@@ -39,34 +39,19 @@ SOURCES = [
 ]
 
 
-def parse_dict(path: Path) -> list[tuple[str, str, int]]:
-    """解析 Rime .dict.yaml 表体，返回 (词, 拼音, 权重)。
+def parse_dict_text(text: str) -> list[tuple[str, str, int]]:
+    """解析 Rime .dict.yaml 文本的表体，返回 (词, 拼音, 权重)。
 
-    表体从单独一行 `...` 之后开始；`#` 开头为注释。
+    规则：表体从单独一行 `...` 之后开始；`#` 开头为注释；
+    列数不足 3、词或拼音为空、权重非数字的行一律跳过。
+    找不到表体标记时抛 ValueError。
     """
-    text = path.read_text(encoding="utf-8")
-    lines = text.splitlines()
-    try:
-        start = next(i for i, l in enumerate(lines) if l.strip() == "...") + 1
-    except StopIteration:
-        raise SystemExit(f"{path.name}: 找不到表体起始标记 '...'")
+    raise NotImplementedError("TDD 红线：先写测试，再实现")
 
-    rows: list[tuple[str, str, int]] = []
-    for line in lines[start:]:
-        if not line.strip() or line.startswith("#"):
-            continue
-        fields = line.split("\t")
-        if len(fields) < 3:
-            continue
-        word, pinyin, weight = fields[0].strip(), fields[1].strip(), fields[2].strip()
-        if not word or not pinyin:
-            continue
-        try:
-            w = int(weight)
-        except ValueError:
-            continue
-        rows.append((word, pinyin, w))
-    return rows
+
+def parse_dict(path: Path) -> list[tuple[str, str, int]]:
+    """解析 .dict.yaml 文件（薄封装，便于单测纯函数）。"""
+    return parse_dict_text(path.read_text(encoding="utf-8"))
 
 
 def sha256(path: Path) -> str:
