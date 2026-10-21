@@ -77,24 +77,33 @@
     void invoke("hide_panel");
   }
 
+  /** 提交候选词。上屏后输入框一律清空——残留字母会影响下一次输入。 */
   function commit(index = sel) {
     const c = pageCands[index];
     if (!c) return;
     const text = c.text;
-    // 前缀兜底的情况：只消费命中的那几个字母，剩下的留着继续打
-    const rest = input.slice(matchedLen);
-    input = rest;
+    input = "";
     all = [];
     page = 0;
     sel = 0;
+    matchedLen = 0;
+    void invoke("set_composing", { composing: false });
+    void resize();
     void invoke("commit_text", { text, keepOpen: true }).catch((e) => console.error("上屏失败", e));
-    if (rest) {
-      void invoke("set_composing", { composing: true });
-      void refresh(rest);
-    } else {
-      void invoke("set_composing", { composing: false });
-      void resize();
-    }
+  }
+
+  /** 回车：把当前拼音串**原样**上屏（和主流输入法一致，方便直接打英文）。 */
+  function commitRaw() {
+    if (!input) return;
+    const text = input;
+    input = "";
+    all = [];
+    page = 0;
+    sel = 0;
+    matchedLen = 0;
+    void invoke("set_composing", { composing: false });
+    void resize();
+    void invoke("commit_text", { text, keepOpen: true }).catch((e) => console.error("上屏失败", e));
   }
 
   function forward(ch: string) {
@@ -144,6 +153,9 @@
         turnPage(1);
         return;
       case "Enter":
+        // 主流行为：回车 = 原样上屏拼音串（等于直接打英文）
+        commitRaw();
+        return;
       case "Tab":
       case " ":
         commit();
