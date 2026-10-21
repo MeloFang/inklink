@@ -99,14 +99,16 @@
         return;
       case "Enter":
       case "Tab":
+      case " ":
+        // 空格 = 选第一个（当前高亮）候选上屏，和常见输入法一致
         void commit();
         return;
     }
 
     if (key.length === 1) {
       const ch = key.toLowerCase();
-      // 字母、撇号（音节分隔）、空格
-      if (/^[a-z'’ ]$/.test(ch)) {
+      // 字母、撇号（音节分隔）
+      if (/^[a-z'’]$/.test(ch)) {
         type(ch);
         return;
       }
@@ -148,7 +150,7 @@
 <main class="panel">
   <header>
     <span class="brand">inklink</span>
-    <span class="hint">Esc 隐藏 · ↑↓ 选择 · 数字键直选</span>
+    <span class="hint">Esc 隐藏 · ↑↓ 选择 · 空格/回车 上屏</span>
   </header>
 
   <div class="box" role="textbox" aria-label="拼音输入">
