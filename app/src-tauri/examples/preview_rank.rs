@@ -43,9 +43,9 @@ fn main() {
     };
 
     let t = Instant::now();
-    let ranker = Ranker::new(&lex);
+    let ranker = Ranker::new(lex);
     let build_ms = t.elapsed().as_millis();
-    println!("词库 {} 条 | 建索引 {}ms\n", lex.len(), build_ms);
+    println!("词库 {} 条 | 建索引 {}ms\n", ranker.len(), build_ms);
 
     let custom: Vec<String> = args.collect();
     let queries: Vec<&str> = if custom.is_empty() {

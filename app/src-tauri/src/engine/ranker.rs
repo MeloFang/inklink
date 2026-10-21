@@ -53,18 +53,21 @@ pub struct Candidate {
     pub source: Source,
 }
 
-/// 召回器：持有词库引用，并自建编码与简拼索引。
-pub struct Ranker<'a> {
-    lex: &'a Lexicon,
+/// 召回器：**持有**词库，并自建编码与简拼索引。
+///
+/// 选择持有而非借用，是为了能存进 Tauri 的全局状态（`State<Mutex<Ranker>>`）——
+/// 借用会让结构体变成自引用。
+pub struct Ranker {
+    lex: Lexicon,
     /// 全拼码 -> 词条下标
     codes: BTreeMap<String, Vec<u32>>,
     /// 简拼串 -> 词条下标
     initials: BTreeMap<String, Vec<u32>>,
 }
 
-impl<'a> Ranker<'a> {
-    /// 建索引。8 万词条约 30–60ms，只在启动时做一次。
-    pub fn new(lex: &'a Lexicon) -> Self {
+impl Ranker {
+    /// 建索引。8 万词条约 90ms，只在启动时做一次。
+    pub fn new(lex: Lexicon) -> Self {
         let mut codes: BTreeMap<String, Vec<u32>> = BTreeMap::new();
         let mut initials: BTreeMap<String, Vec<u32>> = BTreeMap::new();
         for (idx, e) in lex.entries().iter().enumerate() {
@@ -224,8 +227,7 @@ mod tests {
 
     #[test]
     fn 全拼整词排第一() {
-        let lex = Lexicon::parse_str(FIXTURE);
-        let r = Ranker::new(&lex);
+        let r = Ranker::new(Lexicon::parse_str(FIXTURE));
         let c = r.candidates("nihao", 10);
         assert_eq!(c.first().map(|x| x.text.as_str()), Some("你好"));
         assert_eq!(c[0].source, Source::Exact);
@@ -233,8 +235,7 @@ mod tests {
 
     #[test]
     fn 同码候选按词频降序() {
-        let lex = Lexicon::parse_str(FIXTURE);
-        let r = Ranker::new(&lex);
+        let r = Ranker::new(Lexicon::parse_str(FIXTURE));
         let c = r.candidates("beijing", 10);
         let names: Vec<&str> = c.iter().map(|x| x.text.as_str()).collect();
         assert_eq!(names, vec!["北京", "背景"]);
@@ -242,8 +243,7 @@ mod tests {
 
     #[test]
     fn 前缀输入也能出候选() {
-        let lex = Lexicon::parse_str(FIXTURE);
-        let r = Ranker::new(&lex);
+        let r = Ranker::new(Lexicon::parse_str(FIXTURE));
         let c = r.candidates("zhonggu", 10);
         let names: Vec<&str> = c.iter().map(|x| x.text.as_str()).collect();
         assert!(names.contains(&"中国"), "应命中中国，实际 {names:?}");
@@ -252,8 +252,7 @@ mod tests {
 
     #[test]
     fn 简拼命中整词() {
-        let lex = Lexicon::parse_str(FIXTURE);
-        let r = Ranker::new(&lex);
+        let r = Ranker::new(Lexicon::parse_str(FIXTURE));
         let c = r.candidates("zgrm", 10);
         assert_eq!(c.first().map(|x| x.text.as_str()), Some("中国人民"));
         assert_eq!(c[0].source, Source::Abbrev);
@@ -261,8 +260,7 @@ mod tests {
 
     #[test]
     fn 结果确定且去重() {
-        let lex = Lexicon::parse_str(FIXTURE);
-        let r = Ranker::new(&lex);
+        let r = Ranker::new(Lexicon::parse_str(FIXTURE));
         let a = r.candidates("zhongguo", 10);
         let b = r.candidates("zhongguo", 10);
         assert_eq!(a, b, "两次结果必须完全一致");
@@ -275,8 +273,7 @@ mod tests {
 
     #[test]
     fn 空输入与无法识别输入返回空() {
-        let lex = Lexicon::parse_str(FIXTURE);
-        let r = Ranker::new(&lex);
+        let r = Ranker::new(Lexicon::parse_str(FIXTURE));
         assert!(r.candidates("", 10).is_empty());
         assert!(r.candidates("zzz", 10).is_empty());
     }
