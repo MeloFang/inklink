@@ -132,7 +132,10 @@ pub fn run() {
             tauri_plugin_global_shortcut::Builder::new()
                 .with_handler(|app, _shortcut, event| {
                     if event.state() == ShortcutState::Pressed {
-                        toggle_panel(app);
+                        // 热键回调不在主线程：窗口 API 必须切回主线程调用，
+                        // 否则会踩到 Tauri 的内部状态直接 fast-fail（0xc0000409）。
+                        let handle = app.clone();
+                        let _ = app.run_on_main_thread(move || toggle_panel(&handle));
                     }
                 })
                 .build(),
