@@ -24,16 +24,29 @@
   let pageCands = $derived(all.slice(page * PAGE, page * PAGE + PAGE));
   let pageCount = $derived(Math.max(1, Math.ceil(all.length / PAGE)));
 
+  /** 当前候选命中的输入长度。比 input 短说明是"前缀兜底"，上屏后要保留剩余字母。 */
+  let matchedLen = $state(0);
+
   async function refresh(q: string) {
     if (!q.trim()) {
       all = [];
       page = 0;
       sel = 0;
+      matchedLen = 0;
       void resize();
       return;
     }
-    const t0 = performance.now();
-    all = await invoke<Cand[]>("search", { input: q, limit: 50 });
+    // 整串查不到就逐步缩短：让「一句话打太长」也能一个字一个字地出。
+    // 主流输入法靠分词/语言模型做这件事，我们先做最简单的"最长可命中的前缀"。
+    let probe = q;
+    let res: Cand[] = [];
+    while (probe.length >= 1) {
+      res = await invoke<Cand[]>("search", { input: probe, limit: 50 });
+      if (res.length) break;
+      probe = probe.slice(0, -1);
+    }
+    all = res;
+    matchedLen = probe.length;
     page = 0;
     sel = 0;
     void resize();
@@ -45,6 +58,7 @@
     if (!barEl) return;
     const width = Math.ceil(Math.max(220, barEl.scrollWidth + 4));
     void invoke("resize_panel", { width, height: BAR_HEIGHT });
+    void invoke("reposition_panel");
   }
 
   function move(delta: number) {
@@ -67,12 +81,20 @@
     const c = pageCands[index];
     if (!c) return;
     const text = c.text;
-    input = "";
+    // 前缀兜底的情况：只消费命中的那几个字母，剩下的留着继续打
+    const rest = input.slice(matchedLen);
+    input = rest;
     all = [];
     page = 0;
     sel = 0;
-    void resize();
-    invoke("commit_text", { text, keepOpen: true }).catch((e) => console.error("上屏失败", e));
+    void invoke("commit_text", { text, keepOpen: true }).catch((e) => console.error("上屏失败", e));
+    if (rest) {
+      void invoke("set_composing", { composing: true });
+      void refresh(rest);
+    } else {
+      void invoke("set_composing", { composing: false });
+      void resize();
+    }
   }
 
   function forward(ch: string) {
@@ -83,12 +105,14 @@
 
   function type(ch: string) {
     input += ch;
+    void invoke("set_composing", { composing: true });
     void refresh(input);
   }
 
   function backspace() {
     if (!input) return;
     input = input.slice(0, -1);
+    void invoke("set_composing", { composing: input.length > 0 });
     void refresh(input);
   }
 

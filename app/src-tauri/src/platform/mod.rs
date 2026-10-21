@@ -68,6 +68,23 @@ pub fn caret_position() -> Option<(i32, i32, i32)> {
 pub fn caret_position() -> Option<(i32, i32, i32)> {
     None
 }
+/// 取鼠标当前位置（拿不到光标时的兜底定位）。
+#[cfg(windows)]
+pub fn cursor_position() -> (i32, i32) {
+    use windows_sys::Win32::Foundation::POINT;
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetCursorPos;
+    let mut p = POINT { x: 0, y: 0 };
+    // SAFETY: 纯查询
+    unsafe {
+        GetCursorPos(&mut p);
+    }
+    (p.x, p.y)
+}
+
+#[cfg(not(windows))]
+pub fn cursor_position() -> (i32, i32) {
+    (0, 0)
+}
 /// 取当前前台窗口句柄（0 表示没有）。
 pub fn foreground_window() -> isize {
     #[cfg(windows)]

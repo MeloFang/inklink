@@ -69,6 +69,33 @@ fn search(state: State<'_, AppState>, input: String, limit: Option<usize>) -> Ve
         .collect()
 }
 
+/// 前端告诉 Rust 当前是否在拼写：决定钩子要不要吞掉退格/数字/标点。
+#[tauri::command]
+fn set_composing(composing: bool) {
+    platform::hook::set_composing(composing);
+}
+
+/// 重新贴合光标（输入过程中候选项宽度变化时调用）。
+#[tauri::command]
+fn reposition_panel(app: AppHandle) {
+    let Some(win) = app.get_webview_window("main") else {
+        return;
+    };
+    if let Some((caret_x, caret_y, _)) = platform::caret_position()
+        && let Ok(Some(monitor)) = win.primary_monitor()
+    {
+        let size = win
+            .outer_size()
+            .unwrap_or(tauri::PhysicalSize::new(400, 78));
+        let origin = monitor.position();
+        let screen = monitor.size();
+        let max_x = origin.x + screen.width as i32 - size.width as i32 - 8;
+        let max_y = origin.y + screen.height as i32 - size.height as i32 - 8;
+        let x = (caret_x - 12).clamp(origin.x, max_x.max(origin.x));
+        let y = (caret_y + 8).clamp(origin.y, max_y.max(origin.y));
+        let _ = win.set_position(tauri::PhysicalPosition::new(x, y));
+    }
+}
 /// 前端按内容宽度调整面板尺寸（候选条要贴合内容，像主流输入法那样）。
 #[tauri::command]
 fn resize_panel(app: AppHandle, width: f64, height: f64) {
@@ -118,7 +145,9 @@ fn place_panel(app: &AppHandle, visible: bool) {
         .outer_size()
         .unwrap_or(tauri::PhysicalSize::new(820, 64));
     let mut placed = false;
-    if let Some((caret_x, caret_y, _)) = platform::caret_position()
+    let caret = platform::caret_position();
+    eprintln!("[panel] caret={caret:?}");
+    if let Some((caret_x, caret_y, _)) = caret
         && let Ok(Some(monitor)) = win.primary_monitor()
     {
         {
@@ -135,8 +164,16 @@ fn place_panel(app: &AppHandle, visible: bool) {
     if !placed && let Ok(Some(monitor)) = win.primary_monitor() {
         let origin = monitor.position();
         let screen = monitor.size();
-        let x = origin.x + (screen.width as i32 - size.width as i32) / 2;
-        let y = origin.y + screen.height as i32 - size.height as i32 - 120;
+        // 拿不到光标时贴在鼠标附近（用户通常就在点击处打字），比固定底部更接近真实输入法
+        let (mx, my) = platform::cursor_position();
+        let x = (mx + 8).clamp(
+            origin.x,
+            origin.x + screen.width as i32 - size.width as i32 - 8,
+        );
+        let y = (my + 20).clamp(
+            origin.y,
+            origin.y + screen.height as i32 - size.height as i32 - 8,
+        );
         let _ = win.set_position(tauri::PhysicalPosition::new(x, y));
     }
     // 窗口带 WS_EX_NOACTIVATE：show 不会抢焦点，目标应用保持前台
@@ -232,7 +269,9 @@ pub fn run() {
             search,
             hide_panel,
             commit_text,
-            resize_panel
+            resize_panel,
+            set_composing,
+            reposition_panel
         ])
         .setup(|app| {
             // 面板不抢焦点：目标应用保持前台，光标不消失

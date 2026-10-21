@@ -30,6 +30,13 @@ pub fn set_committing(v: bool) {
     COMMITTING.store(v, Ordering::Relaxed);
 }
 
+/// 是否正在拼写（决定退格/数字/标点要不要吞掉）。
+static COMPOSING: AtomicBool = AtomicBool::new(false);
+
+pub fn set_composing(v: bool) {
+    COMPOSING.store(v, Ordering::Relaxed);
+}
+
 pub fn set_active(active: bool) {
     ACTIVE.store(active, Ordering::Relaxed);
 }
@@ -147,6 +154,13 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: usize, lparam: isize) -> 
         return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
     };
 
+    // 只有「正在拼写」时才吞这些键：
+    //   - 没在拼写时，退格/空格/回车/数字/标点都应该照常作用于文档
+    //   - 字母永远吞（用来启动拼写）
+    if !should_swallow(kb.vkCode) {
+        return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
+    }
+
     // 只处理按下事件；抬起事件也吞掉，避免目标窗口收到半截按键
     if wparam == WM_KEYDOWN as usize || wparam == WM_SYSKEYDOWN as usize {
         if let Some(sink) = KEY_SINK.get() {
@@ -158,6 +172,45 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: usize, lparam: isize) -> 
     }
 
     1 // 吞掉
+}
+
+/// 这个键该不该被面板吞掉。
+#[cfg(windows)]
+fn should_swallow(vk: u32) -> bool {
+    const VK_BACK: u32 = 0x08;
+    const VK_RETURN: u32 = 0x0D;
+    const VK_ESCAPE: u32 = 0x1B;
+    const VK_SPACE: u32 = 0x20;
+    const VK_LEFT: u32 = 0x25;
+    const VK_UP: u32 = 0x26;
+    const VK_RIGHT: u32 = 0x27;
+    const VK_DOWN: u32 = 0x28;
+    const VK_0: u32 = 0x30;
+    const VK_9: u32 = 0x39;
+    const VK_A: u32 = 0x41;
+    const VK_Z: u32 = 0x5A;
+    const VK_OEM_MINUS: u32 = 0xBD;
+    const VK_OEM_PLUS: u32 = 0xBB;
+    const VK_OEM_COMMA: u32 = 0xBC;
+    const VK_OEM_PERIOD: u32 = 0xBE;
+    const VK_OEM_7: u32 = 0xDE;
+
+    let composing = COMPOSING.load(Ordering::Relaxed);
+
+    match vk {
+        // 字母：永远吃掉，用来启动/继续拼写
+        VK_A..=VK_Z => true,
+        // Esc：永远吃掉，用来收起面板
+        VK_ESCAPE => true,
+        // 以下只在拼写中才吃
+        VK_BACK | VK_SPACE | VK_LEFT | VK_UP | VK_RIGHT | VK_DOWN | VK_OEM_MINUS | VK_OEM_PLUS
+        | VK_OEM_COMMA | VK_OEM_PERIOD | VK_OEM_7 => composing,
+        // 回车：拼写中吃（上屏），否则放行（文档里就是换行）
+        VK_RETURN => composing,
+        // 数字：拼写中有候选时用来选词；没在拼写就放行
+        VK_0..=VK_9 => composing,
+        _ => false,
+    }
 }
 
 #[cfg(windows)]
