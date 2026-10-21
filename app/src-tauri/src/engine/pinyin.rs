@@ -50,26 +50,31 @@ pub fn is_syllable(s: &str) -> bool {
 pub fn normalize_input(input: &str) -> String {
     input
         .chars()
-        .filter_map(|c| match c {
-            '\'' | ' ' | '`' | '’' => None,
-            'ü' | 'ǖ' | 'ǘ' | 'ǚ' | 'ǜ' => Some('v'),
-            c => Some(c.to_ascii_lowercase()),
+        .map(|c| match c {
+            // 撇号/空格/隔音符号是**音节边界**，统一成空格保留，不能直接删
+            '\'' | ' ' | '`' | '’' => ' ',
+            'ü' | 'ǖ' | 'ǘ' | 'ǚ' | 'ǜ' => 'v',
+            c => c.to_ascii_lowercase(),
         })
         .collect()
 }
 
 /// 把拼音串切成音节。无法完整切分时返回 `None`；空串也返回 `None`。
+///
+/// 分隔符（空格、撇号）视为强制音节边界：`xi'an` 切成 `xi` + `an`，而不是 `xian`。
 pub fn decode(input: &str) -> Option<Vec<String>> {
-    let code = normalize_input(input);
-    if code.is_empty() {
-        return None;
-    }
+    let normalized = normalize_input(input);
     let mut out = Vec::new();
-    if segment(&code, 0, &mut out) {
-        Some(out)
-    } else {
-        None
+    let mut any = false;
+    for chunk in normalized.split_whitespace() {
+        any = true;
+        let mut part = Vec::new();
+        if !segment(chunk, 0, &mut part) {
+            return None;
+        }
+        out.extend(part);
     }
+    if any { Some(out) } else { None }
 }
 
 /// 带回溯的最大匹配：优先长音节，失败则退回短音节。
@@ -90,6 +95,65 @@ fn segment(code: &str, pos: usize, out: &mut Vec<String>) -> bool {
         }
     }
     false
+}
+
+/// 带模糊音的变体：zh/z、ch/c、sh/s、n/l、ng/n 可以互换。
+///
+/// 返回**除自身以外**的全部变体，按字典序去重。用于召回时扩大匹配面。
+pub fn fuzzy_variants(syllable: &str) -> Vec<String> {
+    use std::collections::BTreeSet;
+
+    let mut out: BTreeSet<String> = BTreeSet::new();
+    let mut frontier = vec![syllable.to_string()];
+    while let Some(cur) = frontier.pop() {
+        for next in one_fuzzy_step(&cur) {
+            if next != syllable && out.insert(next.clone()) {
+                frontier.push(next);
+            }
+        }
+    }
+    out.into_iter().collect()
+}
+
+/// 单步模糊变体（不含组合）。
+///
+/// 注意：声母替换必须在「已含双字母声母」时才用单字母版本，否则 `sh` 会被再拆成
+/// `s` + `h` 得到 `shh`，进而无限增长。
+fn one_fuzzy_step(s: &str) -> Vec<String> {
+    let mut v = Vec::new();
+    for (two, one) in [("zh", "z"), ("ch", "c"), ("sh", "s")] {
+        if let Some(rest) = s.strip_prefix(two) {
+            v.push(format!("{one}{rest}"));
+        } else if let Some(rest) = s.strip_prefix(one) {
+            v.push(format!("{two}{rest}"));
+        }
+    }
+    if let Some(rest) = s.strip_prefix('n') {
+        v.push(format!("l{rest}"));
+    }
+    if let Some(rest) = s.strip_prefix('l') {
+        v.push(format!("n{rest}"));
+    }
+    if let Some(stem) = s.strip_suffix("ng") {
+        v.push(format!("{stem}n"));
+    } else if let Some(stem) = s.strip_suffix('n') {
+        v.push(format!("{stem}ng"));
+    }
+    v
+}
+
+/// 声母集合（含零声母占位）。
+const INITIALS: &[char] = &[
+    'b', 'p', 'm', 'f', 'd', 't', 'n', 'l', 'g', 'k', 'h', 'j', 'q', 'x', 'r', 'z', 'c', 's', 'y',
+    'w',
+];
+
+/// 是否可能是简拼：至少 2 个字符，且每个字符都是声母字母。
+///
+/// 注意：这只是**必要条件**，`zh`/`ch`/`sh` 的两个字母会被当成两个声母，属于可接受的误判。
+pub fn is_abbreviation(input: &str) -> bool {
+    let code: String = normalize_input(input).split_whitespace().collect();
+    code.chars().count() >= 2 && code.chars().all(|c| INITIALS.contains(&c))
 }
 
 #[cfg(test)]
