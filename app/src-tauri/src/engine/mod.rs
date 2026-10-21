@@ -4,3 +4,4 @@
 
 pub mod lexicon;
 pub mod pinyin;
+pub mod ranker;

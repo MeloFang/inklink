@@ -121,6 +121,11 @@ impl Lexicon {
         self.skipped
     }
 
+    /// 全部词条（只读）。排序层用它建额外索引。
+    pub fn entries(&self) -> &[Entry] {
+        &self.entries
+    }
+
     /// 按编码前缀查询，返回匹配词条的迭代器（编码序 + 同码内加入顺序）。
     pub fn lookup(&self, prefix: &str) -> impl Iterator<Item = &Entry> + '_ {
         let needle = normalize_code(prefix);
