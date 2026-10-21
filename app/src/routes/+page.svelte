@@ -138,7 +138,7 @@
     height: 100vh;
     padding: 14px 16px 10px;
     border-radius: 14px;
-    background: #1e1f22f2;
+    background: #1e1f22;
     border: 1px solid #ffffff1a;
     box-shadow: 0 12px 40px #00000066;
     color: #eceff4;
