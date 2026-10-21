@@ -53,9 +53,11 @@ pub struct Candidate {
     pub source: Source,
 }
 
-/// 召回器：持有词库引用，并自建简拼索引。
+/// 召回器：持有词库引用，并自建编码与简拼索引。
 pub struct Ranker<'a> {
     lex: &'a Lexicon,
+    /// 全拼码 -> 词条下标
+    codes: BTreeMap<String, Vec<u32>>,
     /// 简拼串 -> 词条下标
     initials: BTreeMap<String, Vec<u32>>,
 }
@@ -63,20 +65,27 @@ pub struct Ranker<'a> {
 impl<'a> Ranker<'a> {
     /// 建索引。8 万词条约 30–60ms，只在启动时做一次。
     pub fn new(lex: &'a Lexicon) -> Self {
+        let mut codes: BTreeMap<String, Vec<u32>> = BTreeMap::new();
         let mut initials: BTreeMap<String, Vec<u32>> = BTreeMap::new();
         for (idx, e) in lex.entries().iter().enumerate() {
+            let id = idx as u32;
+            codes.entry(e.code.clone()).or_default().push(id);
+
             let mut init = String::new();
             for syllable in e.pinyin.split_whitespace() {
                 if let Some(c) = syllable.chars().next() {
                     init.push(c);
                 }
             }
-            if init.is_empty() {
-                continue;
+            if !init.is_empty() {
+                initials.entry(init).or_default().push(id);
             }
-            initials.entry(init).or_default().push(idx as u32);
         }
-        Self { lex, initials }
+        Self {
+            lex,
+            codes,
+            initials,
+        }
     }
 
     /// 词条总数（便于外部核对索引）。
@@ -90,9 +99,109 @@ impl<'a> Ranker<'a> {
     }
 
     /// 召回并排序。
+    ///
+    /// 顺序：全拼整词 → 全拼前缀 → 模糊音变体 → 简拼。同一词条只保留最高分。
     pub fn candidates(&self, input: &str, limit: usize) -> Vec<Candidate> {
-        let _ = (input, limit);
-        unimplemented!("TDD 红线：先写测试，再实现")
+        let compact: String = normalize_input(input).split_whitespace().collect();
+        if compact.is_empty() {
+            return Vec::new();
+        }
+
+        // 词条下标 -> (score, source)
+        let mut best: HashMap<u32, (f32, Source)> = HashMap::new();
+
+        if let Some(syllables) = decode(input) {
+            let code = syllables.concat();
+
+            // 全拼整词 / 前缀
+            for (idx, entry) in self.indexed_lookup(&code) {
+                let source = if entry.code == code {
+                    Source::Exact
+                } else {
+                    Source::Prefix
+                };
+                self.consider(&mut best, idx, entry, source);
+            }
+
+            // 模糊音：逐音节替换，命中降权
+            for (pos, syllable) in syllables.iter().enumerate() {
+                for variant in fuzzy_variants(syllable).into_iter().take(4) {
+                    let mut alt = syllables.clone();
+                    alt[pos] = variant;
+                    let alt_code = alt.concat();
+                    if alt_code == code {
+                        continue;
+                    }
+                    for (idx, entry) in self.indexed_lookup(&alt_code) {
+                        self.consider(&mut best, idx, entry, Source::Fuzzy);
+                    }
+                }
+            }
+        }
+
+        // 简拼整词
+        if is_abbreviation(input) {
+            for (_, ids) in self
+                .initials
+                .range(compact.clone()..)
+                .take_while(|(k, _)| k.starts_with(&compact))
+            {
+                for id in ids {
+                    let entry = &self.lex.entries()[*id as usize];
+                    self.consider(&mut best, *id, entry, Source::Abbrev);
+                }
+            }
+        }
+
+        let mut out: Vec<Candidate> = best
+            .into_iter()
+            .map(|(idx, (score, source))| {
+                let e = &self.lex.entries()[idx as usize];
+                Candidate {
+                    text: e.text.clone(),
+                    pinyin: e.pinyin.clone(),
+                    freq: e.freq,
+                    score,
+                    source,
+                }
+            })
+            .collect();
+
+        out.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.source.rank().cmp(&b.source.rank()))
+                .then_with(|| b.freq.cmp(&a.freq))
+                .then_with(|| a.text.cmp(&b.text))
+        });
+        out.truncate(limit);
+        out
+    }
+
+    /// 按编码前缀取候选，同时给出下标。
+    fn indexed_lookup<'e>(&'e self, code: &str) -> impl Iterator<Item = (u32, &'e Entry)> + 'e {
+        let entries = self.lex.entries();
+        let needle = code.to_string();
+        let guard = needle.clone();
+        self.codes
+            .range(needle..)
+            .take_while(move |(k, _)| k.starts_with(&guard))
+            .flat_map(move |(_, ids)| ids.iter().map(move |id| (*id, &entries[*id as usize])))
+    }
+
+    fn consider(
+        &self,
+        best: &mut HashMap<u32, (f32, Source)>,
+        idx: u32,
+        entry: &Entry,
+        source: Source,
+    ) {
+        let score = (1.0 + entry.freq as f32).ln() - source.penalty();
+        let slot = best.entry(idx).or_insert((f32::NEG_INFINITY, source));
+        if score > slot.0 {
+            *slot = (score, source);
+        }
     }
 }
 
@@ -102,21 +211,16 @@ mod tests {
 
     /// 手写小词库：期望值全部来自这些字面量。
     const FIXTURE: &str = "\
-你好	nihao	332885
-项目	xiangmu	502761
-中国	zhongguo	500000
-中国人	zhongguoren	451625
-中国人民	zhongguorenmin	186195
-银行	yinhang	500769
-行长	hangzhang	50370
-北京	beijing	1119506
-背景	beijing	500302
+你好\tni hao\t332885
+项目\txiang mu\t502761
+中国\tzhong guo\t500000
+中国人\tzhong guo ren\t451625
+中国人民\tzhong guo ren min\t186195
+银行\tyin hang\t500769
+行长\thang zhang\t50370
+北京\tbei jing\t1119506
+背景\tbei jing\t500302
 ";
-
-    fn ranker<'a>() -> (Lexicon, ()) {
-        let _ = ranker;
-        (Lexicon::parse_str(FIXTURE), ())
-    }
 
     #[test]
     fn 全拼整词排第一() {

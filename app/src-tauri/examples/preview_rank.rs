@@ -1,21 +1,33 @@
-//! 排序预览：给定拼音，打印当前引擎能给出的候选与权重。
-//!
-//! 只做「切分 → 查库 → 按权重降序」，**没有**模糊音召回和简拼召回（那是步骤 4）。
+//! 召回与排序预览：给定拼音，打印当前引擎给出的候选、来源与耗时。
 //!
 //! 用法（在 app/src-tauri 下）：
 //! ```powershell
 //! cargo run --example preview_rank -- ../../data/base.tsv
-//! cargo run --example preview_rank -- ../../data/base.tsv nihao xiangmu
+//! cargo run --example preview_rank -- ../../data/base.tsv nihao zgrm bjdx
 //! ```
 
 use std::path::PathBuf;
+use std::time::Instant;
 
-use inklink_lib::engine::lexicon::{Entry, Lexicon};
-use inklink_lib::engine::pinyin::decode;
+use inklink_lib::engine::lexicon::Lexicon;
+use inklink_lib::engine::ranker::{Ranker, Source};
 
 const DEFAULT_QUERIES: &[&str] = &[
-    "nihao", "xiangmu", "zhongguo", "women", "shijian", "gongzuo", "zhege", "yinhang", "beijing",
-    "shanghai", "chifan", "renmin",
+    "nihao",
+    "xiangmu",
+    "zhongguo",
+    "shijian",
+    "shanghai",
+    "yinhang",
+    "beijing",
+    "chifan",
+    "women",
+    "zhonggu",
+    "zgrm",
+    "bjdx",
+    "xwlb",
+    "yhhz",
+    "yinhanghangzhang",
 ];
 
 fn main() {
@@ -29,7 +41,11 @@ fn main() {
             std::process::exit(1);
         }
     };
-    println!("词库 {} 条\n", lex.len());
+
+    let t = Instant::now();
+    let ranker = Ranker::new(&lex);
+    let build_ms = t.elapsed().as_millis();
+    println!("词库 {} 条 | 建索引 {}ms\n", lex.len(), build_ms);
 
     let custom: Vec<String> = args.collect();
     let queries: Vec<&str> = if custom.is_empty() {
@@ -38,37 +54,44 @@ fn main() {
         custom.iter().map(String::as_str).collect()
     };
 
-    for query in queries {
-        let Some(syllables) = decode(query) else {
-            println!("{query:<14} 切分失败");
-            continue;
-        };
-        let code = syllables.concat();
+    let mut total_us = 0u128;
+    for q in &queries {
+        let t = Instant::now();
+        let cands = ranker.candidates(q, 6);
+        let us = t.elapsed().as_micros();
+        total_us += us;
 
-        let mut exact: Vec<&Entry> = lex.lookup(&code).filter(|e| e.code == code).collect();
-        let kind = if exact.is_empty() {
-            exact = lex.lookup(&code).take(300).collect();
-            "前缀"
-        } else {
-            "整词"
-        };
-
-        exact.sort_by(|a, b| b.freq.cmp(&a.freq).then_with(|| a.text.cmp(&b.text)));
-
-        let shown: Vec<String> = exact
+        let head: Vec<String> = cands
             .iter()
-            .take(6)
-            .map(|e| format!("{}({})", e.text, e.freq))
+            .map(|c| {
+                format!(
+                    "{}({},{:.1},{})",
+                    c.text,
+                    c.freq,
+                    c.score,
+                    match c.source {
+                        Source::Exact => "整",
+                        Source::Prefix => "前",
+                        Source::Abbrev => "简",
+                        Source::Fuzzy => "糊",
+                    }
+                )
+            })
             .collect();
 
         println!(
-            "{query:<14} [{code:<22}] {kind} {} 条 | {}",
-            exact.len(),
-            if shown.is_empty() {
+            "{q:<18} {us:>5}µs | {}",
+            if head.is_empty() {
                 "无候选".to_string()
             } else {
-                shown.join("  ")
+                head.join("  ")
             }
         );
     }
+
+    println!(
+        "\n平均 {:.0}µs/次（共 {} 次）",
+        total_us as f64 / queries.len() as f64,
+        queries.len()
+    );
 }
