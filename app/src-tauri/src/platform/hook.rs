@@ -198,8 +198,8 @@ fn should_swallow(vk: u32) -> bool {
     let composing = COMPOSING.load(Ordering::Relaxed);
 
     match vk {
-        // 字母：永远吃掉，用来启动/继续拼写
-        VK_A..=VK_Z => true,
+        // 字母：正常吃（用来拼写）；但大写锁定 / Shift 按下时放行——那是要打英文
+        VK_A..=VK_Z => !caps_or_shift(),
         // Esc：永远吃掉，用来收起面板
         VK_ESCAPE => true,
         // 以下只在拼写中才吃
@@ -210,6 +210,20 @@ fn should_swallow(vk: u32) -> bool {
         // 数字：拼写中有候选时用来选词；没在拼写就放行
         VK_0..=VK_9 => composing,
         _ => false,
+    }
+}
+
+/// 大写锁定开着，或者按住 Shift —— 此时用户要打的是英文大写，不该被输入法吞掉。
+#[cfg(windows)]
+fn caps_or_shift() -> bool {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+    const VK_SHIFT: i32 = 0x10;
+    const VK_CAPITAL: i32 = 0x14;
+    // SAFETY: 纯查询
+    unsafe {
+        let shift = (GetAsyncKeyState(VK_SHIFT) as u16 & 0x8000) != 0;
+        let caps = (GetAsyncKeyState(VK_CAPITAL) as u16 & 0x0001) != 0;
+        shift || caps
     }
 }
 
