@@ -143,31 +143,46 @@ static TARGET_WINDOW: std::sync::atomic::AtomicIsize = std::sync::atomic::Atomic
 
 /// 把选中的候选写进目标应用。
 ///
-/// 顺序很关键：先藏面板 → 把焦点还给目标窗口 → 发字符。
-/// `SendInput` 失败（部分应用/权限受限场景）时退回「剪贴板 + Ctrl+V」。
+/// `keep_open = true` 时上屏后把焦点收回面板，支持连续输入（否则打一个词就得重新按热键）。
+/// 顺序很关键：焦点先给目标窗口 → 发字符 → 再把焦点抢回来，否则字符会打到自己的窗口里。
 #[tauri::command]
-fn commit_text(app: AppHandle, text: String) -> Result<(), String> {
+fn commit_text(app: AppHandle, text: String, keep_open: Option<bool>) -> Result<(), String> {
     if text.is_empty() {
         return Ok(());
     }
+    let keep_open = keep_open.unwrap_or(false);
 
-    // 1. 收起面板（否则焦点还在我们这边，字符会打到空气里）
-    place_panel(&app, false);
-    PANEL_VISIBLE.store(false, std::sync::atomic::Ordering::SeqCst);
-
-    // 2. 焦点还给唤起前的窗口
+    // 1. 焦点还给唤起前的窗口
     let target = TARGET_WINDOW.load(std::sync::atomic::Ordering::SeqCst);
     platform::focus_window(target);
-    std::thread::sleep(std::time::Duration::from_millis(40));
+    std::thread::sleep(std::time::Duration::from_millis(35));
+    let now_fg = platform::foreground_window();
+    eprintln!(
+        "[commit] text={text:?} target={target} fg_after_focus={now_fg} keep_open={keep_open}"
+    );
 
-    // 3. 直发字符，失败则走剪贴板
-    if platform::send_unicode(&text) {
-        return Ok(());
+    // 2. 直发字符，失败则走剪贴板
+    let ok = if platform::send_unicode(&text) {
+        true
+    } else {
+        app.clipboard().write_text(text).is_ok() && platform::send_paste()
+    };
+
+    // 3. 连续模式：把焦点收回面板，接着打下个字
+    if keep_open {
+        if let Some(win) = app.get_webview_window("main") {
+            let _ = win.set_focus();
+        }
+    } else {
+        place_panel(&app, false);
+        PANEL_VISIBLE.store(false, std::sync::atomic::Ordering::SeqCst);
     }
-    if app.clipboard().write_text(text).is_ok() && platform::send_paste() {
-        return Ok(());
+
+    if ok {
+        Ok(())
+    } else {
+        Err("上屏失败：目标窗口可能不允许模拟输入".into())
     }
-    Err("上屏失败：目标窗口可能不允许模拟输入".into())
 }
 
 /// 面板当前是否可见（由我们自己维护，避免依赖窗口 API 的时序）。

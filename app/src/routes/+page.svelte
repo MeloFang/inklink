@@ -52,11 +52,19 @@
     cands = [];
     sel = 0;
     try {
-      await invoke("commit_text", { text });
+      // keepOpen: 上屏后把焦点收回面板，可以接着打下个词
+      await invoke("commit_text", { text, keepOpen: true });
     } catch (err) {
-      input = "";
-      cands = [];
       console.error("上屏失败", err);
+    }
+  }
+
+  /** 非拼音字符（数字、标点）直接透传给目标应用。 */
+  async function forward(ch: string) {
+    try {
+      await invoke("commit_text", { text: ch, keepOpen: true });
+    } catch (err) {
+      console.error("透传失败", err);
     }
   }
 
@@ -112,10 +120,20 @@
         e.preventDefault();
         return;
       }
-      // 数字键直接选并上屏
-      if (/^[1-9]$/.test(ch) && cands.length) {
-        const i = Number(ch) - 1;
-        if (i < cands.length) void commit(i);
+      // 数字键：有候选时选词，否则当作数字透传给目标应用
+      if (/^[0-9]$/.test(ch)) {
+        if (cands.length && ch !== "0") {
+          const i = Number(ch) - 1;
+          if (i < cands.length) void commit(i);
+        } else if (!input) {
+          void forward(ch);
+        }
+        e.preventDefault();
+        return;
+      }
+      // 其他可打印字符（标点等）：不在拼音里，直接透传
+      if (!input) {
+        void forward(e.key);
         e.preventDefault();
       }
     }
