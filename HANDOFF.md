@@ -58,7 +58,7 @@
 | ① 立项与产品文档 | ✅ | `PRODUCT.md` | v0.2，方向已定（面板 + 开源产品） |
 | ② 固定上下文 | ✅ | `AGENTS.md` `GLOSSARY.md` `docs/adr/` | 3 条 ADR：不注入 / AI 不进同步路径 / 词库选型 |
 | ③ 规划 | ✅ | `PLAN.md` | M0 拆成 8 步（0–7） |
-| ④ 实现 | 🟡 | `app/` | 步骤 1/8 完成（骨架 + 词库加载器） |
+| ④ 实现 | 🟡 | `app/` `tools/` | 步骤 2/8 完成（骨架 + 加载器 + 词库转换） |
 | ⑤ 验证 | ⬜ | — | |
 | ⑥ 续接文档 | ✅ | 本文件 | |
 
@@ -71,6 +71,8 @@
   clippy / fmt / test / svelte-check 全绿，`tauri build --debug` 能出 MSI + NSIS 安装包
 - ✅ **步骤 1 完成**：`engine/lexicon.rs` — TSV 加载 + 拼音前缀索引，
   6 个单测全绿；release 实测 6 万条加载 153ms、10 万次前缀查询 76ms
+- ✅ **步骤 2 完成**：词库源改为 rime-ice（GPL-3.0），`tools/build_base_lexicon.py` 产出
+  `data/base.tsv` 80,434 条（2.1MB），转换幂等；Rust 实测加载 283ms（debug）、查询 4–75µs
 - ✅ `docs/architecture.md`（三层解耦 / 四条数据流 / Obsidian 与 AI 协同 / M0–M4 路线）
 - ✅ `docs/base-lexicon-eval.md`（三条词库路线实测，已定 A）
 - ✅ 阶段②：`AGENTS.md`、`GLOSSARY.md`、`docs/adr/` 三条决策

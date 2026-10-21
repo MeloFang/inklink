@@ -9,6 +9,9 @@
 
 完整设计：[`docs/architecture.md`](docs/architecture.md)。产品边界：[`PRODUCT.md`](PRODUCT.md)。
 
+**许可证：GPL-3.0**（见 `LICENSE`）。基础词库衍生自 [rime-ice](https://github.com/iDvel/rime-ice)（GPL-3.0），
+以独立资源包分发（`data/` 不进 git），见 `docs/adr/0004`。
+
 ## 三条铁律（违反即回滚）
 
 1. **不进入别人的进程**：不写 DLL、不做 TSF 注入、不 `SetWindowsHookEx` 接管键盘。见 `docs/adr/0001`。
