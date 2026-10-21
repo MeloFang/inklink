@@ -82,12 +82,18 @@ fn map_key(vk: u32) -> Option<String> {
     const VK_RETURN: u32 = 0x0D;
     const VK_ESCAPE: u32 = 0x1B;
     const VK_SPACE: u32 = 0x20;
+    const VK_LEFT: u32 = 0x25;
     const VK_UP: u32 = 0x26;
+    const VK_RIGHT: u32 = 0x27;
     const VK_DOWN: u32 = 0x28;
     const VK_0: u32 = 0x30;
     const VK_9: u32 = 0x39;
     const VK_A: u32 = 0x41;
     const VK_Z: u32 = 0x5A;
+    const VK_OEM_MINUS: u32 = 0xBD; // -  （部分键盘是 0x6D 小键盘）
+    const VK_OEM_PLUS: u32 = 0xBB; // =
+    const VK_OEM_COMMA: u32 = 0xBC; // ,
+    const VK_OEM_PERIOD: u32 = 0xBE; // .
     const VK_OEM_7: u32 = 0xDE; // 单引号/撇号
 
     match vk {
@@ -97,6 +103,12 @@ fn map_key(vk: u32) -> Option<String> {
         VK_SPACE => Some(" ".into()),
         VK_UP => Some("ArrowUp".into()),
         VK_DOWN => Some("ArrowDown".into()),
+        VK_LEFT => Some("ArrowLeft".into()),
+        VK_RIGHT => Some("ArrowRight".into()),
+        VK_OEM_MINUS => Some("-".into()),
+        VK_OEM_PLUS => Some("=".into()),
+        VK_OEM_COMMA => Some(",".into()),
+        VK_OEM_PERIOD => Some(".".into()),
         VK_OEM_7 => Some("'".into()),
         VK_A..=VK_Z => Some((vk as u8 as char).to_ascii_lowercase().to_string()),
         VK_0..=VK_9 => Some((vk as u8 as char).to_string()),

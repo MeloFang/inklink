@@ -21,6 +21,53 @@ pub fn make_no_activate(hwnd: isize) {
 
 #[cfg(not(windows))]
 pub fn make_no_activate(_hwnd: isize) {}
+
+/// 取前台窗口里**文本光标**的屏幕坐标（左上角 x、底边 y）。
+///
+/// 用 `GetGUIThreadInfo`：拿前台窗口所属线程的光标矩形，再换算成屏幕坐标。
+/// 不是所有应用都暴露光标（UWP、部分自绘控件拿不到），拿不到就返回 `None`。
+#[cfg(windows)]
+pub fn caret_position() -> Option<(i32, i32, i32)> {
+    use windows_sys::Win32::Foundation::RECT;
+    use windows_sys::Win32::Graphics::Gdi::ClientToScreen;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GUITHREADINFO, GetForegroundWindow, GetGUIThreadInfo, GetWindowThreadProcessId,
+    };
+
+    let mut info: GUITHREADINFO = unsafe { std::mem::zeroed() };
+    info.cbSize = std::mem::size_of::<GUITHREADINFO>() as u32;
+
+    // SAFETY: 纯查询；cbSize 已按结构体大小填好
+    unsafe {
+        let fg = GetForegroundWindow();
+        if fg.is_null() {
+            return None;
+        }
+        let tid = GetWindowThreadProcessId(fg, std::ptr::null_mut());
+        if tid == 0 || GetGUIThreadInfo(tid, &mut info) == 0 || info.hwndCaret.is_null() {
+            return None;
+        }
+        let mut origin = windows_sys::Win32::Foundation::POINT { x: 0, y: 0 };
+        if ClientToScreen(info.hwndCaret, &mut origin) == 0 {
+            return None;
+        }
+        let RECT {
+            left,
+            top: _,
+            right,
+            bottom,
+        } = info.rcCaret;
+        let x = origin.x + left;
+        let y = origin.y + bottom;
+        let width = right - left;
+        Some((x, y, width))
+    }
+}
+
+#[cfg(not(windows))]
+pub fn caret_position() -> Option<(i32, i32, i32)> {
+    None
+}
 /// 取当前前台窗口句柄（0 表示没有）。
 pub fn foreground_window() -> isize {
     #[cfg(windows)]

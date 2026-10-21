@@ -63,10 +63,18 @@ fn search(state: State<'_, AppState>, input: String, limit: Option<usize>) -> Ve
         return Vec::new();
     };
     ranker
-        .candidates(&input, limit.unwrap_or(9))
+        .candidates(&input, limit.unwrap_or(50))
         .into_iter()
         .map(CandidateDto::from)
         .collect()
+}
+
+/// 前端按内容宽度调整面板尺寸（候选条要贴合内容，像主流输入法那样）。
+#[tauri::command]
+fn resize_panel(app: AppHandle, width: f64, height: f64) {
+    if let Some(win) = app.get_webview_window("main") {
+        let _ = win.set_size(tauri::LogicalSize::new(width, height));
+    }
 }
 
 /// 词库路径：环境变量 > 开发期相对路径 > exe 同级 `data/base.tsv`。
@@ -105,14 +113,30 @@ fn place_panel(app: &AppHandle, visible: bool) {
         let _ = win.set_position(tauri::PhysicalPosition::new(HIDDEN_POS, HIDDEN_POS));
         return;
     }
-    if let Ok(Some(monitor)) = win.primary_monitor() {
-        let size = win
-            .outer_size()
-            .unwrap_or(tauri::PhysicalSize::new(680, 420));
+    // 优先贴着光标显示；拿不到光标就退到屏幕底部居中
+    let size = win
+        .outer_size()
+        .unwrap_or(tauri::PhysicalSize::new(820, 64));
+    let mut placed = false;
+    if let Some((caret_x, caret_y, _)) = platform::caret_position()
+        && let Ok(Some(monitor)) = win.primary_monitor()
+    {
+        {
+            let origin = monitor.position();
+            let screen = monitor.size();
+            let max_x = origin.x + screen.width as i32 - size.width as i32 - 8;
+            let max_y = origin.y + screen.height as i32 - size.height as i32 - 8;
+            let x = (caret_x - 12).clamp(origin.x, max_x.max(origin.x));
+            let y = (caret_y + 8).clamp(origin.y, max_y.max(origin.y));
+            let _ = win.set_position(tauri::PhysicalPosition::new(x, y));
+            placed = true;
+        }
+    }
+    if !placed && let Ok(Some(monitor)) = win.primary_monitor() {
         let origin = monitor.position();
         let screen = monitor.size();
         let x = origin.x + (screen.width as i32 - size.width as i32) / 2;
-        let y = origin.y + (screen.height as i32 - size.height as i32) / 3;
+        let y = origin.y + screen.height as i32 - size.height as i32 - 120;
         let _ = win.set_position(tauri::PhysicalPosition::new(x, y));
     }
     // 窗口带 WS_EX_NOACTIVATE：show 不会抢焦点，目标应用保持前台
@@ -204,7 +228,12 @@ pub fn run() {
                 })
                 .build(),
         )
-        .invoke_handler(tauri::generate_handler![search, hide_panel, commit_text])
+        .invoke_handler(tauri::generate_handler![
+            search,
+            hide_panel,
+            commit_text,
+            resize_panel
+        ])
         .setup(|app| {
             // 面板不抢焦点：目标应用保持前台，光标不消失
             if let Some(win) = app.get_webview_window("main") {

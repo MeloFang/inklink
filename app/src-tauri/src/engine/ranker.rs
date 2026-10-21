@@ -35,10 +35,13 @@ impl Source {
 
     fn rank(self) -> u8 {
         match self {
+            // 完全匹配的整词排最前
             Source::Exact => 0,
-            Source::Prefix => 1,
-            Source::Abbrev => 2,
-            Source::Fuzzy => 3,
+            // 模糊音命中也是「整词匹配」，只是读音近似，排在精确之后
+            Source::Fuzzy => 1,
+            // 前缀命中（输入还没打完）排在这之后，避免 `sha` 首选「上」(shang)
+            Source::Prefix => 2,
+            Source::Abbrev => 3,
         }
     }
 }
@@ -170,11 +173,17 @@ impl Ranker {
             })
             .collect();
 
+        // 先按匹配类型分组，再按分数：打 `sha` 时 `上`（shang 的前缀）不能排在
+        // 真正的 `sha` 候选前面——主流输入法都是这个行为。
         out.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.source.rank().cmp(&b.source.rank()))
+            a.source
+                .rank()
+                .cmp(&b.source.rank())
+                .then_with(|| {
+                    b.score
+                        .partial_cmp(&a.score)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
                 .then_with(|| b.freq.cmp(&a.freq))
                 .then_with(|| a.text.cmp(&b.text))
         });
