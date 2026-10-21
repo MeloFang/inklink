@@ -43,6 +43,23 @@
     void invoke("hide_panel");
   }
 
+  /** 上屏：把选中的候选写进唤起面板前的那个窗口。 */
+  async function commit(index = sel) {
+    const c = cands[index];
+    if (!c) return;
+    const text = c.text;
+    input = "";
+    cands = [];
+    sel = 0;
+    try {
+      await invoke("commit_text", { text });
+    } catch (err) {
+      input = "";
+      cands = [];
+      console.error("上屏失败", err);
+    }
+  }
+
   function type(ch: string) {
     input += ch;
     void refresh(input);
@@ -78,7 +95,11 @@
         e.preventDefault();
         return;
       case "Enter":
+        void commit();
+        e.preventDefault();
+        return;
       case "Tab":
+        void commit();
         e.preventDefault();
         return;
     }
@@ -91,10 +112,10 @@
         e.preventDefault();
         return;
       }
-      // 数字键选候选
+      // 数字键直接选并上屏
       if (/^[1-9]$/.test(ch) && cands.length) {
         const i = Number(ch) - 1;
-        if (i < cands.length) sel = i;
+        if (i < cands.length) void commit(i);
         e.preventDefault();
       }
     }
@@ -138,7 +159,7 @@
   <ul>
     {#each cands as c, i}
       <li>
-        <button type="button" class="row" class:active={i === sel} onclick={() => (sel = i)}>
+        <button type="button" class="row" class:active={i === sel} onclick={() => void commit(i)}>
           <span class="idx">{i + 1}</span>
           <span class="text">{c.text}</span>
           <span class="py">{c.pinyin}</span>

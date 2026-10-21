@@ -58,7 +58,7 @@
 | ① 立项与产品文档 | ✅ | `PRODUCT.md` | v0.3 **已确认**（阶段①出口关闭） |
 | ② 固定上下文 | ✅ | `AGENTS.md` `GLOSSARY.md` `docs/adr/` | 4 条 ADR：不注入 / AI 不进同步路径 / 词库选型 / rime-ice |
 | ③ 规划 | ✅ | `PLAN.md` | M0 拆成 8 步（0–7） |
-| ④ 实现 | 🟡 | `app/` `tools/` | 步骤 5/8 代码完成（步骤 5 的 UI 待人工验收） |
+| ④ 实现 | 🟡 | `app/` `tools/` | 步骤 6/8 完成（记事本上屏已验证） |
 | ⑤ 验证 | ⬜ | — | |
 | ⑥ 续接文档 | ✅ | 本文件 | |
 
@@ -79,6 +79,7 @@
 - ✅ **步骤 5 完成（用户实机确认）**：全局热键（Ctrl+/Alt+/Ctrl+Shift+` 三组）、面板居中唤出、
   候选渲染与键盘导航、Esc 隐藏。前端改为 `<div tabindex=0>` + 自接管按键（不用 `<input>`），
   彻底绕开输入法冲突与 `ImmAssociateContext` 引起的闪退
+- ✅ **步骤 6 完成**：`commit_text` 命令——藏面板 → 还焦点（`AttachThreadInput`）→ `SendInput` Unicode，失败回退剪贴板；记事本实测可上屏
 - ✅ `docs/architecture.md`（三层解耦 / 四条数据流 / Obsidian 与 AI 协同 / M0–M4 路线）
 - ✅ `docs/base-lexicon-eval.md`（三条词库路线实测，已定 A）
 - ✅ 阶段②：`AGENTS.md`、`GLOSSARY.md`、`docs/adr/` 三条决策
@@ -86,7 +87,7 @@
 
 ### 还没做
 
-- ⬜ 步骤 6：上屏（SendInput / 剪贴板回退 + 焦点归还）
+- ⬜ 步骤 6 的人工补测：WPS / 浏览器 / VSCode 三处上屏
 - ⬜ 步骤 7：M0 验收
 - ⬜ M1：使用反馈排序
 - ⬜ M2：语料 → Obsidian → 个人词库

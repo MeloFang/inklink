@@ -12,6 +12,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use tauri::{AppHandle, Emitter, Manager, State};
+use tauri_plugin_clipboard_manager::ClipboardExt;
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 
 use engine::lexicon::Lexicon;
@@ -126,8 +127,47 @@ fn hide_panel(app: AppHandle) {
 
 fn toggle_panel(app: &AppHandle) {
     let visible = PANEL_VISIBLE.load(std::sync::atomic::Ordering::SeqCst);
+    if !visible {
+        // 唤出前记住前台窗口，上屏时要还回去
+        let target = platform::foreground_window();
+        if target != 0 {
+            TARGET_WINDOW.store(target, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
     place_panel(app, !visible);
     PANEL_VISIBLE.store(!visible, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// 上屏的目标窗口（唤出面板前的前台窗口）。
+static TARGET_WINDOW: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+
+/// 把选中的候选写进目标应用。
+///
+/// 顺序很关键：先藏面板 → 把焦点还给目标窗口 → 发字符。
+/// `SendInput` 失败（部分应用/权限受限场景）时退回「剪贴板 + Ctrl+V」。
+#[tauri::command]
+fn commit_text(app: AppHandle, text: String) -> Result<(), String> {
+    if text.is_empty() {
+        return Ok(());
+    }
+
+    // 1. 收起面板（否则焦点还在我们这边，字符会打到空气里）
+    place_panel(&app, false);
+    PANEL_VISIBLE.store(false, std::sync::atomic::Ordering::SeqCst);
+
+    // 2. 焦点还给唤起前的窗口
+    let target = TARGET_WINDOW.load(std::sync::atomic::Ordering::SeqCst);
+    platform::focus_window(target);
+    std::thread::sleep(std::time::Duration::from_millis(40));
+
+    // 3. 直发字符，失败则走剪贴板
+    if platform::send_unicode(&text) {
+        return Ok(());
+    }
+    if app.clipboard().write_text(text).is_ok() && platform::send_paste() {
+        return Ok(());
+    }
+    Err("上屏失败：目标窗口可能不允许模拟输入".into())
 }
 
 /// 面板当前是否可见（由我们自己维护，避免依赖窗口 API 的时序）。
@@ -136,6 +176,7 @@ static PANEL_VISIBLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicB
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
                 .with_handler(|app, shortcut, event| {
@@ -152,7 +193,7 @@ pub fn run() {
                 })
                 .build(),
         )
-        .invoke_handler(tauri::generate_handler![search, hide_panel])
+        .invoke_handler(tauri::generate_handler![search, hide_panel, commit_text])
         .setup(|app| {
             // 词库加载与建索引放到后台线程：debug 构建要 300–600ms，
             // 放主线程会拖住窗口/WebView2 的创建。
