@@ -76,8 +76,9 @@
 - ✅ **步骤 3 完成**：`engine/pinyin.rs` — 402 音节表、带回溯最大匹配、模糊音、简拼识别；12 个单测全绿
 - ✅ **步骤 4 完成**：`engine/ranker.rs` — 全拼整词/前缀 + 简拼整词 + 模糊音，18 个单测全绿；
   release 实测 平均 62µs/次（最慢 233µs），建索引 90ms；跨词组合按 D9 推迟到 4b
-- 🟡 **步骤 5 代码完成**：全局热键（`ctrl+``）+ 面板 toggle + 前端输入/候选/键盘导航/Esc；
-  `search` 命令接 `Ranker`；词库在后台线程加载。**UI 未能实测**（见已知问题）
+- ✅ **步骤 5 完成（用户实机确认）**：全局热键（Ctrl+/Alt+/Ctrl+Shift+` 三组）、面板居中唤出、
+  候选渲染与键盘导航、Esc 隐藏。前端改为 `<div tabindex=0>` + 自接管按键（不用 `<input>`），
+  彻底绕开输入法冲突与 `ImmAssociateContext` 引起的闪退
 - ✅ `docs/architecture.md`（三层解耦 / 四条数据流 / Obsidian 与 AI 协同 / M0–M4 路线）
 - ✅ `docs/base-lexicon-eval.md`（三条词库路线实测，已定 A）
 - ✅ 阶段②：`AGENTS.md`、`GLOSSARY.md`、`docs/adr/` 三条决策

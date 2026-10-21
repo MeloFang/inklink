@@ -137,11 +137,13 @@
 
   <ul>
     {#each cands as c, i}
-      <li class:active={i === sel} onclick={() => (sel = i)}>
-        <span class="idx">{i + 1}</span>
-        <span class="text">{c.text}</span>
-        <span class="py">{c.pinyin}</span>
-        <span class="meta">{c.source} · {c.freq}</span>
+      <li>
+        <button type="button" class="row" class:active={i === sel} onclick={() => (sel = i)}>
+          <span class="idx">{i + 1}</span>
+          <span class="text">{c.text}</span>
+          <span class="py">{c.pinyin}</span>
+          <span class="meta">{c.source} · {c.freq}</span>
+        </button>
       </li>
     {:else}
       <li class="empty">{input.trim() ? "无候选" : " "}</li>
@@ -242,16 +244,27 @@
   }
 
   li {
+    display: block;
+  }
+
+  .row {
+    box-sizing: border-box;
+    width: 100%;
     display: flex;
     align-items: baseline;
     gap: 10px;
     padding: 6px 8px;
+    border: 0;
     border-radius: 7px;
+    background: transparent;
+    color: inherit;
+    font: inherit;
     font-size: 15px;
+    text-align: left;
     cursor: default;
   }
 
-  li.active {
+  .row.active {
     background: #3b82f62e;
   }
 
