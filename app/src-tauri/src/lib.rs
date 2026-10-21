@@ -5,8 +5,8 @@
 //! 2. 同步路径 50ms 封顶；
 //! 3. 默认不联网。
 
-mod engine;
-mod platform;
+pub mod engine;
+pub mod platform;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
