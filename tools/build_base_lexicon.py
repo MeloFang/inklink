@@ -46,7 +46,27 @@ def parse_dict_text(text: str) -> list[tuple[str, str, int]]:
     列数不足 3、词或拼音为空、权重非数字的行一律跳过。
     找不到表体标记时抛 ValueError。
     """
-    raise NotImplementedError("TDD 红线：先写测试，再实现")
+    lines = text.splitlines()
+    try:
+        start = next(i for i, line in enumerate(lines) if line.strip() == "...") + 1
+    except StopIteration:
+        raise ValueError("找不到表体起始标记 '...'") from None
+
+    rows: list[tuple[str, str, int]] = []
+    for line in lines[start:]:
+        if not line.strip() or line.startswith("#"):
+            continue
+        fields = line.split("\t")
+        if len(fields) < 3:
+            continue
+        word, pinyin, weight = fields[0].strip(), fields[1].strip(), fields[2].strip()
+        if not word or not pinyin:
+            continue
+        try:
+            rows.append((word, pinyin, int(weight)))
+        except ValueError:
+            continue
+    return rows
 
 
 def parse_dict(path: Path) -> list[tuple[str, str, int]]:
@@ -76,7 +96,11 @@ def main() -> int:
     merged: dict[tuple[str, str], int] = {}
     stats = {}
     for name, _desc in SOURCES:
-        rows = parse_dict(ICE / name)
+        try:
+            rows = parse_dict(ICE / name)
+        except ValueError as e:
+            print(f"{name}: {e}", file=sys.stderr)
+            return 1
         kept = 0
         for word, pinyin, w in rows:
             if w < args.min_weight:
