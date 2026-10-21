@@ -115,4 +115,35 @@ mod tests {
         assert!(is_syllable("a"));
         assert!(!is_syllable("zzz"));
     }
+
+    #[test]
+    fn 模糊音生成变体() {
+        // zh/z
+        assert!(fuzzy_variants("zhang").contains(&"zang".to_string()));
+        // ng/n
+        assert!(fuzzy_variants("zhang").contains(&"zhan".to_string()));
+        // sh/s
+        assert!(fuzzy_variants("shi").contains(&"si".to_string()));
+        // n/l
+        assert!(fuzzy_variants("ni").contains(&"li".to_string()));
+        // 自身不在变体里
+        assert!(!fuzzy_variants("ni").contains(&"ni".to_string()));
+    }
+
+    #[test]
+    fn 逗号分隔的输入被归一化() {
+        // 分隔符不影响切分
+        assert_eq!(decode("xi'an"), Some(vec!["xi".into(), "an".into()]));
+        // ü 的各种写法统一成 v
+        assert_eq!(decode("lüxing"), Some(vec!["lv".into(), "xing".into()]));
+        assert_eq!(decode("LVXING"), Some(vec!["lv".into(), "xing".into()]));
+    }
+
+    #[test]
+    fn 简拼识别() {
+        assert!(is_abbreviation("xmch"));
+        assert!(is_abbreviation("zgrm"));
+        assert!(!is_abbreviation("xiangmu"));
+        assert!(!is_abbreviation("x"));
+    }
 }
