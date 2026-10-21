@@ -3,3 +3,4 @@
 //! 全部在同步路径上，预算 50ms。不得做 IO、不得调网络、不得调大模型。
 
 pub mod lexicon;
+pub mod pinyin;
