@@ -58,7 +58,7 @@
 | ① 立项与产品文档 | ✅ | `PRODUCT.md` | v0.2，方向已定（面板 + 开源产品） |
 | ② 固定上下文 | ✅ | `AGENTS.md` `GLOSSARY.md` `docs/adr/` | 3 条 ADR：不注入 / AI 不进同步路径 / 词库选型 |
 | ③ 规划 | ✅ | `PLAN.md` | M0 拆成 8 步（0–7） |
-| ④ 实现 | ⬜ | — | 从步骤 0 开始 |
+| ④ 实现 | 🟡 | `app/` | 步骤 0/8 完成（骨架与构建链） |
 | ⑤ 验证 | ⬜ | — | |
 | ⑥ 续接文档 | ✅ | 本文件 | |
 
@@ -67,6 +67,8 @@
 - ✅ **复跑 v1 管线成功**（2026-10-21）：367 候选 → 13 条词条，拼音正确，与历史记录一致
 - ✅ 环境探测：Rust 1.98 / Node 24 / Python 3.13 可用；**无 .NET**；搜狗拼音 16.8 已装；小狼毫未装
 - ✅ `PRODUCT.md` v0.2（开源产品定位）
+- ✅ **步骤 0 完成**：Tauri 2 + Svelte 面板骨架，`inklink.exe` 能起窗口（title=inklink），
+  clippy / fmt / test / svelte-check 全绿，`tauri build --debug` 能出 MSI + NSIS 安装包
 - ✅ `docs/architecture.md`（三层解耦 / 四条数据流 / Obsidian 与 AI 协同 / M0–M4 路线）
 - ✅ `docs/base-lexicon-eval.md`（三条词库路线实测，已定 A）
 - ✅ 阶段②：`AGENTS.md`、`GLOSSARY.md`、`docs/adr/` 三条决策

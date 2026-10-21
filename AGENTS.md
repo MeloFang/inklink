@@ -48,14 +48,26 @@ cd C:\dsh\work\inklink
 
 **M0 之后（Rust，步骤 0 建好后可用）**
 ```powershell
+# ⚠️ 必须先修正 PATH：本机 Program Files 下装着 GNU 版 rustc 1.98，
+#    它会盖住 rustup 的 MSVC 版，导致 `dlltool.exe not found`。
+$env:PATH = "$env:USERPROFILE\.cargo\bin;$env:PATH"
+
 cd app
+npm install
+npm run check                   # svelte-check，0 error 0 warning
+npm run build                   # 产出 ../build
 cargo tauri dev                 # 开发运行
 cargo test                      # 全部单测
-cargo clippy -- -D warnings     # 必须零告警
-cargo fmt --check               # 必须已格式化
+cargo clippy --all-targets -- -D warnings
+cargo fmt --check
 ```
 
-> 环境事实：Rust 1.98 / Node 24 / Python 3.13 已装；**无 .NET**；WebView2 由 Win11 提供。
+> 环境事实：rustup 默认 `stable-x86_64-pc-windows-msvc`（1.99.1）；VS 2022 Community + Windows SDK 10.0.26100 已装；Node 24 / Python 3.13 已装；**无 .NET**。
+
+> ⚠️ **在 DSH 会话里验证 GUI**：本会话是提权进程（High Mandatory Level），WebView2 的 Chromium 沙箱会失败，报
+> `Failed to setup app: 拒绝访问。(os error 5)`。验证时临时加：
+> `$env:WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS='--no-sandbox'`。
+> 用户自己双击运行时是普通权限，**不需要**这个变量，也不要写进发布配置。
 
 ## 编码约定
 

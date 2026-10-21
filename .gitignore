@@ -11,6 +11,8 @@ app/src-tauri/gen/
 # === Node ===
 app/node_modules/
 app/dist/
+app/build/
+app/.svelte-kit/
 app/.vite/
 npm-debug.log*
 

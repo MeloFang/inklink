@@ -7,7 +7,7 @@
 
 | # | 步骤 | 依赖 | 验收信号 | 状态 |
 |:---|:---|:---|:---|:---|
-| 0 | 仓库骨架与构建链 | — | `cargo tauri dev` 开出空窗口，clippy 零告警 | ⬜ |
+| 0 | 仓库骨架与构建链 | — | `cargo tauri dev` 开出空窗口，clippy 零告警 | ✅ |
 | 1 | 词库格式与加载器 | 0 | 6 万条加载 < 200ms，前缀查询 < 1ms（单测） | ⬜ |
 | 2 | luna_pinyin → TSV 转换工具 | 1 | 转换条数一致、抽样拼音一致、输出可重复 | ⬜ |
 | 3 | 拼音切分与模糊音 | 1 | 30 组标注样例全绿 | ⬜ |
@@ -24,18 +24,28 @@
 
 **做什么**：
 - 初始化 git 仓库，`.gitignore` 覆盖 `data/`、`app/target/`、`app/node_modules/`、`.venv/`、`tmp/`
-- 用 `cargo create-tauri-app`（Svelte + TypeScript 模板）生成 `app/`
-- 删掉模板自带的示例页面，换成一个空白面板窗口（无边框、置顶、默认隐藏）
-- 在 `app/src-tauri` 里建 `engine/`、`platform/`、`ui/` 三个模块目录
+- 用 `npm create tauri-app`（Svelte + TypeScript 模板）生成 `app/`
+- 删掉模板自带的示例页面，换成一个空白面板窗口（无边框、透明、置顶、不占任务栏）
+- 在 `app/src-tauri/src` 里建 `engine/`、`platform/` 模块目录
+
+> 说明：窗口默认隐藏要配合全局热键才有意义，那属于步骤 5。步骤 0 先让窗口可见，用 Esc 隐藏，作为构建链的可见证据。
 
 **验收**：
-- [ ] `cd app && cargo tauri dev` 打开一个空白小窗
-- [ ] `cargo test`、`cargo clippy -- -D warnings`、`cargo fmt --check` 全绿
-- [ ] `git status` 干净，`data/` 与 `target/` 未被跟踪
+- [x] 应用能启动并显示 `inklink` 窗口（`target\debug\inklink.exe`，title=inklink）
+- [x] `cargo test`、`cargo clippy --all-targets -- -D warnings`、`cargo fmt --check` 全绿
+- [x] `svelte-check` 0 error 0 warning；`npm run build` 产出 `../build`
+- [x] `git status` 干净，`data/`、`target/`、`node_modules/` 未被跟踪
+- [x] 附带：`tauri build --debug` 能出 MSI 与 NSIS 安装包
 
 **测试接缝**：无（本步不写业务测试）
 
 **可能踩的坑**：国内拉 crates 慢（配镜像）；WebView2 缺失导致白屏；Tauri 2 与 Node 24 的模板版本要匹配。
+
+**实际操作中踩到的坑（已写进 AGENTS.md）**：
+1. 本机 Program Files 下有 GNU 版 rustc 1.98，盖住 rustup 的 MSVC 版 → `dlltool.exe not found`。修法：把 `%USERPROFILE%\.cargo\bin` 放到 PATH 最前。
+2. MSVC 工具链缺 `clippy` / `rustfmt` 组件 → `rustup component add clippy rustfmt`。
+3. 本 DSH 会话是提权进程，WebView2 沙箱起不来 → `os error 5`。修法：验证时设 `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--no-sandbox`（用户正常双击不受影响）。
+4. `main.rs` 里写的是模板的 `app_lib::run()`，改 crate 名后要同步改成 `inklink_lib::run()`。
 
 ---
 
