@@ -1,7 +1,26 @@
-//! 平台层：窗口句柄、上屏（SendInput）、剪贴板兜底。
+//! 平台层：窗口句柄、上屏（SendInput）、键盘钩子。
 //!
 //! Windows 专有 API 集中在这里，便于将来隔离与替换。
 
+pub mod hook;
+/// 加上 `WS_EX_NOACTIVATE`：显示时不夺取焦点，目标应用保持前台（光标不消失）。
+#[cfg(windows)]
+pub fn make_no_activate(hwnd: isize) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GWL_EXSTYLE, GetWindowLongPtrW, SetWindowLongPtrW, WS_EX_NOACTIVATE,
+    };
+    if hwnd == 0 {
+        return;
+    }
+    // SAFETY: 只改本进程窗口的扩展样式
+    unsafe {
+        let ex = GetWindowLongPtrW(hwnd as _, GWL_EXSTYLE);
+        SetWindowLongPtrW(hwnd as _, GWL_EXSTYLE, ex | WS_EX_NOACTIVATE as isize);
+    }
+}
+
+#[cfg(not(windows))]
+pub fn make_no_activate(_hwnd: isize) {}
 /// 取当前前台窗口句柄（0 表示没有）。
 pub fn foreground_window() -> isize {
     #[cfg(windows)]

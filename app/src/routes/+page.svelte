@@ -1,7 +1,7 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
   import { listen } from "@tauri-apps/api/event";
-  import { getCurrentWindow } from "@tauri-apps/api/window";
+  
   import { onMount } from "svelte";
 
   type Cand = {
@@ -16,9 +16,9 @@
   let cands = $state<Cand[]>([]);
   let sel = $state(0);
   let costUs = $state(0);
-  let boxEl = $state<HTMLDivElement>();
 
-  const win = getCurrentWindow();
+
+
 
   async function refresh(q: string) {
     if (!q.trim()) {
@@ -79,45 +79,35 @@
     void refresh(input);
   }
 
-  // 不用 <input>：可编辑元素会激活系统输入法，把它摘掉又会引发崩溃。
-  // 这里自己接管按键，界面上只显示我们拼出来的字符串。
-  function onKey(e: KeyboardEvent) {
-    if (e.key === "Escape") {
+  // 面板不抢焦点（WS_EX_NOACTIVATE），按键由 Rust 的键盘钩子采集后以事件发过来。
+  // 这里只负责按语义分发：字母拼输入、数字选词、其余透传。
+  function onKey(key: string) {
+    if (key === "Escape") {
       hide();
-      e.preventDefault();
       return;
     }
-    if (e.ctrlKey || e.altKey || e.metaKey) return;
 
-    switch (e.key) {
+    switch (key) {
       case "Backspace":
         backspace();
-        e.preventDefault();
         return;
       case "ArrowDown":
         move(1);
-        e.preventDefault();
         return;
       case "ArrowUp":
         move(-1);
-        e.preventDefault();
         return;
       case "Enter":
-        void commit();
-        e.preventDefault();
-        return;
       case "Tab":
         void commit();
-        e.preventDefault();
         return;
     }
 
-    if (e.key.length === 1) {
-      const ch = e.key.toLowerCase();
+    if (key.length === 1) {
+      const ch = key.toLowerCase();
       // 字母、撇号（音节分隔）、空格
       if (/^[a-z'’ ]$/.test(ch)) {
         type(ch);
-        e.preventDefault();
         return;
       }
       // 数字键：有候选时选词，否则当作数字透传给目标应用
@@ -128,13 +118,11 @@
         } else if (!input) {
           void forward(ch);
         }
-        e.preventDefault();
         return;
       }
       // 其他可打印字符（标点等）：不在拼音里，直接透传
       if (!input) {
-        void forward(e.key);
-        e.preventDefault();
+        void forward(key);
       }
     }
   }
@@ -144,21 +132,18 @@
       if (input.trim()) void refresh(input);
     });
 
-    void win.onFocusChanged(({ payload: focused }) => {
-      if (focused) {
-        input = "";
-        cands = [];
-        sel = 0;
-        costUs = 0;
-        boxEl?.focus();
-      }
-    });
+    // 按键来自 Rust 的键盘钩子（面板不抢焦点）
+    void listen<string>("key", (e) => onKey(e.payload));
 
-    boxEl?.focus();
+    // 面板每次唤出都清空上一轮的输入
+    void listen("panel-shown", () => {
+      input = "";
+      cands = [];
+      sel = 0;
+      costUs = 0;
+    });
   });
 </script>
-
-<svelte:window on:keydown={onKey} />
 
 <main class="panel">
   <header>
@@ -166,7 +151,7 @@
     <span class="hint">Esc 隐藏 · ↑↓ 选择 · 数字键直选</span>
   </header>
 
-  <div class="box" bind:this={boxEl} tabindex="0" role="textbox" aria-label="拼音输入">
+  <div class="box" role="textbox" aria-label="拼音输入">
     {#if input}
       <span class="typed">{input}</span><span class="caret"></span>
     {:else}

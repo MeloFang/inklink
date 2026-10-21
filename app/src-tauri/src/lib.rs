@@ -99,6 +99,8 @@ fn place_panel(app: &AppHandle, visible: bool) {
     let Some(win) = app.get_webview_window("main") else {
         return;
     };
+    // 钩子只在面板可见时采集按键
+    platform::hook::set_active(visible);
     if !visible {
         let _ = win.set_position(tauri::PhysicalPosition::new(HIDDEN_POS, HIDDEN_POS));
         return;
@@ -113,8 +115,9 @@ fn place_panel(app: &AppHandle, visible: bool) {
         let y = origin.y + (screen.height as i32 - size.height as i32) / 3;
         let _ = win.set_position(tauri::PhysicalPosition::new(x, y));
     }
+    // 窗口带 WS_EX_NOACTIVATE：show 不会抢焦点，目标应用保持前台
     let _ = win.show();
-    let _ = win.set_focus();
+    let _ = app.emit("panel-shown", ());
 }
 
 /// 前端请求隐藏面板（Esc）。必须走这里，不能直接调 `window.hide()`——
@@ -143,8 +146,10 @@ static TARGET_WINDOW: std::sync::atomic::AtomicIsize = std::sync::atomic::Atomic
 
 /// 把选中的候选写进目标应用。
 ///
-/// `keep_open = true` 时上屏后把焦点收回面板，支持连续输入（否则打一个词就得重新按热键）。
-/// 顺序很关键：焦点先给目标窗口 → 发字符 → 再把焦点抢回来，否则字符会打到自己的窗口里。
+/// `keep_open = true` 时上屏后面板保持可见，可以接着打下个词。
+///
+/// 面板带 `WS_EX_NOACTIVATE`，目标应用一直是前台，所以**不需要切焦点**，
+/// 直接 `SendInput` 就会落到目标应用的光标处。
 #[tauri::command]
 fn commit_text(app: AppHandle, text: String, keep_open: Option<bool>) -> Result<(), String> {
     if text.is_empty() {
@@ -152,28 +157,19 @@ fn commit_text(app: AppHandle, text: String, keep_open: Option<bool>) -> Result<
     }
     let keep_open = keep_open.unwrap_or(false);
 
-    // 1. 焦点还给唤起前的窗口
-    let target = TARGET_WINDOW.load(std::sync::atomic::Ordering::SeqCst);
-    platform::focus_window(target);
-    std::thread::sleep(std::time::Duration::from_millis(35));
-    let now_fg = platform::foreground_window();
-    eprintln!(
-        "[commit] text={text:?} target={target} fg_after_focus={now_fg} keep_open={keep_open}"
-    );
-
-    // 2. 直发字符，失败则走剪贴板
+    // 上屏期间让钩子放行（我们自己的字符不能被自己吞掉）
+    platform::hook::set_committing(true);
+    // 直发字符，失败则走剪贴板
     let ok = if platform::send_unicode(&text) {
         true
     } else {
-        app.clipboard().write_text(text).is_ok() && platform::send_paste()
+        app.clipboard().write_text(text.clone()).is_ok() && platform::send_paste()
     };
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    platform::hook::set_committing(false);
+    eprintln!("[commit] text={text:?} ok={ok} keep_open={keep_open}");
 
-    // 3. 连续模式：把焦点收回面板，接着打下个字
-    if keep_open {
-        if let Some(win) = app.get_webview_window("main") {
-            let _ = win.set_focus();
-        }
-    } else {
+    if !keep_open {
         place_panel(&app, false);
         PANEL_VISIBLE.store(false, std::sync::atomic::Ordering::SeqCst);
     }
@@ -210,6 +206,33 @@ pub fn run() {
         )
         .invoke_handler(tauri::generate_handler![search, hide_panel, commit_text])
         .setup(|app| {
+            // 面板不抢焦点：目标应用保持前台，光标不消失
+            if let Some(win) = app.get_webview_window("main") {
+                match win.hwnd() {
+                    Ok(hwnd) => platform::make_no_activate(hwnd.0 as isize),
+                    Err(e) => eprintln!("取窗口句柄失败: {e}"),
+                }
+            }
+
+            // 仅测试：允许模拟按键进钩子（正常使用必须关闭）
+            if std::env::var("INKLINK_TEST_INJECTED").is_ok() {
+                platform::hook::set_allow_injected(true);
+                eprintln!("⚠️ 测试模式：接受注入按键");
+            }
+
+            // 键盘钩子：面板可见时采集按键，通过事件发给前端
+            let (tx, rx) = std::sync::mpsc::channel::<String>();
+            let hook_handle = app.handle().clone();
+            std::thread::spawn(move || {
+                for key in rx {
+                    let _ = hook_handle.emit("key", key);
+                }
+            });
+            match platform::hook::start(tx) {
+                true => println!("键盘钩子已安装"),
+                false => eprintln!("键盘钩子安装失败：面板可能收不到按键"),
+            }
+
             // 词库加载与建索引放到后台线程：debug 构建要 300–600ms，
             // 放主线程会拖住窗口/WebView2 的创建。
             app.manage(AppState(Mutex::new(None)));
