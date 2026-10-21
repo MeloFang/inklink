@@ -176,14 +176,19 @@ pub fn run() {
                 PANEL_VISIBLE.store(false, std::sync::atomic::Ordering::SeqCst);
             });
 
-            // 全局热键：Ctrl+`（用键码显式构造，避免字符串解析歧义）
-            let hotkey = tauri_plugin_global_shortcut::Shortcut::new(
-                Some(tauri_plugin_global_shortcut::Modifiers::CONTROL),
-                tauri_plugin_global_shortcut::Code::Backquote,
-            );
-            match app.global_shortcut().register(hotkey) {
-                Ok(()) => println!("热键已注册: Ctrl+`"),
-                Err(e) => eprintln!("热键注册失败: {e}"),
+            // 全局热键：同时注册几个，谁先按到算谁
+            // （` 是 Tab 上方、数字 1 左边那个键，常被误认成单引号）
+            use tauri_plugin_global_shortcut::{Code, Modifiers, Shortcut};
+            let combos = [
+                (Modifiers::CONTROL, Code::Backquote, "Ctrl+`"),
+                (Modifiers::ALT, Code::Backquote, "Alt+`"),
+                (Modifiers::CONTROL | Modifiers::SHIFT, Code::Backquote, "Ctrl+Shift+`"),
+            ];
+            for (mods, code, label) in combos {
+                match app.global_shortcut().register(Shortcut::new(Some(mods), code)) {
+                    Ok(()) => println!("热键已注册: {label}"),
+                    Err(e) => eprintln!("热键注册失败 {label}: {e}"),
+                }
             }
 
             // 摘掉本窗口的输入法关联：面板自己就是输入法，不能让系统 IME 截走按键
