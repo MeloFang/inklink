@@ -98,8 +98,12 @@
   并把 `data\base.tsv` 放到同目录 `data\` 下。
 - **`hide()/show()` 在 WebView2 上不可靠**：`show()` 返回 Ok、`is_visible()` 也变 true，但窗口不出现。
   现在改用「挪到 `(-30000,-30000)`」实现隐藏，唤出时挪回屏幕中央。
-- **系统输入法会抢按键**：必须对面板窗口（含 WebView2 的子窗口）递归
-  `ImmAssociateContext(hwnd, NULL)`，否则搜狗/微软拼音会弹自己的候选框。见 `platform::disable_ime`。
+- **不要用 `<input>` 收拼音**：可编辑元素会激活系统输入法，搜狗/微软拼音会弹自己的候选框吃掉按键；
+  而用 `ImmAssociateContext` 递归摘除 IME 虽然当时有效，**实测会在输入后退格时让进程 fast-fail（0xc0000409）**。
+  现在改成 `<div tabindex=0>` + 自己接管 `keydown`（字母/退格/方向键/数字键），界面上只渲染拼出来的字符串。
+  没有可编辑元素，输入法自然不介入。
+- **隐藏必须走 `hide_panel` 命令**：前端直接 `win.hide()` 不会更新 Rust 的可见标记，
+  导致下次热键被当成"该隐藏"，表现为热键失灵。
 - **词库加载与前端查询有竞态**：已用 `lexicon-ready` 事件解决。
 - `Ranker` 启动时建两份索引（code / initials），80k 词条约 90ms；可接受，暂不优化。
 - v1 的 Python 抽取管线尚未与 Rust 侧打通（M2 的事）。

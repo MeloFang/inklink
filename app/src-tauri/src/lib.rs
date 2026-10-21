@@ -116,6 +116,14 @@ fn place_panel(app: &AppHandle, visible: bool) {
     let _ = win.set_focus();
 }
 
+/// 前端请求隐藏面板（Esc）。必须走这里，不能直接调 `window.hide()`——
+/// 否则 `PANEL_VISIBLE` 不会更新，下次热键会被当成"该隐藏"，看起来就像热键失灵。
+#[tauri::command]
+fn hide_panel(app: AppHandle) {
+    place_panel(&app, false);
+    PANEL_VISIBLE.store(false, std::sync::atomic::Ordering::SeqCst);
+}
+
 fn toggle_panel(app: &AppHandle) {
     let visible = PANEL_VISIBLE.load(std::sync::atomic::Ordering::SeqCst);
     place_panel(app, !visible);
@@ -144,7 +152,7 @@ pub fn run() {
                 })
                 .build(),
         )
-        .invoke_handler(tauri::generate_handler![search])
+        .invoke_handler(tauri::generate_handler![search, hide_panel])
         .setup(|app| {
             // 词库加载与建索引放到后台线程：debug 构建要 300–600ms，
             // 放主线程会拖住窗口/WebView2 的创建。
@@ -182,25 +190,22 @@ pub fn run() {
             let combos = [
                 (Modifiers::CONTROL, Code::Backquote, "Ctrl+`"),
                 (Modifiers::ALT, Code::Backquote, "Alt+`"),
-                (Modifiers::CONTROL | Modifiers::SHIFT, Code::Backquote, "Ctrl+Shift+`"),
+                (
+                    Modifiers::CONTROL | Modifiers::SHIFT,
+                    Code::Backquote,
+                    "Ctrl+Shift+`",
+                ),
             ];
             for (mods, code, label) in combos {
-                match app.global_shortcut().register(Shortcut::new(Some(mods), code)) {
+                match app
+                    .global_shortcut()
+                    .register(Shortcut::new(Some(mods), code))
+                {
                     Ok(()) => println!("热键已注册: {label}"),
                     Err(e) => eprintln!("热键注册失败 {label}: {e}"),
                 }
             }
 
-            // 摘掉本窗口的输入法关联：面板自己就是输入法，不能让系统 IME 截走按键
-            if let Some(win) = app.get_webview_window("main") {
-                match win.hwnd() {
-                    Ok(hwnd) => {
-                        platform::disable_ime(hwnd.0 as isize);
-                        println!("已关闭本窗口的输入法关联");
-                    }
-                    Err(e) => eprintln!("取窗口句柄失败: {e}"),
-                }
-            }
             Ok(())
         })
         .run(tauri::generate_context!())

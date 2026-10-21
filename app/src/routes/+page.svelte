@@ -16,7 +16,7 @@
   let cands = $state<Cand[]>([]);
   let sel = $state(0);
   let costUs = $state(0);
-  let inputEl = $state<HTMLInputElement>();
+  let boxEl = $state<HTMLDivElement>();
 
   const win = getCurrentWindow();
 
@@ -33,59 +33,89 @@
     sel = 0;
   }
 
-  function onInput(e: Event) {
-    input = (e.target as HTMLInputElement).value;
-    void refresh(input);
-  }
-
   function move(delta: number) {
     if (!cands.length) return;
     sel = (sel + delta + cands.length) % cands.length;
   }
 
   function hide() {
-    void win.hide();
+    // 交给 Rust 处理：它要同步"可见"标记，否则下次热键会变成再隐藏一次
+    void invoke("hide_panel");
   }
 
+  function type(ch: string) {
+    input += ch;
+    void refresh(input);
+  }
+
+  function backspace() {
+    if (!input) return;
+    input = input.slice(0, -1);
+    void refresh(input);
+  }
+
+  // 不用 <input>：可编辑元素会激活系统输入法，把它摘掉又会引发崩溃。
+  // 这里自己接管按键，界面上只显示我们拼出来的字符串。
   function onKey(e: KeyboardEvent) {
+    if (e.key === "Escape") {
+      hide();
+      e.preventDefault();
+      return;
+    }
+    if (e.ctrlKey || e.altKey || e.metaKey) return;
+
     switch (e.key) {
-      case "Escape":
-        hide();
+      case "Backspace":
+        backspace();
         e.preventDefault();
-        break;
+        return;
       case "ArrowDown":
         move(1);
         e.preventDefault();
-        break;
+        return;
       case "ArrowUp":
         move(-1);
         e.preventDefault();
-        break;
-      default:
-        if (/^[1-9]$/.test(e.key)) {
-          const i = Number(e.key) - 1;
-          if (i < cands.length) {
-            sel = i;
-            e.preventDefault();
-          }
-        }
+        return;
+      case "Enter":
+      case "Tab":
+        e.preventDefault();
+        return;
+    }
+
+    if (e.key.length === 1) {
+      const ch = e.key.toLowerCase();
+      // 字母、撇号（音节分隔）、空格
+      if (/^[a-z'’ ]$/.test(ch)) {
+        type(ch);
+        e.preventDefault();
+        return;
+      }
+      // 数字键选候选
+      if (/^[1-9]$/.test(ch) && cands.length) {
+        const i = Number(ch) - 1;
+        if (i < cands.length) sel = i;
+        e.preventDefault();
+      }
     }
   }
 
   onMount(() => {
-    // 词库是后台线程加载的：就绪后重跑一次当前查询
     void listen<number>("lexicon-ready", () => {
       if (input.trim()) void refresh(input);
     });
+
     void win.onFocusChanged(({ payload: focused }) => {
       if (focused) {
         input = "";
         cands = [];
         sel = 0;
         costUs = 0;
-        inputEl?.focus();
+        boxEl?.focus();
       }
     });
+
+    boxEl?.focus();
   });
 </script>
 
@@ -97,17 +127,13 @@
     <span class="hint">Esc 隐藏 · ↑↓ 选择 · 数字键直选</span>
   </header>
 
-  <input
-    bind:this={inputEl}
-    value={input}
-    oninput={onInput}
-    placeholder="输入拼音，例如 xiangmu / zgrm"
-    spellcheck="false"
-    autocomplete="off"
-    autofocus
-    lang="en"
-    inputmode="latin"
-  />
+  <div class="box" bind:this={boxEl} tabindex="0" role="textbox" aria-label="拼音输入">
+    {#if input}
+      <span class="typed">{input}</span><span class="caret"></span>
+    {:else}
+      <span class="placeholder">输入拼音，例如 xiangmu / zgrm</span><span class="caret"></span>
+    {/if}
+  </div>
 
   <ul>
     {#each cands as c, i}
@@ -166,21 +192,45 @@
     color: #7b8494;
   }
 
-  input {
+  .box {
     box-sizing: border-box;
-    width: 100%;
+    min-height: 44px;
     padding: 10px 12px;
     border-radius: 9px;
     border: 1px solid #ffffff1f;
     background: #00000038;
-    color: #eceff4;
     font-size: 18px;
     letter-spacing: 0.6px;
+    display: flex;
+    align-items: center;
     outline: none;
   }
 
-  input:focus {
+  .box:focus {
     border-color: #3b82f6;
+  }
+
+  .typed {
+    color: #eceff4;
+  }
+
+  .placeholder {
+    color: #6b7280;
+    font-size: 15px;
+  }
+
+  .caret {
+    width: 2px;
+    height: 20px;
+    margin-left: 1px;
+    background: #3b82f6;
+    animation: blink 1.1s step-end infinite;
+  }
+
+  @keyframes blink {
+    50% {
+      opacity: 0;
+    }
   }
 
   ul {
