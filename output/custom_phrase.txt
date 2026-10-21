@@ -1,0 +1,13 @@
+光纤入户	guang xian ru hu	35
+嘉兴分公司	jia xing fen gong si	20
+周报模板	zhou bao mu ban	19
+运维平台	yun wei ping tai	14
+试点	shi dian	14
+项目进度	xiang mu jin du	11
+里程碑	li cheng bei	10
+背景	bei jing	10
+目标	mu biao	10
+术语表	shu yu biao	10
+下周计划	xia zhou ji hua	10
+三千户	san qian hu	5
+项目代号赤兔	xiang mu dai hao chi tu	4

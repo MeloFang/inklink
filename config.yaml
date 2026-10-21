@@ -1,0 +1,16 @@
+# rime-vault-bridge 配置
+# 路径可用正斜杠；vault_path 指向你的 Obsidian 仓库或任意 .md 文件夹
+# 相对路径相对于「本配置文件所在目录」（即 rime-vault-bridge/）
+
+vault_path: "sample_vault"            # 换成你的真实仓库绝对路径，例如 C:/Users/Administrator/Documents/MyVault
+output_path: "output/custom_phrase.txt"
+
+# 提取 / 筛选阈值
+min_weight: 4        # 权重低于此值不写入。权重基准：标题 10 / 双链 8 / 标签 6 / 粗体 4 / 词频(2~4字 n-gram) 每出现 1 次 +1
+min_len: 2           # 最短词长（汉字数）
+max_len: 12          # 最长词长
+freq_as_term: true   # 高频 2~4 字片段是否计入词库
+
+# Rime 用户目录（安装小狼毫后填，例如 C:/Users/Administrator/AppData/Roaming/Rime）
+# 脚本只负责生成 output/custom_phrase.txt，部署动作由你手动或后续脚本完成
+rime_user_dir: ""

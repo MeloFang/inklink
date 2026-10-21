@@ -1,0 +1,30 @@
+# === 词库资源（不进 git，见 ADR-0003） ===
+data/
+*.dict.yaml
+base.tsv
+
+# === Rust / Tauri ===
+app/target/
+app/src-tauri/target/
+app/src-tauri/gen/
+
+# === Node ===
+app/node_modules/
+app/dist/
+app/.vite/
+npm-debug.log*
+
+# === Python ===
+.venv/
+__pycache__/
+*.pyc
+extractor/terms.json
+extractor/.cache/
+tmp/
+
+# === 系统 / 编辑器 ===
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json
