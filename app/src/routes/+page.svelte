@@ -1,5 +1,6 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
+  import { listen } from "@tauri-apps/api/event";
   import { getCurrentWindow } from "@tauri-apps/api/window";
   import { onMount } from "svelte";
 
@@ -72,6 +73,10 @@
   }
 
   onMount(() => {
+    // 词库是后台线程加载的：就绪后重跑一次当前查询
+    void listen<number>("lexicon-ready", () => {
+      if (input.trim()) void refresh(input);
+    });
     void win.onFocusChanged(({ payload: focused }) => {
       if (focused) {
         input = "";
@@ -99,6 +104,9 @@
     placeholder="输入拼音，例如 xiangmu / zgrm"
     spellcheck="false"
     autocomplete="off"
+    autofocus
+    lang="en"
+    inputmode="latin"
   />
 
   <ul>

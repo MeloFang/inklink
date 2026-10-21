@@ -85,7 +85,6 @@
 
 ### 还没做
 
-- ⬜ **步骤 5 的 UI 手测**（本会话无法创建 GUI，需普通桌面会话）
 - ⬜ 步骤 6：上屏（SendInput / 剪贴板回退 + 焦点归还）
 - ⬜ 步骤 7：M0 验收
 - ⬜ M1：使用反馈排序
@@ -93,9 +92,16 @@
 
 ### 已知问题 / 技术债
 
-- **WebView2 在本会话无法初始化**：`0x8000FFFF` / `os error 5` 两种错误随机出现；已排除窗口透明、隐藏创建、热键插件、用户数据目录、锁屏、主线程阻塞六种假设。判断与「提权会话」有关，需在普通桌面会话验证。
-- 窗口启动时可见（本应常驻后台）；M0 暂可接受，M1 加托盘后再改成真正常驻。
-- `Ranker` 在启动时建两份索引（code / initials），80k 词条约 90ms，可接受但可合并。
+- **⚠️ exe 不能放在 `C:\dsh\work` 下运行**：`CreateWindowEx` 返回 `拒绝访问 (os error 5)`，
+  窗口起不来。**同一份 exe 拷到桌面就正常**——是工作区目录的 ACL 影响，与代码无关。
+  开发期验证：`copy target\debug\inklink.exe %USERPROFILE%\Desktop\inklink-test\`，
+  并把 `data\base.tsv` 放到同目录 `data\` 下。
+- **`hide()/show()` 在 WebView2 上不可靠**：`show()` 返回 Ok、`is_visible()` 也变 true，但窗口不出现。
+  现在改用「挪到 `(-30000,-30000)`」实现隐藏，唤出时挪回屏幕中央。
+- **系统输入法会抢按键**：必须对面板窗口（含 WebView2 的子窗口）递归
+  `ImmAssociateContext(hwnd, NULL)`，否则搜狗/微软拼音会弹自己的候选框。见 `platform::disable_ime`。
+- **词库加载与前端查询有竞态**：已用 `lexicon-ready` 事件解决。
+- `Ranker` 启动时建两份索引（code / initials），80k 词条约 90ms；可接受，暂不优化。
 - v1 的 Python 抽取管线尚未与 Rust 侧打通（M2 的事）。
 
 ---

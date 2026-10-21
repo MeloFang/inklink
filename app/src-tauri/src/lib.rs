@@ -11,7 +11,7 @@ pub mod platform;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 
 use engine::lexicon::Lexicon;
@@ -88,18 +88,42 @@ fn lexicon_path() -> PathBuf {
     dev
 }
 
-fn toggle_panel(app: &AppHandle) {
+const HIDDEN_POS: i32 = -30000;
+
+/// 把面板挪到屏幕外（相当于"隐藏"），或挪回屏幕中央。
+///
+/// 不用 `hide()/show()`：在 WebView2 上实测 `hide()` 之后 `show()` 虽然返回 Ok、
+/// `is_visible()` 也变回 true，但窗口实际再也没出现。挪位置最稳。
+fn place_panel(app: &AppHandle, visible: bool) {
     let Some(win) = app.get_webview_window("main") else {
         return;
     };
-    let visible = win.is_visible().unwrap_or(false);
-    if visible {
-        let _ = win.hide();
-    } else {
-        let _ = win.show();
-        let _ = win.set_focus();
+    if !visible {
+        let _ = win.set_position(tauri::PhysicalPosition::new(HIDDEN_POS, HIDDEN_POS));
+        return;
     }
+    if let Ok(Some(monitor)) = win.primary_monitor() {
+        let size = win
+            .outer_size()
+            .unwrap_or(tauri::PhysicalSize::new(680, 420));
+        let origin = monitor.position();
+        let screen = monitor.size();
+        let x = origin.x + (screen.width as i32 - size.width as i32) / 2;
+        let y = origin.y + (screen.height as i32 - size.height as i32) / 3;
+        let _ = win.set_position(tauri::PhysicalPosition::new(x, y));
+    }
+    let _ = win.show();
+    let _ = win.set_focus();
 }
+
+fn toggle_panel(app: &AppHandle) {
+    let visible = PANEL_VISIBLE.load(std::sync::atomic::Ordering::SeqCst);
+    place_panel(app, !visible);
+    PANEL_VISIBLE.store(!visible, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// 面板当前是否可见（由我们自己维护，避免依赖窗口 API 的时序）。
+static PANEL_VISIBLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -121,25 +145,49 @@ pub fn run() {
             let handle = app.handle().clone();
             std::thread::spawn(move || {
                 let path = lexicon_path();
-                let ranker = match Lexicon::load(&path) {
+                let (ranker, count) = match Lexicon::load(&path) {
                     Ok(lex) => {
-                        println!("词库已加载: {} 条 ({})", lex.len(), path.display());
-                        Some(Ranker::new(lex))
+                        let n = lex.len();
+                        println!("词库已加载: {n} 条 ({})", path.display());
+                        (Some(Ranker::new(lex)), n)
                     }
                     Err(e) => {
                         eprintln!("词库加载失败 {}: {e}", path.display());
-                        None
+                        (None, 0)
                     }
                 };
                 if let Some(state) = handle.try_state::<AppState>() {
                     *state.0.lock().unwrap_or_else(|p| p.into_inner()) = ranker;
                 }
+                // 通知前端：索引就绪，可以重新查询了
+                let _ = handle.emit("lexicon-ready", count);
+
+                // 就绪后把面板藏起来，进入"常驻托盘、热键唤出"的状态。
+                // 注意：不能在窗口创建时就设 visible:false —— WebView2 会创建失败。
+                std::thread::sleep(std::time::Duration::from_millis(400));
+                place_panel(&handle, false);
+                PANEL_VISIBLE.store(false, std::sync::atomic::Ordering::SeqCst);
             });
 
-            // 全局热键：Ctrl+`
-            match app.global_shortcut().register("ctrl+`") {
+            // 全局热键：Ctrl+`（用键码显式构造，避免字符串解析歧义）
+            let hotkey = tauri_plugin_global_shortcut::Shortcut::new(
+                Some(tauri_plugin_global_shortcut::Modifiers::CONTROL),
+                tauri_plugin_global_shortcut::Code::Backquote,
+            );
+            match app.global_shortcut().register(hotkey) {
                 Ok(()) => println!("热键已注册: Ctrl+`"),
                 Err(e) => eprintln!("热键注册失败: {e}"),
+            }
+
+            // 摘掉本窗口的输入法关联：面板自己就是输入法，不能让系统 IME 截走按键
+            if let Some(win) = app.get_webview_window("main") {
+                match win.hwnd() {
+                    Ok(hwnd) => {
+                        platform::disable_ime(hwnd.0 as isize);
+                        println!("已关闭本窗口的输入法关联");
+                    }
+                    Err(e) => eprintln!("取窗口句柄失败: {e}"),
+                }
             }
             Ok(())
         })
