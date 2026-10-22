@@ -6,6 +6,7 @@
 //! 3. 默认不联网。
 
 pub mod engine;
+pub mod engine_server;
 pub mod platform;
 
 use std::path::PathBuf;
@@ -105,7 +106,7 @@ fn resize_panel(app: AppHandle, width: f64, height: f64) {
 }
 
 /// 词库路径：环境变量 > 开发期相对路径 > exe 同级 `data/base.tsv`。
-fn lexicon_path() -> PathBuf {
+pub fn lexicon_path() -> PathBuf {
     if let Ok(p) = std::env::var("INKLINK_LEXICON") {
         return PathBuf::from(p);
     }

@@ -150,12 +150,15 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
     fn OnTestKeyDown(
         &self,
         _pic: Ref<ITfContext>,
-        _wparam: WPARAM,
+        wparam: WPARAM,
         _lparam: LPARAM,
     ) -> windows::core::Result<BOOL> {
-        // 返回 TRUE = 我要接收这个键（否则 TSF 根本不会调 OnKeyDown）
-        log_line("testkeydown");
-        Ok(BOOL(1))
+        let vk = wparam.0 as u32;
+        // 只认领真正要处理的键。上下键是输入法候选窗的默认导航键，
+        // 一旦认领，TSF 就不再把它交给应用（实测：上下失效、左右正常）。
+        let handle = should_handle(vk);
+        log_line(&format!("test vk={vk} handle={handle}"));
+        Ok(BOOL(if handle { 1 } else { 0 }))
     }
 
     fn OnKeyDown(
@@ -201,6 +204,21 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
 /// 注意：这是 T2 的诊断手段，正式版会走 IPC 而不是写文件——铁律是回调里不做重 IO。
 fn log_key(vk: u32) {
     log_line(&format!("keydown vk={vk} (0x{vk:X})"));
+}
+
+/// 这个键要不要由输入法认领。
+///
+/// 原则：**只认领真正要处理的**。认领原则之外的键（方向键、Tab、F 键、回车……）
+/// 一律放行给应用，否则会被 TSF 当成"输入法处理掉了"。
+fn should_handle(vk: u32) -> bool {
+    const VK_BACK: u32 = 0x08;
+    const VK_ESCAPE: u32 = 0x1B;
+    const VK_0: u32 = 0x30;
+    const VK_9: u32 = 0x39;
+    const VK_A: u32 = 0x41;
+    const VK_Z: u32 = 0x5A;
+
+    matches!(vk, VK_A..=VK_Z | VK_0..=VK_9 | VK_BACK | VK_ESCAPE)
 }
 
 fn log_line(msg: &str) {

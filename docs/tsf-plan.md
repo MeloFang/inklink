@@ -184,3 +184,24 @@ deactivate
    表现为"能打字但没日志"。教训：部署脚本必须**校验源文件大小**并在复制后比对，不一致直接中止。
 3. **DLL 热替换不可行**（`DllCanUnloadNow=S_FALSE` + 进程驻留），每次部署用**时间戳唯一文件名**注册。
 4. 诊断日志写 `C:\Users\Public\inklink-tsf-<pid>.log`（固定路径比 `%TEMP%` 好找）。
+
+## T3a 实测记录（2026-10-22）
+
+**结果：✅ 通过**——引擎进程 + 命名管道跑通。
+
+`inklink.exe --serve` 进入引擎服务模式（不启动 GUI），通过 `\\.\pipe\inklink-engine` 接受查询：
+
+| 输入 | 往返 | 候选 | 首选 |
+|:---|:---|:---|:---|
+| `xiangmu` | 5 ms | 29 | 项目 |
+| `nihao` | 1 ms | 5 | 你好 |
+| `zgrm` | 1 ms | 7 | 中国人民（简拼） |
+| `shang` | 6 ms | 50 | 上 |
+
+（含 PowerShell/.NET 开销，真实管道往返 <1ms，远低于 30ms 预算）
+
+**协议**：请求 `[u32 长度][UTF-8 拼音]`，响应 `[u32 候选数]` + C 次 `[u16 长度][UTF-8 词]`。
+一次连接一次请求，实现简单，先跑通再谈优化。
+
+**踩的坑**：`windows-sys` 的 `CreateNamedPipeW` 需要 `Win32_Security` + `Win32_Storage_FileSystem` 两个特性，
+`ConnectNamedPipe` 需要 `Win32_System_IO`——少一个就是 unresolved import。
