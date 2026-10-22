@@ -1,44 +1,61 @@
-# 在虚拟机里部署 inklink TSF 输入法（T1：能被系统识别并出现在列表里）
-# 用法（管理员 PowerShell）：powershell -ExecutionPolicy Bypass -File .\deploy.ps1
-#
-# 为什么用 regsvr32 而不是内联 C#：PowerShell 的 here-string 解析会吃掉 C# 代码，
-# 而且 regsvr32 走的就是标准注册路径，行为最接近用户实际安装。
+﻿# inklink TSF deploy v11 - uppercase GUIDs, propagate enable error
+# Run as Administrator: powershell -ExecutionPolicy Bypass -File .\deploy-v11.ps1
 
-$ErrorActionPreference = 'Stop'
-$clsid   = '{8f2a6c1e-4b3d-4f7a-9a21-5c6d7e8f9a0b}'
-$profile = '{1b2c3d4e-5f60-4718-9a2b-3c4d5e6f7081}'
+$ErrorActionPreference = 'Continue'
+$clsid   = '{8F2A6C1E-4B3D-4F7A-9A21-5C6D7E8F9A0B}'
+$profile = '{1B2C3D4E-5F60-4718-9A2B-3C4D5E6F7081}'
 $tip     = "0804:$clsid$profile"
 $dir     = 'C:\Program Files\inklink'
 $dll     = Join-Path $dir 'inklink_tsf.dll'
 
-Write-Host '== 1. 复制 DLL =='
+Write-Host "== 1. copy DLL =="
 New-Item -ItemType Directory -Force $dir | Out-Null
-Copy-Item 'C:\Users\Public\inklink_tsf.dll' $dll -Force
-Write-Host "   $dll"
-
-Write-Host '== 2. regsvr32 注册 =='
-$p = Start-Process -FilePath 'regsvr32.exe' -ArgumentList @('/s', $dll) -PassThru -Wait
-Write-Host "   退出码: $($p.ExitCode)"
-if ($p.ExitCode -ne 0) { throw "regsvr32 失败，退出码 $($p.ExitCode)" }
-
-Write-Host '== 3. 加入当前用户的输入法列表 =='
-$list = Get-WinUserLanguageList
-if ($list[0].InputMethodTips -notcontains $tip) {
-  $list[0].InputMethodTips.Add($tip)
-  Set-WinUserLanguageList -LanguageList $list -Force
+try {
+  Copy-Item 'C:\Users\Public\inklink_tsf5.dll' $dll -Force -ErrorAction Stop
+  Write-Host "   copied"
+} catch {
+  $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+  $dll = Join-Path $dir ("inklink_tsf_" + $stamp + ".dll")
+  Copy-Item 'C:\Users\Public\inklink_tsf5.dll' $dll -Force -ErrorAction Stop
+  Write-Host ("   locked, fallback: " + $dll)
 }
 
-Write-Host '== 4. 验证 =='
-Start-Sleep -Seconds 1
-$now = (Get-WinUserLanguageList)[0].InputMethodTips
-if ($now -contains $tip) {
-  Write-Host '   OK 已出现在输入法列表' -ForegroundColor Green
+Write-Host "== 2. register =="
+Add-Type -TypeDefinition 'using System;using System.Runtime.InteropServices;public class R{[DllImport("kernel32.dll",CharSet=CharSet.Unicode)]public static extern IntPtr LoadLibraryW(string p);[DllImport("kernel32.dll",CharSet=CharSet.Ansi)]public static extern IntPtr GetProcAddress(IntPtr h,string n);[DllImport("kernel32.dll")]public static extern uint GetLastError();[UnmanagedFunctionPointer(CallingConvention.StdCall)]public delegate int F();}'
+$h = [R]::LoadLibraryW($dll)
+if ($h -eq [IntPtr]::Zero) { Write-Host ("   LOAD FAIL " + [R]::GetLastError()); exit 1 }
+$pa = [R]::GetProcAddress($h, 'DllRegisterServer')
+if ($pa -eq [IntPtr]::Zero) { Write-Host "   no export"; exit 1 }
+$f = [System.Runtime.InteropServices.Marshal]::GetDelegateForFunctionPointer($pa, [R+F])
+$hr = $f.Invoke()
+Write-Host ("   HRESULT = 0x{0:X8}" -f $hr)
+if ($hr -ne 0) { Write-Host "   register FAILED, aborting"; exit 1 }
+
+Write-Host "== 3. ensure zh-Hans-CN language =="
+$langList = Get-WinUserLanguageList
+$zh = $langList | Where-Object { $_.LanguageTag -eq 'zh-Hans-CN' } | Select-Object -First 1
+if ($zh -eq $null) {
+  Write-Host "   no Chinese language, adding..."
+  $zhNew = New-WinUserLanguageList 'zh-Hans-CN'
+  $langList.Add($zhNew[0])
+}
+
+Write-Host "== 4. add TIP to zh-Hans-CN =="
+$zh = $langList | Where-Object { $_.LanguageTag -eq 'zh-Hans-CN' } | Select-Object -First 1
+if ($zh -ne $null) {
+  if ($zh.InputMethodTips -notcontains $tip) { $zh.InputMethodTips.Add($tip) }
+  Set-WinUserLanguageList -LanguageList $langList -Force
+}
+
+Write-Host "== 5. verify =="
+Start-Sleep -Seconds 2
+(Get-WinUserLanguageList) | ForEach-Object {
+  Write-Host ("   lang " + $_.LanguageTag)
+  $_.InputMethodTips | ForEach-Object { Write-Host ("      " + $_) }
+}
+if (((Get-WinUserLanguageList) | ForEach-Object { $_.InputMethodTips }) -contains $tip) {
+  Write-Host "RESULT: OK in list"
 } else {
-  Write-Host '   FAIL 未出现在列表，系统没接受这个 TIP' -ForegroundColor Red
-  Write-Host '   当前列表：'
-  $now | ForEach-Object { Write-Host "     $_" }
+  Write-Host "RESULT: still not in list"
 }
-
-Write-Host ''
-Write-Host '接着按 Win+Space，看列表里有没有「inklink 输入法」。'
-Write-Host '卸载：powershell -ExecutionPolicy Bypass -File .\uninstall.ps1'
+Write-Host "done"

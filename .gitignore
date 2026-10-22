@@ -33,3 +33,7 @@ Thumbs.db
 
 *.bak
 
+
+# TSF 构建产物
+/tsf/target/
+/tsf/target-static/
