@@ -161,3 +161,26 @@
 **诊断工具**：`tsf/src/bin/probe.rs` —— 枚举语言配置 + 测试能否实例化 TIP，是定位"注册成功但列表不显示"的分水岭。
 
 **部署脚本**：`vm/deploy-v11.ps1`（自诊断、含中文语言补装、被锁自动换名）、`vm/uninstall.ps1`。
+
+## T2 实测记录（2026-10-22）
+
+**结果：✅ 通过**——按键完整流进 `OnKeyDown`，日志实测：
+
+```
+DllGetClassObject
+ActivateEx
+activate tid=12 advise=ok
+keydown vk=65 (0x41)   ← A
+keydown vk=83 (0x53)   ← S
+deactivate
+```
+
+**关键坑（浪费了好几轮）**：
+
+1. **`OnTestKeyDown` 必须返回 TRUE**，否则 TSF 根本不会调用 `OnKeyDown`。
+   之前的实现返回 FALSE（"我不处理"），导致日志永远空。
+   正确语义：`OnTestKeyDown` 返回 TRUE（我要接收），`OnKeyDown` 返回 FALSE（但我不吞，键照常进应用）。
+2. **部署脚本用字符串替换生成，替换目标写错会静默失败**——连续几轮一直在复制旧 DLL，
+   表现为"能打字但没日志"。教训：部署脚本必须**校验源文件大小**并在复制后比对，不一致直接中止。
+3. **DLL 热替换不可行**（`DllCanUnloadNow=S_FALSE` + 进程驻留），每次部署用**时间戳唯一文件名**注册。
+4. 诊断日志写 `C:\Users\Public\inklink-tsf-<pid>.log`（固定路径比 `%TEMP%` 好找）。

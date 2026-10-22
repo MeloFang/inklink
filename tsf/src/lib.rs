@@ -5,19 +5,21 @@
 //! - `DllMain` 什么都不做；不启动线程
 //! - `DllCanUnloadNow` **永远返回 S_FALSE**（上一版就死在这条）
 //!
-//! 当前阶段：T1 —— 能被注册、能被系统当成输入法选中，按键暂全部透传。
+//! 当前阶段：T2 完成 —— 掛上 `ITfKeyEventSink`，按键已能流进 `OnKeyDown`（仍透传）。
 
 use std::sync::Mutex;
 
 use windows::Win32::Foundation::{
-    CLASS_E_NOAGGREGATION, E_NOINTERFACE, HINSTANCE, S_FALSE, S_OK,
+    CLASS_E_NOAGGREGATION, E_NOINTERFACE, HINSTANCE, LPARAM, S_FALSE, S_OK, WPARAM,
 };
 use windows::core::BOOL;
 use windows::Win32::System::Com::{IClassFactory, IClassFactory_Impl};
 use windows::Win32::UI::TextServices::{
-    ITfTextInputProcessorEx, ITfTextInputProcessorEx_Impl, ITfTextInputProcessor_Impl, ITfThreadMgr,
+    ITfContext, ITfKeyEventSink, ITfKeyEventSink_Impl, ITfKeystrokeMgr, ITfTextInputProcessorEx,
+    ITfTextInputProcessorEx_Impl, ITfTextInputProcessor_Impl, ITfThreadMgr,
 };
 use windows::core::{GUID, HRESULT, Interface, Ref, implement};
+use windows::core::IUnknownImpl;
 
 /// 文本服务的 CLSID（固定值，注册表与代码必须一致）
 pub const CLSID_INKLINK_TSF: GUID = GUID::from_u128(0x8f2a6c1e_4b3d_4f7a_9a21_5c6d7e8f9a0b);
@@ -61,9 +63,11 @@ impl IClassFactory_Impl for ClassFactory_Impl {
 
 struct TextServiceInner {
     thread_mgr: Mutex<Option<ITfThreadMgr>>,
+    keystroke_mgr: Mutex<Option<ITfKeystrokeMgr>>,
+    tid: Mutex<u32>,
 }
 
-#[implement(ITfTextInputProcessorEx)]
+#[implement(ITfTextInputProcessorEx, ITfKeyEventSink)]
 struct TextService {
     inner: TextServiceInner,
 }
@@ -73,21 +77,21 @@ impl TextService {
         Self {
             inner: TextServiceInner {
                 thread_mgr: Mutex::new(None),
+                keystroke_mgr: Mutex::new(None),
+                tid: Mutex::new(0),
             },
         }
     }
 }
 
 impl ITfTextInputProcessor_Impl for TextService_Impl {
-    fn Activate(&self, ptim: Ref<ITfThreadMgr>, _tid: u32) -> windows::core::Result<()> {
-        if let Some(mgr) = ptim.as_ref() {
-            *self.inner.thread_mgr.lock().unwrap() = Some(mgr.clone());
-        }
-        Ok(())
+    fn Activate(&self, ptim: Ref<ITfThreadMgr>, tid: u32) -> windows::core::Result<()> {
+        self.advise_keys(ptim, tid)
     }
 
     fn Deactivate(&self) -> windows::core::Result<()> {
-        *self.inner.thread_mgr.lock().unwrap() = None;
+        log_line("deactivate");
+        self.unadvise_keys();
         Ok(())
     }
 }
@@ -99,8 +103,117 @@ impl ITfTextInputProcessorEx_Impl for TextService_Impl {
         tid: u32,
         _flags: u32,
     ) -> windows::core::Result<()> {
-        // 目前与 Activate 相同；后续在这里挂 ITfKeyEventSink
-        ITfTextInputProcessor_Impl::Activate(self, ptim, tid)
+        log_line("ActivateEx");
+        self.advise_keys(ptim, tid)
+    }
+}
+
+impl TextService_Impl {
+    /// 挂上按键接收器：TSF 把按键通过 `ITfKeystrokeMgr` 分发给注册的 sink。
+    fn advise_keys(&self, ptim: Ref<ITfThreadMgr>, tid: u32) -> windows::core::Result<()> {
+        let Some(thread_mgr) = ptim.as_ref() else {
+            return Ok(());
+        };
+        *self.inner.tid.lock().unwrap() = tid;
+
+        // 从 thread manager 取 ITfKeystrokeMgr
+        let keystroke_mgr: ITfKeystrokeMgr = thread_mgr.cast()?;
+        *self.inner.keystroke_mgr.lock().unwrap() = Some(keystroke_mgr.clone());
+
+        // 把自己作为按键 sink 挂上去（传引用，而不是把 owned 接口交给 Param）
+        let sink: ITfKeyEventSink = self.to_interface();
+        let r = unsafe { keystroke_mgr.AdviseKeyEventSink(tid, &sink, true) };
+        log_line(&format!("activate tid={tid} advise={}", if r.is_ok() { "ok" } else { "FAILED" }));
+        r?;
+        Ok(())
+    }
+
+    fn unadvise_keys(&self) {
+        let tid = *self.inner.tid.lock().unwrap();
+        if tid != 0 {
+            if let Some(mgr) = self.inner.keystroke_mgr.lock().unwrap().as_ref() {
+                unsafe {
+                    let _ = mgr.UnadviseKeyEventSink(tid);
+                }
+            }
+        }
+        *self.inner.keystroke_mgr.lock().unwrap() = None;
+        *self.inner.thread_mgr.lock().unwrap() = None;
+    }
+}
+
+impl ITfKeyEventSink_Impl for TextService_Impl {
+    fn OnSetFocus(&self, _fforeground: BOOL) -> windows::core::Result<()> {
+        Ok(())
+    }
+
+    fn OnTestKeyDown(
+        &self,
+        _pic: Ref<ITfContext>,
+        _wparam: WPARAM,
+        _lparam: LPARAM,
+    ) -> windows::core::Result<BOOL> {
+        // 返回 TRUE = 我要接收这个键（否则 TSF 根本不会调 OnKeyDown）
+        log_line("testkeydown");
+        Ok(BOOL(1))
+    }
+
+    fn OnKeyDown(
+        &self,
+        _pic: Ref<ITfContext>,
+        wparam: WPARAM,
+        _lparam: LPARAM,
+    ) -> windows::core::Result<BOOL> {
+        log_key(wparam.0 as u32);
+        // 返回 0 = 不吞键，按键照常进应用
+        Ok(BOOL(0))
+    }
+
+    fn OnTestKeyUp(
+        &self,
+        _pic: Ref<ITfContext>,
+        _wparam: WPARAM,
+        _lparam: LPARAM,
+    ) -> windows::core::Result<BOOL> {
+        Ok(BOOL(0))
+    }
+
+    fn OnKeyUp(
+        &self,
+        _pic: Ref<ITfContext>,
+        _wparam: WPARAM,
+        _lparam: LPARAM,
+    ) -> windows::core::Result<BOOL> {
+        Ok(BOOL(0))
+    }
+
+    fn OnPreservedKey(
+        &self,
+        _pic: Ref<ITfContext>,
+        _rguid: *const GUID,
+    ) -> windows::core::Result<BOOL> {
+        Ok(BOOL(0))
+    }
+}
+
+/// 把按键记到临时目录的日志（按进程分文件，便于诊断按键流是否到达）。
+///
+/// 注意：这是 T2 的诊断手段，正式版会走 IPC 而不是写文件——铁律是回调里不做重 IO。
+fn log_key(vk: u32) {
+    log_line(&format!("keydown vk={vk} (0x{vk:X})"));
+}
+
+fn log_line(msg: &str) {
+    use std::io::Write;
+    static LOG_LOCK: Mutex<()> = Mutex::new(());
+    let _guard = LOG_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    // 固定写到 Public：所有用户可写，且比 %TEMP% 更容易找到。
+    let path = format!(
+        "C:\\Users\\Public\\inklink-tsf-{}.log",
+        std::process::id()
+    );
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = writeln!(f, "{msg}");
     }
 }
 
@@ -126,6 +239,7 @@ pub extern "system" fn DllGetClassObject(
         if rclsid.is_null() || riid.is_null() || ppv.is_null() {
             return windows::Win32::Foundation::E_POINTER;
         }
+        log_line("DllGetClassObject");
         if *rclsid != CLSID_INKLINK_TSF {
             return CLASS_E_NOAGGREGATION;
         }
