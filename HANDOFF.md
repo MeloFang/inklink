@@ -1,228 +1,127 @@
 # 续接文档：inklink
 
-> **最后更新**：2026-10-21 ｜ **当前阶段**：③ 规划完成，待开工 ｜ **总体进度**：M0 0/8 步
+> **最后更新**：2026-10-22 ｜ **当前阶段**：T3 完成（TSF 能打中文），T4 进行中 ｜ **总体进度**：TSF 里程碑 3/5
 
 ---
 
-## 一、这个程序是什么
+## 一、这个程序现在是什么
 
-### 一句话
-
-一个离线的 Windows 中文输入面板：按热键唤起，用「内置词库 + 我的笔记 + 我的使用习惯」打中文，**不注入、不劫持系统输入法**。
-
-### 背景
-
-上一轮 inklink 想做完整 AI 输入法（PIME/TSF + librime 编进 DLL）。前端那半崩了：`rime.dll` 在 explorer / WPS 里 `0xc0000409`，无符号服务器、每次验证要重启，最终放弃。
-
-但那一轮的**词库管线没失败**——`scan_vault.py` → `terms.json` → `build_phrase.py` 当天就跑通，样例抽出 13 条干净术语，今天复跑依然正常。
-
-中间还有一段弯路：v0.1 曾计划「只自己用 + 小狼毫词库」，用户不愿装 Weasel，且提出真正的诉求是「冷启动能用、越用越懂我」。于是 v0.2 改成**独立面板 + 内置词库 + 开源产品**。
-
-### 它怎么工作
+**inklink 是一个 TSF 输入法**（不再是热键面板）。架构（ADR-0006 决定）：
 
 ```
-全局热键 ──→ 面板（WebView）
-                 │ 输入拼音
-                 ▼
-           检索与排序
-   ┌────────────┼────────────┐
-基础词库      个人词库      使用记录
-(10万条)     (笔记抽取)     (选中次数·时间衰减)
-   └────────────┼────────────┘
-                 ▼
-            候选列表 → 回车
-                 ▼
-        写回前一个窗口的光标处
+应用进程（记事本/WPS/浏览器…）
+  └─ inklink_tsf.dll（薄壳：收键、查候选、上屏，无词库）
+         │  \\.\pipe\inklink-engine  往返 <1ms
+         ▼
+     inklink.exe --serve（词库 8 万条 + 切分 + 排序，独立进程）
 ```
 
-**没有任何东西进入别的进程**：面板崩了只死自己，这是与上一版最根本的区别。
+**铁律**（AGENTS.md 已改）：引擎绝不进别人进程；DLL 只能是薄壳，`DllMain` 不做事、`DllCanUnloadNow` 恒 `S_FALSE`。
 
-### 技术概览
-
-| 项 | 值 |
-|:---|:---|
-| 运行时 | Rust 1.98 + Tauri 2（WebView2），前端 Svelte |
-| 构建期 | Python 3.13（词库预处理，不进入发布物） |
-| 平台 | Windows 10 1809+ / 11 x64 |
-| 数据 | 全本地：`%APPDATA%\inklink\`（词库、使用计数、配置） |
-| 入口 | 托盘常驻 + 全局热键 |
+上一轮失败复盘 + TSF 蓝图见 `docs/tsf-plan.md` 和 `docs/adr/0006`。
 
 ---
 
 ## 二、做到了哪一步
 
-### 阶段进度
+| 里程碑 | 内容 | 状态 |
+|:---|:---|:---|
+| T1 | 注册成 TSF 输入法，出现在 Win+Space 列表 | ✅ |
+| T2 | 按键流打通到 OnKeyDown | ✅ |
+| T3 | 能打中文（查词库→候选→上屏），快捷键/退格/错误恢复 | ✅ |
+| T4 | 组合串显示（拼音显示在光标处带下划线） | ⏳ |
+| T5 | 兼容与兜底（引擎进程生命周期、各应用兼容） | ⏳ |
 
-| 阶段 | 状态 | 产物 | 备注 |
-|:---|:---|:---|:---|
-| ① 立项与产品文档 | ✅ | `PRODUCT.md` | v0.3 **已确认**（阶段①出口关闭） |
-| ② 固定上下文 | ✅ | `AGENTS.md` `GLOSSARY.md` `docs/adr/` | 4 条 ADR：不注入 / AI 不进同步路径 / 词库选型 / rime-ice |
-| ③ 规划 | ✅ | `PLAN.md` | M0 拆成 8 步（0–7） |
-| ④ 实现 | 🟡 | `app/` `tools/` | 步骤 6/8 完成（记事本上屏已验证） |
-| ⑤ 验证 | ⬜ | — | |
-| ⑥ 续接文档 | ✅ | 本文件 | |
+### 已完成的细节（实测验证）
 
-### 已完成
+- `xiangmu`+空格 → 「项目」；`nihao`→「你好」；`zgrm`→「中国人民」（简拼）
+- 快捷键 Ctrl+A/C/V、Shift 打大写、CapsLock 打英文、Tab/回车/方向键正常
+- 打错字（`xiangmm`）→ 前缀回退出候选，上屏后多余字母自动删除
+- 回车 = 原样上屏拼音（恢复通道）
+- 引擎管道用 NULL DACL（Box 持有，防悬垂指针），跨用户可连
 
-- ✅ **复跑 v1 管线成功**（2026-10-21）：367 候选 → 13 条词条，拼音正确，与历史记录一致
-- ✅ 环境探测：Rust 1.98 / Node 24 / Python 3.13 可用；**无 .NET**；搜狗拼音 16.8 已装；小狼毫未装
-- ✅ `PRODUCT.md` v0.2（开源产品定位）
-- ✅ **步骤 0 完成**：Tauri 2 + Svelte 面板骨架，`inklink.exe` 能起窗口（title=inklink），
-  clippy / fmt / test / svelte-check 全绿，`tauri build --debug` 能出 MSI + NSIS 安装包
-- ✅ **步骤 1 完成**：`engine/lexicon.rs` — TSV 加载 + 拼音前缀索引，
-  6 个单测全绿；release 实测 6 万条加载 153ms、10 万次前缀查询 76ms
-- ✅ **步骤 2 完成**：词库源改为 rime-ice（GPL-3.0），`tools/build_base_lexicon.py` 产出
-  `data/base.tsv` 80,434 条（2.1MB），转换幂等；Rust 实测加载 283ms（debug）、查询 4–75µs
-- ✅ **步骤 3 完成**：`engine/pinyin.rs` — 402 音节表、带回溯最大匹配、模糊音、简拼识别；12 个单测全绿
-- ✅ **步骤 4 完成**：`engine/ranker.rs` — 全拼整词/前缀 + 简拼整词 + 模糊音，18 个单测全绿；
-  release 实测 平均 62µs/次（最慢 233µs），建索引 90ms；跨词组合按 D9 推迟到 4b
-- ✅ **步骤 5 完成（用户实机确认）**：全局热键（Ctrl+/Alt+/Ctrl+Shift+` 三组）、面板居中唤出、
-  候选渲染与键盘导航、Esc 隐藏。前端改为 `<div tabindex=0>` + 自接管按键（不用 `<input>`），
-  彻底绕开输入法冲突与 `ImmAssociateContext` 引起的闪退
-- ✅ **步骤 6 完成**：`commit_text` 命令——藏面板 → 还焦点（`AttachThreadInput`）→ `SendInput` Unicode，失败回退剪贴板；记事本实测可上屏
-- ✅ `docs/architecture.md`（三层解耦 / 四条数据流 / Obsidian 与 AI 协同 / M0–M4 路线）
-- ✅ `docs/base-lexicon-eval.md`（三条词库路线实测，已定 A）
-- ✅ 阶段②：`AGENTS.md`、`GLOSSARY.md`、`docs/adr/` 三条决策
-- ✅ 阶段③：`PLAN.md`（M0 八步，每步带验收与测试接缝）
+### 代码位置
 
-### 还没做
-
-- ⬜ 步骤 6b 的人工确认：真实键盘下光标可见、连续输入、数字可直接打
-- ⬜ 步骤 7：M0 验收
-- ⬜ M1：使用反馈排序
-- ⬜ M2：语料 → Obsidian → 个人词库
-
-### 已知问题 / 技术债
-
-- **⚠️ exe 不能放在 `C:\dsh\work` 下运行**：`CreateWindowEx` 返回 `拒绝访问 (os error 5)`，
-  窗口起不来。**同一份 exe 拷到桌面就正常**——是工作区目录的 ACL 影响，与代码无关。
-  开发期验证：`copy target\debug\inklink.exe %USERPROFILE%\Desktop\inklink-test\`，
-  并把 `data\base.tsv` 放到同目录 `data\` 下。
-- **`hide()/show()` 在 WebView2 上不可靠**：`show()` 返回 Ok、`is_visible()` 也变 true，但窗口不出现。
-  现在改用「挪到 `(-30000,-30000)`」实现隐藏，唤出时挪回屏幕中央。
-- **不要用 `<input>` 收拼音**：可编辑元素会激活系统输入法，搜狗/微软拼音会弹自己的候选框吃掉按键；
-  而用 `ImmAssociateContext` 递归摘除 IME 虽然当时有效，**实测会在输入后退格时让进程 fast-fail（0xc0000409）**。
-  现在改成 `<div tabindex=0>` + 自己接管 `keydown`（字母/退格/方向键/数字键），界面上只渲染拼出来的字符串。
-  没有可编辑元素，输入法自然不介入。
-- **隐藏必须走 `hide_panel` 命令**：前端直接 `win.hide()` 不会更新 Rust 的可见标记，
-  导致下次热键被当成"该隐藏"，表现为热键失灵。
-- **词库加载与前端查询有竞态**：已用 `lexicon-ready` 事件解决。
-- `Ranker` 启动时建两份索引（code / initials），80k 词条约 90ms；可接受，暂不优化。
-- v1 的 Python 抽取管线尚未与 Rust 侧打通（M2 的事）。
+| 文件 | 作用 |
+|:---|:---|
+| `tsf/src/lib.rs` | COM 骨架 + 注册 + 按键状态机 + 查询/上屏 |
+| `tsf/src/ipc.rs` | 命名管道客户端 + SendInput 上屏 |
+| `tsf/src/bin/probe.rs` | 诊断工具（枚举语言配置 + 测试实例化） |
+| `app/src-tauri/src/engine_server.rs` | `--serve` 引擎服务（管道服务器 + NULL DACL） |
+| `app/src-tauri/src/engine/` | 词库/切分/排序（复用，未动） |
+| `vm/deploy.ps1` `uninstall.ps1` `diag.ps1` | VM 部署/卸载/诊断脚本 |
 
 ---
 
-## 三、怎么接着做
+## 三、怎么接着做（T4：组合串显示）
 
-### 下一步（照着做就行）
+**目标**：打 `xiangmu` 时拼音直接显示在文档光标处、带虚线下划线，和搜狗/微软拼音一样。
 
-1. **先做步骤 5 的手工验收**（清单见下），在普通桌面会话里：
-   ```powershell
-   cd C:\dsh\work\inklink\app\src-tauri\target\debug
-   .\inklink.exe
-   ```
-   启动时窗口应直接出现（M0 暂未做常驻）；按 `Ctrl+\`` 应隐藏/显示。
-2. 验收通过后做 **步骤 6（上屏）**。
-3. 若窗口仍起不来：先修 WebView2 运行时（`winget install Microsoft.EdgeWebView2Runtime`），
-   再确认不是以管理员身份启动。
+**子步骤**：
 
-### 步骤 5 手工验收清单
+1. **拿到光标处的 ITfRange**——已知坑：windows-rs 的 `ITfContext::GetSelection` 只返回字符位置（`TS_SELECTION_ACP`）、`GetStart` 返回 `IAnchor`，都**不是**标准 TSF 的 `TF_SELECTION.range`。需要先搞清楚 windows-rs 里怎么拿 ITfRange（可能需要 `GetSelection` 的另一个签名，或手动建 range）。
+2. **ITfEditSession**：实现 `ITfEditSession_Impl::DoEditSession(ec)`，在里面做插入/更新。
+3. **ITfCompositionSink + StartComposition**：首次字母时 `StartComposition` + 写拼音；后续字母更新文本。
+4. **ITfDisplayAttributeProvider**：注册显示属性提供者，给组合串加下划线（这是独立的 TIP 注册）。
 
-- [ ] 双击 `inklink.exe` 能出现面板（无边框、置顶、不在任务栏）
-- [ ] 面板里输入 `xiangmu`，出现「项目 / 项目管理 / 项目经理…」
-- [ ] 输入 `zgrm`，第一条是「中国人民」
-- [ ] `↑` `↓` 能移动选中项，数字键可直接选中
-- [ ] 按 `Ctrl+\`` 面板隐藏，再按一次重新出现
-- [ ] 按 `Esc` 面板隐藏
-- [ ] 从按热键到看见面板，主观上"立刻"出现（<150ms）
-- [ ] 控制台（若从 cmd 启动）打印「词库已加载: 80434 条」与「热键已注册」
+**签名已确认**（windows 0.61）：
+- `ITfContext::RequestEditSession(tid, pes, flags) -> Result<HRESULT>`
+- `ITfContext::StartComposition(ec, range, sink) -> Result<ITfComposition>`
+- `ITfRange::SetText(flags, acpstart, acpend, &[u16]) -> Result<TS_TEXTCHANGE>`
+- `ITfEditSession_Impl::DoEditSession(&self, ec) -> Result<()>`
+- `ITfCompositionSink_Impl::OnCompositionTerminated(&self, ec, Ref<ITfComposition>) -> Result<()>`
 
-### 从哪里开始读
+---
 
-| 想知道 | 读这个 |
-|:---|:---|
-| 完整需求和边界 | `PRODUCT.md` |
-| **架构怎么设计的** | `docs/architecture.md` |
-| **下一步做什么、做到哪了** | `PLAN.md` |
-| 词典为什么选 luna | `docs/base-lexicon-eval.md` |
-| 为什么不做注入 | `docs/adr/0001-不注入输入法进程.md` |
-| 上一版为什么崩 | `docs/inklink项目复盘.md` |
+## 四、关键教训（务必先读，避免重蹈覆辙）
 
-### 环境准备
+1. **按键状态机必须放在 `OnKeyDown`，不是 `OnTestKeyDown`**——用 `fForeground=TRUE` 注册的接收器，TSF 跳过 `OnTestKeyDown` 直接调 `OnKeyDown`。曾把修饰键检查放错位置，Ctrl+A 修了很多轮才明白。
+2. **只认领真正处理的键**：空闲时只认领"无 Shift/CapsLock 的纯字母"，其余（Tab/回车/方向键/符号）全放行；Ctrl/Alt/Win 组合永远放行。
+3. **注册必须走 TSF 接口**（`Register` + `RegisterCategory(GUID_TFCAT_TIP_KEYBOARD)` + `AddLanguageProfile` + `EnableLanguageProfile`），只写注册表系统不认。重复注册时这些接口返回 `S_FALSE`，要当成成功（`ignore_s_false`）。
+4. **NULL DACL 描述符要用 Box 持有**，否则 `SECURITY_ATTRIBUTES.lpSecurityDescriptor` 指向被 move 的栈变量，ACL 修复形同虚设（cands=0 查了很久）。
+5. **DLL 一旦被加载就驻留**（`DllCanUnloadNow=S_FALSE`），改代码后必须：换 DLL 文件名注册 + 重启应用进程，否则跑的还是旧 DLL。
+6. **引擎进程是独立生命周期**：崩了不会自启，DLL 连不上管道就静默 `cands=0`。验证前先确认 `Get-Process inklink` 存在。
+7. **给 Windows 写含中文的 .ps1 必须带 UTF-8 BOM**，否则 PS 5.1 按 ANSI 解析会崩。
+8. **VM 验证**：Hyper-V「Windows 11 开发环境」+ 快照 `tsf-base`；PowerShell Direct 账号 `inklink` / `Ink!2026test`；`Copy-VMFile` 只能 Host→Guest，同名文件会报错，用新文件名。
+
+### 部署命令（在 VM 内）
 
 ```powershell
-cd C:\dsh\work\inklink
-# v1 Python 管线（仅参考/预处理用）
-.\.venv\Scripts\python.exe extractor\scan_vault.py
-.\.venv\Scripts\python.exe extractor\build_phrase.py
-# 运行时（尚未创建）
-# cargo --version   # 1.98.1
-# node -v           # v24.19.0
+# 推送 DLL 后，注册（改用唯一文件名 + 直接改注册表路径）：
+$stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+$dll = "C:\Program Files\inklink\inklink_tsf_$stamp.dll"
+Copy-Item 'C:\Users\Public\inklink_tsfXX.dll' $dll -Force
+Set-ItemProperty 'HKLM:\SOFTWARE\Classes\CLSID\{8F2A6C1E-4B3D-4F7A-9A21-5C6D7E8F9A0B}\InprocServer32' -Name '(default)' -Value $dll
+# 引擎：
+Start-Process 'C:\inklink-engine\inklink.exe' -ArgumentList '--serve' -WorkingDirectory 'C:\inklink-engine' -WindowStyle Hidden
 ```
 
-### 注意事项
+### 构建命令
 
-- **不要**再往输入法进程里塞任何东西。
-- 本机**没有**小狼毫、没有 Obsidian、没有 .NET SDK —— 别假设它们存在。
-- 搜狗拼音已安装但**未确认是否日常使用**，不要默认依赖它。
-- 控制台输出中文会乱码（GBK），看文件不要看 stdout。
-
----
-
-## 四、决策记录（摘要）
-
-| 决策 | 内容 | 为什么 |
-|:---|:---|:---|
-| D1 | 放弃自研 TSF/DLL 输入法前端 | 爆炸半径 = 全系统，且无真机调试条件 |
-| D2 | 形态选「按需唤起的面板」，不做常驻注入 | 零注入风险，崩了不影响系统 |
-| D3 | 冷启动用内置公开词库，不靠联网 | 离线可控，隐私可讲，不依赖第三方服务 |
-| D4 | 运行时 Rust + Tauri，构建期 Python | 面板要求启动快、包小；Python 只做离线预处理 |
-| D5 | 保留 v1 管线不重写 | 那部分没失败，重写是浪费 |
-| D6 | v0.1「只自己用 + 小狼毫」作废 | 用户不装 Weasel，且真实诉求是产品化 |
-| D7 | ~~基础词库用 Rime `luna_pinyin`~~（被 D8 取代） | 当时以为它有词频；下载实测后不成立 |
-| D8 | 基础词库改用 rime-ice，项目 GPL-3.0 | luna 是字表 + 繁体语料，整词拼音仅 9.4%；rime-ice 简体、带权重、100% 音节 |
-| D9 | M0 不做跨词组合，只做整词 | 原型证明无语言模型时组合搜索输出「有很好在」这类高频单字串；跨词组合排到 4b 并与 LM 同做 |
-
-## 五、变更日志
-
-| 日期 | 阶段变化 | 做了什么 |
-|:---|:---|:---|
-| 2026-10-21 | 立项 | 读复盘；找回 v1 遗留代码；复跑管线成功 |
-| 2026-10-21 | 立项 v0.1 | 落 `PRODUCT.md`（小狼毫 + 只自己用） |
-| 2026-10-21 | 立项 v0.2 | 用户否决 Weasel；改为面板 + 内置词库 + 开源产品 |
-| 2026-10-21 | ② 固定上下文 | `AGENTS.md` / `GLOSSARY.md` / ADR 0001–0003 |
-| 2026-10-21 | ③ 规划 | `PLAN.md`：M0 拆 8 步；词库选型实测后定 A |
+```powershell
+$env:PATH = "$env:USERPROFILE\.cargo\bin;$env:PATH"   # 必须先修 PATH（GNU rustc 会盖掉 MSVC）
+cd C:\dsh\work\inklink\tsf
+cargo build --release --target-dir target-static      # 静态 CRT，DLL 不依赖 vcruntime140
+cd C:\dsh\work\inklink\app\src-tauri
+cargo build --release --offline                       # 引擎
+```
 
 ---
 
-## 六、TDD 记录（2026-10-21 自审）
+## 五、决策记录（TSF 阶段）
 
-| 项 | 状态 | 证据 |
-|:---|:---|:---|
-| 步骤 0（骨架） | 无业务测试（接缝为空，PLAN 已声明） | — |
-| 步骤 1（词库加载器） | 🟡 红→绿完整，但**六个测试一次写完再实现**（水平切片），测试与实现在同一提交 | `9fbc8ad` |
-| 步骤 2（词库转换） | ❌ **先写实现后补测试**（TDD 违规）→ 已修复 | 见下 |
-
-**违规修复（步骤 2）**：
-
-- 删除实现（留 `NotImplementedError` 桩）：`56f2a9b` 之前的编辑
-- 红线测试提交（红，3 个测试全挂）：`56f2a9b`
-- 实现提交（绿，3 个测试通过）：`7ba47a5`
-- 回归证据：重建 `base.tsv` 与修复前**逐字节一致**（SHA-256 `0F3976...30A1`）
-
-**技术债**：步骤 1 的水平切片不重做（重做无新信息），但从步骤 3 起，每个接缝按
-「一个测试 → 一个实现」推进，测试提交先于实现提交。
-
-## 七、收尾流程决定（finishing-branch）
-
-**决定**：采用 **trunk-based**，不建 feature 分支。
-
-| 项 | 决定 |
+| 决策 | 内容 |
 |:---|:---|
-| 分支策略 | 单人在 `main` 上直接提交，每步一个提交（或红/绿两个） |
-| 每步收尾四步 | ① 全量测试 + 构建绿 ② 对照 `PLAN.md` 验收 ③ 去向固定为 **Merge**（已在 main）④ 更新 `HANDOFF.md` |
-| 为什么不走 PR | 没有审查者，PR 只会变成自我表演；保留「步骤边界 + 验收记录」比保留分支更有价值 |
-| 何时改回 PR | 有第二个贡献者，或改动涉及 `engine/` 公共接口时 |
+| ADR-0005 | 面板改为「不抢焦点 + 键盘钩子」（已被 ADR-0006 取代） |
+| ADR-0006 | 改用 TSF 输入法：薄壳 DLL + 引擎独立进程，取代面板方案 |
+| — | 面板版保留为免安装降级模式 |
+| — | T3 上屏先用 SendInput（临时），T4 换 ITfRange::SetText |
 
-**理由**：技能里的 4 选项（Merge/PR/Keep/Discard）本质上是为了「不让功能悬空」。
-单人项目里，悬空的反面是**每步都有验收记录**，这一点由 `PLAN.md` + 本节保证。
+## 六、变更日志（TSF 阶段）
+
+| 日期 | 做了什么 |
+|:---|:---|
+| 2026-10-22 | T1：注册成输入法，出现在列表（关键：键盘分类注册） |
+| 2026-10-22 | T2：按键流打通（关键：OnTestKeyDown 返回 TRUE 才触发 OnKeyDown） |
+| 2026-10-22 | T3：能打中文（引擎管道 + 候选 + SendInput 上屏 + 错误恢复） |
+| 2026-10-22 | 大量踩坑记录见 `docs/tsf-plan.md` T1/T2/T3a 实测记录 |
