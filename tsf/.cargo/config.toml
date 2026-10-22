@@ -1,0 +1,4 @@
+# 静态链接 CRT：TSF DLL 会被加载进各种应用进程，
+# 不能假设目标机器装了 VC++ 运行库（虚拟机里就很可能没有）。
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

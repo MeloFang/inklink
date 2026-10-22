@@ -134,3 +134,30 @@
 
 **要做的不是"再写一个输入法"，而是"给现有引擎加一个符合 TSF 规范的前端"**。
 难点集中在 COM 胶水和组合串（M-T1、M-T4），其余都是体力活。
+
+
+---
+
+## T1 实测记录（2026-10-22）
+
+**结果：✅ 通过**——inklink 已出现在 Win+Space 输入法列表里（与微软拼音并列）。
+
+**踩过的坑（按严重度）**：
+
+1. **必须注册「键盘输入法」分类**：`ITfCategoryMgr::RegisterCategory(CLSID, GUID_TFCAT_TIP_KEYBOARD, CLSID)`。
+   没有这一步，探针显示"已枚举、可实例化"，但 `Set-WinUserLanguageList` 就是会把 TIP 丢弃。
+   这是 T1 卡住最久的原因。
+2. **LanguageProfile 注册表子树要交给 `AddLanguageProfile` 写**，不要手写。
+   手写会弄错 `IconIndex` 类型（该是 DWORD）和 `Description` 位置，还会和 TSF 自己写的打架。
+   以微软拼音 `HKLM\SOFTWARE\Microsoft\CTF\TIP\{81D4E9C9...}` 为对照。
+3. **静态链接 CRT**（`-C target-feature=+crt-static`）：干净 VM 没有 `vcruntime140.dll`，
+   `regsvr32` 会报退出码 3（无法加载）。静态后只剩系统 DLL。
+4. **`regsvr32` 退出码不可信**（32 位 WOW64 重定向、静默吞错误），改用 `LoadLibrary` + 直接调 `DllRegisterServer` 读 HRESULT。
+5. **PowerShell 5.1 按 ANSI 读 .ps1**：含中文的脚本必须带 UTF-8 BOM，否则字符串解析崩坏。
+6. **VM 需先装 zh-Hans-CN 语言**：纯英文系统没有中文语言条目，TIP 没处挂。
+7. **`DllCanUnloadNow = S_FALSE` 副作用**：DLL 一旦被加载就驻留进程、文件锁死，
+   迭代必须换 DLL 文件名（v2/v3/v4/v5 就是这么来的）。
+
+**诊断工具**：`tsf/src/bin/probe.rs` —— 枚举语言配置 + 测试能否实例化 TIP，是定位"注册成功但列表不显示"的分水岭。
+
+**部署脚本**：`vm/deploy-v11.ps1`（自诊断、含中文语言补装、被锁自动换名）、`vm/uninstall.ps1`。
