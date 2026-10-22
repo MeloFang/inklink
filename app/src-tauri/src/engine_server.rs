@@ -53,6 +53,10 @@ fn serve_once(ranker: &Ranker) -> std::io::Result<()> {
             .chain(std::iter::once(0))
             .collect();
 
+        // NULL DACL：允许任何用户连接。引擎可能以别的账户运行，而 TSF DLL
+        // 跑在每个应用（各种用户）里，默认 DACL 只放行创建者自己 → 跨用户连不上。
+        let (sa, _sd) = everyone_security_attributes();
+
         let pipe = CreateNamedPipeW(
             name.as_ptr(),
             PIPE_ACCESS_DUPLEX,
@@ -61,7 +65,7 @@ fn serve_once(ranker: &Ranker) -> std::io::Result<()> {
             8192,
             8192,
             0,
-            std::ptr::null_mut(),
+            &sa,
         );
         if pipe == INVALID_HANDLE_VALUE {
             return Err(std::io::Error::last_os_error());
@@ -86,6 +90,37 @@ fn serve_once(ranker: &Ranker) -> std::io::Result<()> {
 }
 
 const PIPE_ACCESS_DUPLEX: u32 = 0x0000_0003;
+
+/// 构造一个带 NULL DACL（所有人可访问）的 SECURITY_ATTRIBUTES。
+///
+/// 描述符用 `Box` 放在堆上：返回的 `SECURITY_ATTRIBUTES.lpSecurityDescriptor`
+/// 指向它，只要 Box 活着地址就稳定。**不能**指向栈上局部变量——move 后地址会失效。
+fn everyone_security_attributes(
+) -> (windows_sys::Win32::Security::SECURITY_ATTRIBUTES, Box<windows_sys::Win32::Security::SECURITY_DESCRIPTOR>) {
+    use windows_sys::Win32::Security::{
+        InitializeSecurityDescriptor, SetSecurityDescriptorDacl, SECURITY_ATTRIBUTES,
+        SECURITY_DESCRIPTOR,
+    };
+
+    let mut sd = Box::new(unsafe { std::mem::zeroed::<SECURITY_DESCRIPTOR>() });
+    // SAFETY: sd 是零初始化的有效缓冲区，Box 保证地址稳定
+    unsafe {
+        InitializeSecurityDescriptor(sd.as_mut() as *mut _ as *mut core::ffi::c_void, 1);
+        // bDaclPresent=TRUE, pDacl=NULL → 空 DACL = 所有人放行
+        SetSecurityDescriptorDacl(
+            sd.as_mut() as *mut _ as *mut core::ffi::c_void,
+            1,
+            std::ptr::null(),
+            0,
+        );
+    }
+
+    let mut sa: SECURITY_ATTRIBUTES = unsafe { std::mem::zeroed() };
+    sa.nLength = std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32;
+    sa.lpSecurityDescriptor = sd.as_mut() as *mut _ as *mut core::ffi::c_void;
+    sa.bInheritHandle = 0;
+    (sa, sd)
+}
 
 unsafe fn handle_client(pipe: HANDLE, ranker: &Ranker) -> std::io::Result<()> {
     // 读请求长度

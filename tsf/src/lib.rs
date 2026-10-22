@@ -18,6 +18,7 @@ use windows::Win32::UI::TextServices::{
     ITfContext, ITfKeyEventSink, ITfKeyEventSink_Impl, ITfKeystrokeMgr, ITfTextInputProcessorEx,
     ITfTextInputProcessorEx_Impl, ITfTextInputProcessor_Impl, ITfThreadMgr,
 };
+mod ipc;
 use windows::core::{GUID, HRESULT, Interface, Ref, implement};
 use windows::core::IUnknownImpl;
 
@@ -65,6 +66,14 @@ struct TextServiceInner {
     thread_mgr: Mutex<Option<ITfThreadMgr>>,
     keystroke_mgr: Mutex<Option<ITfKeystrokeMgr>>,
     tid: Mutex<u32>,
+    /// 当前拼音缓冲
+    buffer: Mutex<String>,
+    /// 当前候选
+    cands: Mutex<Vec<String>>,
+    /// 候选命中的缓冲长度（前缀回退时可能小于 buffer 全长）
+    matched_len: Mutex<usize>,
+    /// 是否已挂载按键接收器（防止重复挂载导致同一按键触发多次回调）
+    advised: Mutex<bool>,
 }
 
 #[implement(ITfTextInputProcessorEx, ITfKeyEventSink)]
@@ -79,6 +88,10 @@ impl TextService {
                 thread_mgr: Mutex::new(None),
                 keystroke_mgr: Mutex::new(None),
                 tid: Mutex::new(0),
+                buffer: Mutex::new(String::new()),
+                cands: Mutex::new(Vec::new()),
+                matched_len: Mutex::new(0),
+                advised: Mutex::new(false),
             },
         }
     }
@@ -91,6 +104,10 @@ impl ITfTextInputProcessor_Impl for TextService_Impl {
 
     fn Deactivate(&self) -> windows::core::Result<()> {
         log_line("deactivate");
+        // 切换输入法/焦点时清空状态，否则缓冲会跨会话累积
+        self.inner.buffer.lock().unwrap_or_else(|p| p.into_inner()).clear();
+        self.inner.cands.lock().unwrap_or_else(|p| p.into_inner()).clear();
+        *self.inner.matched_len.lock().unwrap_or_else(|p| p.into_inner()) = 0;
         self.unadvise_keys();
         Ok(())
     }
@@ -110,10 +127,19 @@ impl ITfTextInputProcessorEx_Impl for TextService_Impl {
 
 impl TextService_Impl {
     /// 挂上按键接收器：TSF 把按键通过 `ITfKeystrokeMgr` 分发给注册的 sink。
+    /// 幂等——Activate/ActivateEx 可能被反复调用，重复挂载会让同一按键触发多次回调。
     fn advise_keys(&self, ptim: Ref<ITfThreadMgr>, tid: u32) -> windows::core::Result<()> {
         let Some(thread_mgr) = ptim.as_ref() else {
             return Ok(());
         };
+
+        // 已挂载就不再挂：这是「字母重复」的根因
+        let mut advised = self.inner.advised.lock().unwrap_or_else(|p| p.into_inner());
+        if *advised {
+            log_line("activate skipped (already advised)");
+            return Ok(());
+        }
+
         *self.inner.tid.lock().unwrap() = tid;
 
         // 从 thread manager 取 ITfKeystrokeMgr
@@ -125,10 +151,16 @@ impl TextService_Impl {
         let r = unsafe { keystroke_mgr.AdviseKeyEventSink(tid, &sink, true) };
         log_line(&format!("activate tid={tid} advise={}", if r.is_ok() { "ok" } else { "FAILED" }));
         r?;
+        *advised = true;
         Ok(())
     }
 
     fn unadvise_keys(&self) {
+        let mut advised = self.inner.advised.lock().unwrap_or_else(|p| p.into_inner());
+        if !*advised {
+            return;
+        }
+        *advised = false;
         let tid = *self.inner.tid.lock().unwrap();
         if tid != 0 {
             if let Some(mgr) = self.inner.keystroke_mgr.lock().unwrap().as_ref() {
@@ -154,11 +186,10 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
         _lparam: LPARAM,
     ) -> windows::core::Result<BOOL> {
         let vk = wparam.0 as u32;
-        // 只认领真正要处理的键。上下键是输入法候选窗的默认导航键，
-        // 一旦认领，TSF 就不再把它交给应用（实测：上下失效、左右正常）。
-        let handle = should_handle(vk);
-        log_line(&format!("test vk={vk} handle={handle}"));
-        Ok(BOOL(if handle { 1 } else { 0 }))
+        let composing = !self.inner.buffer.lock().unwrap_or_else(|p| p.into_inner()).is_empty();
+        let claim = should_claim(vk, composing);
+        log_line(&format!("test vk={vk} claim={claim} composing={composing}"));
+        Ok(BOOL(if claim { 1 } else { 0 }))
     }
 
     fn OnKeyDown(
@@ -167,9 +198,112 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
         wparam: WPARAM,
         _lparam: LPARAM,
     ) -> windows::core::Result<BOOL> {
-        log_key(wparam.0 as u32);
-        // 返回 0 = 不吞键，按键照常进应用
-        Ok(BOOL(0))
+        const VK_BACK: u32 = 0x08;
+        const VK_RETURN: u32 = 0x0D;
+        const VK_ESCAPE: u32 = 0x1B;
+        const VK_SPACE: u32 = 0x20;
+        const VK_0: u32 = 0x30;
+        const VK_9: u32 = 0x39;
+        const VK_A: u32 = 0x41;
+        const VK_Z: u32 = 0x5A;
+
+        let vk = wparam.0 as u32;
+
+        // Ctrl/Alt/Win 组合键：整体放行给应用（Ctrl+A/C/V/X/Z 等快捷键）。
+        // 注意必须放在 OnKeyDown 里——fForeground=TRUE 的接收器，TSF 会跳过
+        // OnTestKeyDown 直接调 OnKeyDown，所以修饰键检查放 OnTestKeyDown 是死代码。
+        if ctrl_alt_win_held() {
+            return Ok(BOOL(0));
+        }
+
+        let mut buffer = self.inner.buffer.lock().unwrap_or_else(|p| p.into_inner());
+        let mut cands = self.inner.cands.lock().unwrap_or_else(|p| p.into_inner());
+        let mut matched_len = self.inner.matched_len.lock().unwrap_or_else(|p| p.into_inner());
+        let composing = !buffer.is_empty();
+
+        match vk {
+            // 字母：进入/继续拼写
+            VK_A..=VK_Z => {
+                // 空闲 + Shift/CapsLock：是要打英文大写，放行给应用
+                if !composing && shift_or_caps() {
+                    return Ok(BOOL(0));
+                }
+                buffer.push((vk as u8 as char).to_ascii_lowercase());
+                (*cands, *matched_len) = query_with_fallback(&buffer);
+                log_line(&format!(
+                    "compose buffer={} cands={} matched={} top={:?}",
+                    *buffer,
+                    cands.len(),
+                    *matched_len,
+                    cands.first()
+                ));
+                Ok(BOOL(1))
+            }
+            // 退格：删一个字母；空缓冲时放行给应用
+            VK_BACK => {
+                if buffer.pop().is_some() {
+                    (*cands, *matched_len) = query_with_fallback(&buffer);
+                    Ok(BOOL(1))
+                } else {
+                    Ok(BOOL(0))
+                }
+            }
+            // 空格：首个候选上屏；没有候选时是普通空格
+            VK_SPACE => {
+                if let Some(top) = cands.first().cloned() {
+                    // 上屏后清空整个缓冲——多余/打错的字母一并删掉（用户要求）
+                    buffer.clear();
+                    cands.clear();
+                    *matched_len = 0;
+                    ipc::send_text(&top);
+                    log_line(&format!("commit {top}"));
+                    Ok(BOOL(1))
+                } else {
+                    Ok(BOOL(0))
+                }
+            }
+            // 回车：把当前拼音原样上屏（等于直接打英文），是打错后的恢复通道
+            VK_RETURN => {
+                if !buffer.is_empty() {
+                    let raw = buffer.clone();
+                    buffer.clear();
+                    cands.clear();
+                    *matched_len = 0;
+                    ipc::send_text(&raw);
+                    log_line(&format!("commit-raw {raw}"));
+                    Ok(BOOL(1))
+                } else {
+                    Ok(BOOL(0))
+                }
+            }
+            // 数字键：选第 N 个候选
+            VK_0..=VK_9 => {
+                if buffer.is_empty() {
+                    return Ok(BOOL(0));
+                }
+                let idx = (vk - VK_0) as usize;
+                if idx >= 1 {
+                    if let Some(pick) = cands.get(idx - 1).cloned() {
+                        buffer.clear();
+                        cands.clear();
+                        *matched_len = 0;
+                        ipc::send_text(&pick);
+                        log_line(&format!("commit {pick}"));
+                        return Ok(BOOL(1));
+                    }
+                }
+                Ok(BOOL(1))
+            }
+            // Esc：取消这次输入
+            VK_ESCAPE => {
+                let had = !buffer.is_empty();
+                buffer.clear();
+                cands.clear();
+                *matched_len = 0;
+                Ok(BOOL(if had { 1 } else { 0 }))
+            }
+            _ => Ok(BOOL(0)),
+        }
     }
 
     fn OnTestKeyUp(
@@ -201,24 +335,94 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
 
 /// 把按键记到临时目录的日志（按进程分文件，便于诊断按键流是否到达）。
 ///
-/// 注意：这是 T2 的诊断手段，正式版会走 IPC 而不是写文件——铁律是回调里不做重 IO。
-fn log_key(vk: u32) {
-    log_line(&format!("keydown vk={vk} (0x{vk:X})"));
-}
-
 /// 这个键要不要由输入法认领。
 ///
-/// 原则：**只认领真正要处理的**。认领原则之外的键（方向键、Tab、F 键、回车……）
-/// 一律放行给应用，否则会被 TSF 当成"输入法处理掉了"。
-fn should_handle(vk: u32) -> bool {
+/// 原则：**只认领真正要处理的**。方向键、Tab、F 键一律放行；
+/// 这个键该不该由输入法认领（TSF 按键状态机）。
+///
+/// 规则（对照主流输入法）：
+/// - **Ctrl/Alt/Win 按下**：永远放行（是快捷键，如 Ctrl+A/Ctrl+C）
+/// - **正在拼写**：认领 A-Z、数字、退格、空格、Esc（候选相关操作）
+/// - **空闲**：只认领"无 Shift/CapsLock 的纯字母"来启动拼写；
+///   Tab、CapsLock、Shift、Enter、空格、方向键、退格、符号 → 全部放行给应用
+fn should_claim(vk: u32, composing: bool) -> bool {
     const VK_BACK: u32 = 0x08;
     const VK_ESCAPE: u32 = 0x1B;
+    const VK_SPACE: u32 = 0x20;
     const VK_0: u32 = 0x30;
     const VK_9: u32 = 0x39;
     const VK_A: u32 = 0x41;
     const VK_Z: u32 = 0x5A;
 
-    matches!(vk, VK_A..=VK_Z | VK_0..=VK_9 | VK_BACK | VK_ESCAPE)
+    // 快捷键永远放行
+    if ctrl_alt_win_held() {
+        return false;
+    }
+
+    if composing {
+        // 正在拼写：候选相关键
+        return matches!(vk, VK_A..=VK_Z | VK_0..=VK_9 | VK_BACK | VK_SPACE | VK_ESCAPE);
+    }
+
+    // 空闲：只有"无 Shift/CapsLock 的纯字母"才启动拼写
+    if (VK_A..=VK_Z).contains(&vk) && !shift_or_caps() {
+        return true;
+    }
+    false
+}
+
+/// 查候选；整串查不到就逐步缩短，返回 (候选, 命中的前缀长度)。
+///
+/// 这样 `xiangmm` 会退到 `xiang` 出候选，而不是整串查不到直接卡死。
+fn query_with_fallback(code: &str) -> (Vec<String>, usize) {
+    if code.is_empty() {
+        return (Vec::new(), 0);
+    }
+    let mut probe = code.to_string();
+    while probe.len() >= 1 {
+        let r = ipc::query(&probe);
+        if !r.is_empty() {
+            return (r, probe.len());
+        }
+        probe.pop();
+    }
+    (Vec::new(), 0)
+}
+
+/// Ctrl / Alt / Win 是否按下（快捷键，应交给应用）。
+fn ctrl_alt_win_held() -> bool {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+    const VK_CONTROL: i32 = 0x11;
+    const VK_MENU: i32 = 0x12;
+    const VK_LWIN: i32 = 0x5B;
+    const VK_RWIN: i32 = 0x5C;
+    // SAFETY: 纯查询
+    unsafe {
+        [VK_CONTROL, VK_MENU, VK_LWIN, VK_RWIN]
+            .iter()
+            .any(|vk| (GetAsyncKeyState(*vk) as u16 & 0x8000) != 0)
+    }
+}
+
+/// Shift 按下 或 CapsLock 开着（用户想打英文大写，应交给应用）。
+fn shift_or_caps() -> bool {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+    const VK_SHIFT: i32 = 0x10;
+    const VK_CAPITAL: i32 = 0x14;
+    // SAFETY: 纯查询；Shift 看高位（按下），CapsLock 看低位（开关状态）
+    unsafe {
+        (GetAsyncKeyState(VK_SHIFT) as u16 & 0x8000) != 0
+            || (GetAsyncKeyState(VK_CAPITAL) as u16 & 0x0001) != 0
+    }
+}
+
+/// 注册类接口在"已存在"时返回 S_FALSE(HRESULT 1)，windows-rs 会当成 Err。
+/// 这里把 S_FALSE 视为成功，让重复注册变成幂等操作。
+fn ignore_s_false(r: windows::core::Result<()>) -> windows::core::Result<()> {
+    match r {
+        Err(e) if e.code() == windows::core::HRESULT(1) => Ok(()),
+        other => other,
+    }
 }
 
 fn log_line(msg: &str) {
@@ -431,29 +635,31 @@ mod registry {
                 let profiles: ITfInputProcessorProfiles =
                     CoCreateInstance(&CLSID_TF_InputProcessorProfiles, None, CLSCTX_INPROC_SERVER)?;
 
-                profiles.Register(&CLSID_INKLINK_TSF)?;
+                // Register / RegisterCategory / AddLanguageProfile 在"已存在"时返回
+                // S_FALSE(1)，windows-rs 会当成 Err——这里视为成功（幂等注册）。
+                crate::ignore_s_false(profiles.Register(&CLSID_INKLINK_TSF))?;
 
                 // 关键：注册到「键盘输入法」分类。没有这一步，Set-WinUserLanguageList
                 // 不会把它当作可选键盘，输入法列表里永远不出现。
                 let catmgr: ITfCategoryMgr =
                     CoCreateInstance(&CLSID_TF_CategoryMgr, None, CLSCTX_INPROC_SERVER)?;
-                catmgr.RegisterCategory(
+                crate::ignore_s_false(catmgr.RegisterCategory(
                     &CLSID_INKLINK_TSF,
                     &GUID_TFCAT_TIP_KEYBOARD,
                     &CLSID_INKLINK_TSF,
-                )?;
+                ))?;
                 drop(catmgr);
 
                 let desc: Vec<u16> = DLL_DESC.encode_utf16().collect();
                 let icon: Vec<u16> = dll_path.encode_utf16().collect();
-                profiles.AddLanguageProfile(
+                crate::ignore_s_false(profiles.AddLanguageProfile(
                     &CLSID_INKLINK_TSF,
                     LANG_ZH_CN,
                     &GUID_PROFILE,
                     &desc,
                     &icon,
                     0,
-                )?;
+                ))?;
 
                 // EnableLanguageProfile 失败时把错误透传出去——否则注册"看起来成功"，
                 // 但输入法列表里永远不会出现，问题会被藏起来。
