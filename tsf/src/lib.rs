@@ -18,7 +18,7 @@ use windows::Win32::UI::TextServices::{
     ITfComposition, ITfCompositionSink, ITfCompositionSink_Impl, ITfContext, ITfContextComposition,
     ITfEditSession, ITfEditSession_Impl, ITfKeyEventSink, ITfKeyEventSink_Impl, ITfKeystrokeMgr,
     ITfTextInputProcessorEx, ITfTextInputProcessorEx_Impl, ITfTextInputProcessor_Impl, ITfThreadMgr,
-    TF_ANCHOR_END, TF_DEFAULT_SELECTION, TF_ES_ASYNC, TF_ES_READWRITE, TF_SELECTION,
+    TF_ANCHOR_END, TF_ANCHOR_START, TF_DEFAULT_SELECTION, TF_ES_ASYNC, TF_ES_READWRITE, TF_SELECTION,
 };
 mod ipc;
 use windows::core::{GUID, HRESULT, Interface, Ref, implement};
@@ -66,8 +66,10 @@ impl IClassFactory_Impl for ClassFactory_Impl {
 
 /// 待编辑会话执行的动作
 enum EditAction {
-    /// 更新组合串文本（拼音）
-    Compose(String),
+    /// 更新组合串文本（拼音）并定位内部光标
+    Compose(String, usize),
+    /// 只移动组合串内部光标（方向键）
+    MoveCaret(usize),
     /// 提交：把组合串替换成最终文字，然后结束组合
     Commit(String),
     /// 取消：结束组合，清空
@@ -90,6 +92,8 @@ struct TextServiceInner {
     context: Mutex<Option<ITfContext>>,
     /// 当前活动的组合
     composition: Mutex<Option<ITfComposition>>,
+    /// 组合串内部光标位置（字节索引，拼音全 ASCII）
+    cursor: Mutex<usize>,
     /// 待编辑会话执行的动作
     pending: Mutex<Option<EditAction>>,
 }
@@ -112,6 +116,7 @@ impl TextService {
                 advised: Mutex::new(false),
                 context: Mutex::new(None),
                 composition: Mutex::new(None),
+                cursor: Mutex::new(0),
                 pending: Mutex::new(None),
             },
         }
@@ -132,6 +137,7 @@ impl ITfTextInputProcessor_Impl for TextService_Impl {
         *self.inner.context.lock().unwrap_or_else(|p| p.into_inner()) = None;
         *self.inner.composition.lock().unwrap_or_else(|p| p.into_inner()) = None;
         *self.inner.pending.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        *self.inner.cursor.lock().unwrap_or_else(|p| p.into_inner()) = 0;
         self.unadvise_keys();
         Ok(())
     }
@@ -220,6 +226,39 @@ impl TextService_Impl {
             *self.inner.context.lock().unwrap_or_else(|p| p.into_inner()) = Some(ctx.clone());
         }
     }
+
+    /// 把文档选区移到组合串内部的第 `cursor` 个字符处，让光标"看得见"。
+    ///
+    /// 做法：拿当前选区 range 当临时范围，起点对齐组合串起点，再右移 cursor 个字符。
+    /// （windows-rs 没有 `ITfRange::Clone`，只能借当前选区这个现成 range 来用。）
+    fn place_caret(
+        &self,
+        ec: u32,
+        comp_range: &windows::Win32::UI::TextServices::ITfRange,
+        cursor: usize,
+    ) -> windows::core::Result<()> {
+        let mut scratch = [TF_SELECTION::default()];
+        let mut fetched = 0u32;
+        if let Some(ctx) = self.inner.context.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
+            // SAFETY: 标准 TSF range 操作，全部在同一个编辑会话内
+            unsafe {
+                ctx.GetSelection(ec, TF_DEFAULT_SELECTION, &mut scratch, &mut fetched)?;
+                if let Some(s) = scratch[0].range.as_ref() {
+                    s.ShiftStartToRange(ec, comp_range, TF_ANCHOR_START)?;
+                    s.Collapse(ec, TF_ANCHOR_START)?;
+                    let mut shifted = 0i32;
+                    s.ShiftEnd(ec, cursor as i32, &mut shifted, std::ptr::null())?;
+                    s.Collapse(ec, TF_ANCHOR_END)?;
+                    let caret = [TF_SELECTION {
+                        range: std::mem::ManuallyDrop::new(Some(s.clone())),
+                        style: Default::default(),
+                    }];
+                    ctx.SetSelection(ec, &caret)?;
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 impl ITfEditSession_Impl for TextService_Impl {
@@ -232,7 +271,7 @@ impl ITfEditSession_Impl for TextService_Impl {
 
         match action {
             None => Ok(()),
-            Some(EditAction::Compose(text)) => {
+            Some(EditAction::Compose(text, cursor)) => {
                 let utf16: Vec<u16> = text.encode_utf16().collect();
                 // 没有组合就新建一个；有就更新
                 if comp.is_none() {
@@ -256,6 +295,15 @@ impl ITfEditSession_Impl for TextService_Impl {
                 if let Some(c) = comp.as_ref() {
                     let range = unsafe { c.GetRange()? };
                     unsafe { range.SetText(ec, 0, &utf16)? };
+                    self.place_caret(ec, &range, cursor)?;
+                }
+                Ok(())
+            }
+            Some(EditAction::MoveCaret(cursor)) => {
+                // 只移动光标，不改文字（方向键用）
+                if let Some(c) = comp.as_ref() {
+                    let range = unsafe { c.GetRange()? };
+                    self.place_caret(ec, &range, cursor)?;
                 }
                 Ok(())
             }
@@ -332,6 +380,10 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
         const VK_9: u32 = 0x39;
         const VK_A: u32 = 0x41;
         const VK_Z: u32 = 0x5A;
+        const VK_LEFT: u32 = 0x25;
+        const VK_RIGHT: u32 = 0x27;
+        const VK_HOME: u32 = 0x24;
+        const VK_END: u32 = 0x23;
 
         let vk = wparam.0 as u32;
 
@@ -348,37 +400,87 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
         let mut buffer = self.inner.buffer.lock().unwrap_or_else(|p| p.into_inner());
         let mut cands = self.inner.cands.lock().unwrap_or_else(|p| p.into_inner());
         let mut matched_len = self.inner.matched_len.lock().unwrap_or_else(|p| p.into_inner());
+        let mut cursor = self.inner.cursor.lock().unwrap_or_else(|p| p.into_inner());
         let composing = !buffer.is_empty();
 
         match vk {
-            // 字母：进入/继续拼写
+            // 字母：插入到内部光标处（拼音全 ASCII，字节索引即字符索引）
             VK_A..=VK_Z => {
                 // 空闲 + Shift/CapsLock：是要打英文大写，放行给应用
                 if !composing && shift_or_caps() {
                     return Ok(BOOL(0));
                 }
-                buffer.push((vk as u8 as char).to_ascii_lowercase());
+                let at = (*cursor).min(buffer.len());
+                buffer.insert(at, (vk as u8 as char).to_ascii_lowercase());
+                *cursor = at + 1;
                 (*cands, *matched_len) = query_with_fallback(&buffer);
                 log_line(&format!(
-                    "compose buffer={} cands={} matched={} top={:?}",
+                    "compose buffer={} cursor={} cands={} matched={} top={:?}",
                     *buffer,
+                    *cursor,
                     cands.len(),
                     *matched_len,
                     cands.first()
                 ));
                 // 把拼音写到文档里（组合串）
-                self.request_edit(EditAction::Compose(buffer.clone()));
+                self.request_edit(EditAction::Compose(buffer.clone(), *cursor));
                 Ok(BOOL(1))
             }
-            // 退格：删一个字母；空缓冲时放行给应用
+            // 退格：删内部光标前一个字母；缓冲空时放行给应用
             VK_BACK => {
-                if buffer.pop().is_some() {
+                if !buffer.is_empty() && *cursor > 0 {
+                    let at = (*cursor).min(buffer.len());
+                    buffer.remove(at - 1);
+                    *cursor = at - 1;
                     (*cands, *matched_len) = query_with_fallback(&buffer);
                     if buffer.is_empty() {
                         self.request_edit(EditAction::Cancel);
                     } else {
-                        self.request_edit(EditAction::Compose(buffer.clone()));
+                        self.request_edit(EditAction::Compose(buffer.clone(), *cursor));
                     }
+                    Ok(BOOL(1))
+                } else {
+                    Ok(BOOL(0))
+                }
+            }
+            // 左右键：在组合串内部移动光标（不移动文档光标）
+            VK_LEFT => {
+                if composing {
+                    if *cursor > 0 {
+                        *cursor -= 1;
+                    }
+                    self.request_edit(EditAction::MoveCaret(*cursor));
+                    Ok(BOOL(1))
+                } else {
+                    Ok(BOOL(0))
+                }
+            }
+            VK_RIGHT => {
+                if composing {
+                    let len = buffer.len();
+                    if *cursor < len {
+                        *cursor += 1;
+                    }
+                    self.request_edit(EditAction::MoveCaret(*cursor));
+                    Ok(BOOL(1))
+                } else {
+                    Ok(BOOL(0))
+                }
+            }
+            // Home/End：跳到组合串首/尾
+            VK_HOME => {
+                if composing {
+                    *cursor = 0;
+                    self.request_edit(EditAction::MoveCaret(*cursor));
+                    Ok(BOOL(1))
+                } else {
+                    Ok(BOOL(0))
+                }
+            }
+            VK_END => {
+                if composing {
+                    *cursor = buffer.len();
+                    self.request_edit(EditAction::MoveCaret(*cursor));
                     Ok(BOOL(1))
                 } else {
                     Ok(BOOL(0))
@@ -391,6 +493,7 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                     buffer.clear();
                     cands.clear();
                     *matched_len = 0;
+                    *cursor = 0;
                     log_line(&format!("commit {top}"));
                     self.request_edit(EditAction::Commit(top));
                     Ok(BOOL(1))
@@ -405,6 +508,7 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                     buffer.clear();
                     cands.clear();
                     *matched_len = 0;
+                    *cursor = 0;
                     log_line(&format!("commit-raw {raw}"));
                     self.request_edit(EditAction::Commit(raw));
                     Ok(BOOL(1))
@@ -423,6 +527,7 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                         buffer.clear();
                         cands.clear();
                         *matched_len = 0;
+                        *cursor = 0;
                         log_line(&format!("commit {pick}"));
                         self.request_edit(EditAction::Commit(pick));
                         return Ok(BOOL(1));
@@ -436,6 +541,7 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                 buffer.clear();
                 cands.clear();
                 *matched_len = 0;
+                *cursor = 0;
                 if had {
                     self.request_edit(EditAction::Cancel);
                 }
@@ -486,8 +592,13 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
 ///   Tab、CapsLock、Shift、Enter、空格、方向键、退格、符号 → 全部放行给应用
 fn should_claim(vk: u32, composing: bool) -> bool {
     const VK_BACK: u32 = 0x08;
+    const VK_RETURN: u32 = 0x0D;
     const VK_ESCAPE: u32 = 0x1B;
     const VK_SPACE: u32 = 0x20;
+    const VK_END: u32 = 0x23;
+    const VK_HOME: u32 = 0x24;
+    const VK_LEFT: u32 = 0x25;
+    const VK_RIGHT: u32 = 0x27;
     const VK_0: u32 = 0x30;
     const VK_9: u32 = 0x39;
     const VK_A: u32 = 0x41;
@@ -499,8 +610,20 @@ fn should_claim(vk: u32, composing: bool) -> bool {
     }
 
     if composing {
-        // 正在拼写：候选相关键
-        return matches!(vk, VK_A..=VK_Z | VK_0..=VK_9 | VK_BACK | VK_SPACE | VK_ESCAPE);
+        // 正在拼写：字母/数字/候选操作键 + 组合串内移动光标的键
+        return matches!(
+            vk,
+            VK_A..=VK_Z
+                | VK_0..=VK_9
+                | VK_BACK
+                | VK_SPACE
+                | VK_RETURN
+                | VK_ESCAPE
+                | VK_LEFT
+                | VK_RIGHT
+                | VK_HOME
+                | VK_END
+        );
     }
 
     // 空闲：只有"无 Shift/CapsLock 的纯字母"才启动拼写
