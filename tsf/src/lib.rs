@@ -5,7 +5,7 @@
 //! - `DllMain` 什么都不做；不启动线程
 //! - `DllCanUnloadNow` **永远返回 S_FALSE**（上一版就死在这条）
 //!
-//! 当前阶段：T2 完成 —— 掛上 `ITfKeyEventSink`，按键已能流进 `OnKeyDown`（仍透传）。
+//! 当前阶段：T4 —— 组合串显示（拼音直接显示在文档光标处）。
 
 use std::sync::Mutex;
 
@@ -15,8 +15,10 @@ use windows::Win32::Foundation::{
 use windows::core::BOOL;
 use windows::Win32::System::Com::{IClassFactory, IClassFactory_Impl};
 use windows::Win32::UI::TextServices::{
-    ITfContext, ITfKeyEventSink, ITfKeyEventSink_Impl, ITfKeystrokeMgr, ITfTextInputProcessorEx,
-    ITfTextInputProcessorEx_Impl, ITfTextInputProcessor_Impl, ITfThreadMgr,
+    ITfComposition, ITfCompositionSink, ITfCompositionSink_Impl, ITfContext, ITfContextComposition,
+    ITfEditSession, ITfEditSession_Impl, ITfKeyEventSink, ITfKeyEventSink_Impl, ITfKeystrokeMgr,
+    ITfTextInputProcessorEx, ITfTextInputProcessorEx_Impl, ITfTextInputProcessor_Impl, ITfThreadMgr,
+    TF_ANCHOR_END, TF_DEFAULT_SELECTION, TF_ES_ASYNC, TF_ES_READWRITE, TF_SELECTION,
 };
 mod ipc;
 use windows::core::{GUID, HRESULT, Interface, Ref, implement};
@@ -62,6 +64,16 @@ impl IClassFactory_Impl for ClassFactory_Impl {
 
 // ─────────────────────────── 文本服务本体 ───────────────────────────
 
+/// 待编辑会话执行的动作
+enum EditAction {
+    /// 更新组合串文本（拼音）
+    Compose(String),
+    /// 提交：把组合串替换成最终文字，然后结束组合
+    Commit(String),
+    /// 取消：结束组合，清空
+    Cancel,
+}
+
 struct TextServiceInner {
     thread_mgr: Mutex<Option<ITfThreadMgr>>,
     keystroke_mgr: Mutex<Option<ITfKeystrokeMgr>>,
@@ -74,9 +86,15 @@ struct TextServiceInner {
     matched_len: Mutex<usize>,
     /// 是否已挂载按键接收器（防止重复挂载导致同一按键触发多次回调）
     advised: Mutex<bool>,
+    /// 输入上下文（来自 OnKeyDown 的 pic，编辑会话要用）
+    context: Mutex<Option<ITfContext>>,
+    /// 当前活动的组合
+    composition: Mutex<Option<ITfComposition>>,
+    /// 待编辑会话执行的动作
+    pending: Mutex<Option<EditAction>>,
 }
 
-#[implement(ITfTextInputProcessorEx, ITfKeyEventSink)]
+#[implement(ITfTextInputProcessorEx, ITfKeyEventSink, ITfEditSession, ITfCompositionSink)]
 struct TextService {
     inner: TextServiceInner,
 }
@@ -92,6 +110,9 @@ impl TextService {
                 cands: Mutex::new(Vec::new()),
                 matched_len: Mutex::new(0),
                 advised: Mutex::new(false),
+                context: Mutex::new(None),
+                composition: Mutex::new(None),
+                pending: Mutex::new(None),
             },
         }
     }
@@ -108,6 +129,9 @@ impl ITfTextInputProcessor_Impl for TextService_Impl {
         self.inner.buffer.lock().unwrap_or_else(|p| p.into_inner()).clear();
         self.inner.cands.lock().unwrap_or_else(|p| p.into_inner()).clear();
         *self.inner.matched_len.lock().unwrap_or_else(|p| p.into_inner()) = 0;
+        *self.inner.context.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        *self.inner.composition.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        *self.inner.pending.lock().unwrap_or_else(|p| p.into_inner()) = None;
         self.unadvise_keys();
         Ok(())
     }
@@ -172,6 +196,105 @@ impl TextService_Impl {
         *self.inner.keystroke_mgr.lock().unwrap() = None;
         *self.inner.thread_mgr.lock().unwrap() = None;
     }
+
+    /// 把一个动作交给编辑会话执行（异步，安全，不阻塞按键线程）。
+    fn request_edit(&self, action: EditAction) {
+        *self.inner.pending.lock().unwrap_or_else(|p| p.into_inner()) = Some(action);
+        let tid = *self.inner.tid.lock().unwrap();
+        if tid == 0 {
+            return;
+        }
+        if let Some(ctx) = self.inner.context.lock().unwrap_or_else(|p| p.into_inner()).clone() {
+            let sink: ITfEditSession = self.to_interface();
+            // SAFETY: 标准 TSF 编辑会话请求，sink 生命周期由 COM 引用计数管理
+            let _ = unsafe { ctx.RequestEditSession(tid, &sink, TF_ES_ASYNC | TF_ES_READWRITE) };
+        }
+    }
+
+    /// 把输入上下文存下来（编辑会话要用）
+    fn store_context(&self, pic: Ref<ITfContext>) {
+        if let Some(ctx) = pic.as_ref() {
+            *self.inner.context.lock().unwrap_or_else(|p| p.into_inner()) = Some(ctx.clone());
+        }
+    }
+}
+
+impl ITfEditSession_Impl for TextService_Impl {
+    fn DoEditSession(&self, ec: u32) -> windows::core::Result<()> {
+        // 取出待执行的动作
+        let action = self.inner.pending.lock().unwrap_or_else(|p| p.into_inner()).take();
+
+        // 取出当前组合
+        let mut comp = self.inner.composition.lock().unwrap_or_else(|p| p.into_inner());
+
+        match action {
+            None => Ok(()),
+            Some(EditAction::Compose(text)) => {
+                let utf16: Vec<u16> = text.encode_utf16().collect();
+                // 没有组合就新建一个；有就更新
+                if comp.is_none() {
+                    if let Some(ctx) = self.inner.context.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
+                        // 取光标位置的 range
+                        let mut sel = [TF_SELECTION::default()];
+                        let mut fetched = 0u32;
+                        unsafe {
+                            ctx.GetSelection(ec, TF_DEFAULT_SELECTION, &mut sel, &mut fetched)?;
+                        }
+                        let range = &sel[0].range;
+                        if let Some(range) = range.as_ref() {
+                            let sink: ITfCompositionSink = self.to_interface();
+                            // StartComposition 在 ITfContextComposition 上，先从 ITfContext cast 过去
+                            let ctx_comp: ITfContextComposition = ctx.cast()?;
+                            let c = unsafe { ctx_comp.StartComposition(ec, range, &sink)? };
+                            *comp = Some(c);
+                        }
+                    }
+                }
+                if let Some(c) = comp.as_ref() {
+                    let range = unsafe { c.GetRange()? };
+                    unsafe { range.SetText(ec, 0, &utf16)? };
+                }
+                Ok(())
+            }
+            Some(EditAction::Commit(text)) => {
+                let utf16: Vec<u16> = text.encode_utf16().collect();
+                if let Some(c) = comp.as_ref() {
+                    let range = unsafe { c.GetRange()? };
+                    unsafe { range.SetText(ec, 0, &utf16)? };
+                    unsafe { c.EndComposition(ec)? };
+                    // 结束组合只是"定格"文字，光标仍停在文本开头。
+                    // 把 range 折叠到末尾、设为选区，光标才会落到文字之后。
+                    unsafe { range.Collapse(ec, TF_ANCHOR_END)? };
+                    let sel = [TF_SELECTION {
+                        range: std::mem::ManuallyDrop::new(Some(range)),
+                        style: Default::default(),
+                    }];
+                    if let Some(ctx) = self.inner.context.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
+                        unsafe { ctx.SetSelection(ec, &sel)? };
+                    }
+                }
+                *comp = None;
+                Ok(())
+            }
+            Some(EditAction::Cancel) => {
+                if let Some(c) = comp.as_ref() {
+                    let range = unsafe { c.GetRange()? };
+                    // 先清空文本再结束组合，否则拼音会被当成普通文字留在文档里
+                    unsafe { range.SetText(ec, 0, &[])? };
+                    unsafe { c.EndComposition(ec)? };
+                }
+                *comp = None;
+                Ok(())
+            }
+        }
+    }
+}
+
+impl ITfCompositionSink_Impl for TextService_Impl {
+    fn OnCompositionTerminated(&self, _ecwrite: u32, _pcomposition: Ref<ITfComposition>) -> windows::core::Result<()> {
+        *self.inner.composition.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        Ok(())
+    }
 }
 
 impl ITfKeyEventSink_Impl for TextService_Impl {
@@ -194,7 +317,7 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
 
     fn OnKeyDown(
         &self,
-        _pic: Ref<ITfContext>,
+        pic: Ref<ITfContext>,
         wparam: WPARAM,
         _lparam: LPARAM,
     ) -> windows::core::Result<BOOL> {
@@ -208,6 +331,9 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
         const VK_Z: u32 = 0x5A;
 
         let vk = wparam.0 as u32;
+
+        // 存下输入上下文，编辑会话要用
+        self.store_context(pic);
 
         // Ctrl/Alt/Win 组合键：整体放行给应用（Ctrl+A/C/V/X/Z 等快捷键）。
         // 注意必须放在 OnKeyDown 里——fForeground=TRUE 的接收器，TSF 会跳过
@@ -237,12 +363,19 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                     *matched_len,
                     cands.first()
                 ));
+                // 把拼音写到文档里（组合串）
+                self.request_edit(EditAction::Compose(buffer.clone()));
                 Ok(BOOL(1))
             }
             // 退格：删一个字母；空缓冲时放行给应用
             VK_BACK => {
                 if buffer.pop().is_some() {
                     (*cands, *matched_len) = query_with_fallback(&buffer);
+                    if buffer.is_empty() {
+                        self.request_edit(EditAction::Cancel);
+                    } else {
+                        self.request_edit(EditAction::Compose(buffer.clone()));
+                    }
                     Ok(BOOL(1))
                 } else {
                     Ok(BOOL(0))
@@ -255,8 +388,8 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                     buffer.clear();
                     cands.clear();
                     *matched_len = 0;
-                    ipc::send_text(&top);
                     log_line(&format!("commit {top}"));
+                    self.request_edit(EditAction::Commit(top));
                     Ok(BOOL(1))
                 } else {
                     Ok(BOOL(0))
@@ -269,8 +402,8 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                     buffer.clear();
                     cands.clear();
                     *matched_len = 0;
-                    ipc::send_text(&raw);
                     log_line(&format!("commit-raw {raw}"));
+                    self.request_edit(EditAction::Commit(raw));
                     Ok(BOOL(1))
                 } else {
                     Ok(BOOL(0))
@@ -287,8 +420,8 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                         buffer.clear();
                         cands.clear();
                         *matched_len = 0;
-                        ipc::send_text(&pick);
                         log_line(&format!("commit {pick}"));
+                        self.request_edit(EditAction::Commit(pick));
                         return Ok(BOOL(1));
                     }
                 }
@@ -300,6 +433,9 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                 buffer.clear();
                 cands.clear();
                 *matched_len = 0;
+                if had {
+                    self.request_edit(EditAction::Cancel);
+                }
                 Ok(BOOL(if had { 1 } else { 0 }))
             }
             _ => Ok(BOOL(0)),

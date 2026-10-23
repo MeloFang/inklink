@@ -67,6 +67,8 @@ pub fn query(code: &str) -> Vec<String> {
 }
 
 /// 把文本送进当前获得焦点的应用（在光标处插入）。
+/// 保留作回退：T4 之后主路径是 ITfRange::SetText，若某些应用不配合可回退到 SendInput。
+#[allow(dead_code)]
 pub fn send_text(text: &str) -> bool {
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
         INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, SendInput,
