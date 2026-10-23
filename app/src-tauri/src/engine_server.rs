@@ -27,6 +27,12 @@ pub const PIPE_NAME: &str = r"\\.\pipe\inklink-engine";
 
 /// 引擎服务主循环：加载词库后一直服务，直到进程被杀。
 pub fn run(lexicon_path: &std::path::Path) -> ! {
+    // 单例：DLL 可能被多个应用同时拉起引擎，用命名互斥量保证只有一个实例在服务。
+    if !claim_singleton() {
+        eprintln!("已有引擎实例在运行，本实例退出");
+        std::process::exit(0);
+    }
+
     let lex = match Lexicon::load(lexicon_path) {
         Ok(l) => l,
         Err(e) => {
@@ -42,6 +48,29 @@ pub fn run(lexicon_path: &std::path::Path) -> ! {
             eprintln!("管道错误: {e}");
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
+    }
+}
+
+/// 用命名互斥量抢占单例。成功返回 true；已有实例返回 false。
+///
+/// 互斥量故意不释放——进程退出时由系统回收，正好表达"我在运行"。
+fn claim_singleton() -> bool {
+    use windows_sys::Win32::Foundation::ERROR_ALREADY_EXISTS;
+    use windows_sys::Win32::System::Threading::CreateMutexW;
+
+    let name: Vec<u16> = std::ffi::OsStr::new("Global\\inklink-engine-singleton")
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    // SAFETY: 标准 CreateMutex 调用；句柄故意不关闭（进程生命周期内有效）
+    unsafe {
+        let handle = CreateMutexW(std::ptr::null(), 0, name.as_ptr());
+        if handle.is_null() {
+            // 创建失败就别卡住，放行（最坏情况是多个实例，仍能服务）
+            return true;
+        }
+        windows_sys::Win32::Foundation::GetLastError() != ERROR_ALREADY_EXISTS
     }
 }
 

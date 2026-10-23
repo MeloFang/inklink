@@ -13,6 +13,100 @@ use windows_sys::Win32::Storage::FileSystem::{
 
 pub const PIPE_NAME: &str = r"\\.\pipe\inklink-engine";
 
+/// 引擎进程是否在跑（管道是否有可用实例）。
+pub fn engine_alive() -> bool {
+    use windows_sys::Win32::System::Pipes::WaitNamedPipeW;
+    let name = wide(PIPE_NAME);
+    // 0 毫秒 = 立刻返回：有实例就 TRUE，没管道就 FALSE
+    // SAFETY: 纯查询
+    unsafe { WaitNamedPipeW(name.as_ptr(), 0) != 0 }
+}
+
+/// 确保引擎在跑：连不上就把它拉起来（同用户上下文，不阻塞）。
+///
+/// 这是"引擎崩了输入法就废"的根治手段——下次激活或按键时自动复活。
+pub fn ensure_engine() {
+    if engine_alive() {
+        return;
+    }
+    let exe = engine_exe_path();
+    if exe.is_empty() {
+        return;
+    }
+    start_process(&exe);
+}
+
+/// 引擎可执行文件路径：注册表 > 默认安装位置。
+fn engine_exe_path() -> String {
+    use windows_sys::Win32::System::Registry::{HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ, RegGetValueW};
+    let key = wide("SOFTWARE\\inklink");
+    let value = wide("EnginePath");
+    let mut buf = [0u16; 512];
+    let mut size = (buf.len() * 2) as u32;
+    // SAFETY: 标准注册表读取，缓冲区大小按字节给出
+    let rc = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            key.as_ptr(),
+            value.as_ptr(),
+            RRF_RT_REG_SZ,
+            std::ptr::null_mut(),
+            buf.as_mut_ptr() as *mut core::ffi::c_void,
+            &mut size,
+        )
+    };
+    if rc == 0 {
+        let len = (size as usize / 2).saturating_sub(1);
+        let s = String::from_utf16_lossy(&buf[..len]);
+        if !s.is_empty() {
+            return s;
+        }
+    }
+    // 回退到默认安装位置
+    let fallback = r"C:\inklink-engine\inklink.exe";
+    if std::path::Path::new(fallback).exists() {
+        fallback.to_string()
+    } else {
+        String::new()
+    }
+}
+
+/// 拉起引擎进程（不等待，创建后立刻关闭句柄）。
+fn start_process(exe: &str) {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        CREATE_NO_WINDOW, CreateProcessW, PROCESS_INFORMATION, STARTUPINFOW,
+    };
+
+    let mut cmd: Vec<u16> = format!("\"{exe}\" --serve")
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut si: STARTUPINFOW = unsafe { std::mem::zeroed() };
+    si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
+    let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+
+    // SAFETY: 标准 CreateProcessW；命令行可写、结构体已初始化
+    unsafe {
+        let ok = CreateProcessW(
+            std::ptr::null(),
+            cmd.as_mut_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+            CREATE_NO_WINDOW,
+            std::ptr::null(),
+            std::ptr::null(),
+            &si,
+            &mut pi,
+        );
+        if ok != 0 {
+            let _ = CloseHandle(pi.hProcess);
+            let _ = CloseHandle(pi.hThread);
+        }
+    }
+}
+
 /// 向引擎查询候选。连不上就返回空（输入法不能让应用卡住）。
 pub fn query(code: &str) -> Vec<String> {
     if code.is_empty() {
@@ -31,6 +125,8 @@ pub fn query(code: &str) -> Vec<String> {
             std::ptr::null_mut(),
         );
         if pipe == INVALID_HANDLE_VALUE {
+            // 连不上：顺手拉一下引擎（自愈），本次查询先返回空
+            ensure_engine();
             return Vec::new();
         }
 

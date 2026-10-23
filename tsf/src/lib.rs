@@ -170,6 +170,9 @@ impl TextService_Impl {
         let keystroke_mgr: ITfKeystrokeMgr = thread_mgr.cast()?;
         *self.inner.keystroke_mgr.lock().unwrap() = Some(keystroke_mgr.clone());
 
+        // 激活时顺手确保引擎在跑——引擎崩了下次切输入法就自动复活
+        ipc::ensure_engine();
+
         // 把自己作为按键 sink 挂上去（传引用，而不是把 owned 接口交给 Param）
         let sink: ITfKeyEventSink = self.to_interface();
         let r = unsafe { keystroke_mgr.AdviseKeyEventSink(tid, &sink, true) };
