@@ -1,61 +1,44 @@
-﻿# inklink TSF deploy v11 - uppercase GUIDs, propagate enable error
-# Run as Administrator: powershell -ExecutionPolicy Bypass -File .\deploy-v11.ps1
+# inklink TSF 部署到测试机（Hyper-V VM 内，管理员 PowerShell 运行）
+#
+# 用法：先把编译产物推进 VM 的 C:\Users\Public\ 下，再跑本脚本：
+#   powershell -ExecutionPolicy Bypass -File .\deploy.ps1
+#
+# 关键点（都是踩过的坑，见 HANDOFF.md 第四节）：
+#   1. TIP 已注册（首次用 regsvr32 注册过一次），日常迭代只需改 InprocServer32 指向新 DLL
+#   2. DLL 用唯一时间戳文件名，避免被已加载的旧 DLL 锁死
+#   3. 引擎是独立进程，崩了要能拉起来
 
-$ErrorActionPreference = 'Continue'
-$clsid   = '{8F2A6C1E-4B3D-4F7A-9A21-5C6D7E8F9A0B}'
-$profile = '{1B2C3D4E-5F60-4718-9A2B-3C4D5E6F7081}'
-$tip     = "0804:$clsid$profile"
-$dir     = 'C:\Program Files\inklink'
-$dll     = Join-Path $dir 'inklink_tsf.dll'
+param(
+    [string]$SourceDll = 'C:\Users\Public\inklink_tsf.dll',
+    [string]$EngineExe = 'C:\inklink-engine\inklink.exe',
+    [string]$EngineDir = 'C:\inklink-engine'
+)
 
-Write-Host "== 1. copy DLL =="
-New-Item -ItemType Directory -Force $dir | Out-Null
-try {
-  Copy-Item 'C:\Users\Public\inklink_tsf5.dll' $dll -Force -ErrorAction Stop
-  Write-Host "   copied"
-} catch {
-  $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-  $dll = Join-Path $dir ("inklink_tsf_" + $stamp + ".dll")
-  Copy-Item 'C:\Users\Public\inklink_tsf5.dll' $dll -Force -ErrorAction Stop
-  Write-Host ("   locked, fallback: " + $dll)
-}
+$ErrorActionPreference = 'Stop'
+$clsid = '{8F2A6C1E-4B3D-4F7A-9A21-5C6D7E8F9A0B}'
 
-Write-Host "== 2. register =="
-Add-Type -TypeDefinition 'using System;using System.Runtime.InteropServices;public class R{[DllImport("kernel32.dll",CharSet=CharSet.Unicode)]public static extern IntPtr LoadLibraryW(string p);[DllImport("kernel32.dll",CharSet=CharSet.Ansi)]public static extern IntPtr GetProcAddress(IntPtr h,string n);[DllImport("kernel32.dll")]public static extern uint GetLastError();[UnmanagedFunctionPointer(CallingConvention.StdCall)]public delegate int F();}'
-$h = [R]::LoadLibraryW($dll)
-if ($h -eq [IntPtr]::Zero) { Write-Host ("   LOAD FAIL " + [R]::GetLastError()); exit 1 }
-$pa = [R]::GetProcAddress($h, 'DllRegisterServer')
-if ($pa -eq [IntPtr]::Zero) { Write-Host "   no export"; exit 1 }
-$f = [System.Runtime.InteropServices.Marshal]::GetDelegateForFunctionPointer($pa, [R+F])
-$hr = $f.Invoke()
-Write-Host ("   HRESULT = 0x{0:X8}" -f $hr)
-if ($hr -ne 0) { Write-Host "   register FAILED, aborting"; exit 1 }
+# 1. 关掉记事本，让它下次加载新 DLL（DllCanUnloadNow=S_FALSE，进程不重启就还是旧 DLL）
+Get-Process notepad -ErrorAction SilentlyContinue | Stop-Process -Force
+Start-Sleep -Seconds 1
 
-Write-Host "== 3. ensure zh-Hans-CN language =="
-$langList = Get-WinUserLanguageList
-$zh = $langList | Where-Object { $_.LanguageTag -eq 'zh-Hans-CN' } | Select-Object -First 1
-if ($zh -eq $null) {
-  Write-Host "   no Chinese language, adding..."
-  $zhNew = New-WinUserLanguageList 'zh-Hans-CN'
-  $langList.Add($zhNew[0])
-}
+# 2. DLL 复制到唯一文件名
+if (-not (Test-Path $SourceDll)) { throw "找不到源 DLL: $SourceDll" }
+$stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+$dll = "C:\Program Files\inklink\inklink_tsf_$stamp.dll"
+Copy-Item $SourceDll $dll -Force
+Write-Host "DLL -> $dll"
 
-Write-Host "== 4. add TIP to zh-Hans-CN =="
-$zh = $langList | Where-Object { $_.LanguageTag -eq 'zh-Hans-CN' } | Select-Object -First 1
-if ($zh -ne $null) {
-  if ($zh.InputMethodTips -notcontains $tip) { $zh.InputMethodTips.Add($tip) }
-  Set-WinUserLanguageList -LanguageList $langList -Force
-}
+# 3. 注册表直接指向新 DLL（TIP 已注册，不用再走 DllRegisterServer）
+Set-ItemProperty "HKLM:\SOFTWARE\Classes\CLSID\$clsid\InprocServer32" -Name '(default)' -Value $dll
+Write-Host "注册表已更新"
 
-Write-Host "== 5. verify =="
-Start-Sleep -Seconds 2
-(Get-WinUserLanguageList) | ForEach-Object {
-  Write-Host ("   lang " + $_.LanguageTag)
-  $_.InputMethodTips | ForEach-Object { Write-Host ("      " + $_) }
-}
-if (((Get-WinUserLanguageList) | ForEach-Object { $_.InputMethodTips }) -contains $tip) {
-  Write-Host "RESULT: OK in list"
+# 4. 确保引擎进程在跑
+if (-not (Get-Process inklink -ErrorAction SilentlyContinue)) {
+    Start-Process -FilePath $EngineExe -ArgumentList '--serve' -WorkingDirectory $EngineDir -WindowStyle Hidden
+    Start-Sleep -Seconds 4
+    Write-Host "引擎已启动"
 } else {
-  Write-Host "RESULT: still not in list"
+    Write-Host "引擎已在运行"
 }
-Write-Host "done"
+
+Write-Host "完成。关掉并重开记事本，Win+Space 切到 inklink 测试。"
