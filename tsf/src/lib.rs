@@ -21,6 +21,7 @@ use windows::Win32::UI::TextServices::{
     TF_ANCHOR_END, TF_ANCHOR_START, TF_DEFAULT_SELECTION, TF_ES_ASYNC, TF_ES_READWRITE, TF_SELECTION,
 };
 mod ipc;
+mod candwin;
 use windows::core::{GUID, HRESULT, Interface, Ref, implement};
 use windows::core::IUnknownImpl;
 
@@ -30,6 +31,14 @@ pub const CLSID_INKLINK_TSF: GUID = GUID::from_u128(0x8f2a6c1e_4b3d_4f7a_9a21_5c
 pub const GUID_PROFILE: GUID = GUID::from_u128(0x1b2c3d4e_5f60_4718_9a2b_3c4d5e6f7081);
 
 const DLL_DESC: &str = "inklink 输入法";
+
+/// 候选网格列数
+const GRID_COLS: usize = 5;
+
+/// 候选窗收起时每页 5 个（1 行）
+const PAGE_SIZE_COLLAPSED: usize = 5;
+/// 展开时每页 25 个（5 行 × 5 列）
+const PAGE_SIZE_EXPANDED: usize = 25;
 
 // ─────────────────────────── COM 类工厂 ───────────────────────────
 
@@ -84,6 +93,12 @@ struct TextServiceInner {
     buffer: Mutex<String>,
     /// 当前候选
     cands: Mutex<Vec<String>>,
+    /// 候选当前页
+    page: Mutex<usize>,
+    /// 候选窗是否展开成 5×5
+    expanded: Mutex<bool>,
+    /// 当前页内选中的候选下标
+    sel: Mutex<usize>,
     /// 候选命中的缓冲长度（前缀回退时可能小于 buffer 全长）
     matched_len: Mutex<usize>,
     /// 是否已挂载按键接收器（防止重复挂载导致同一按键触发多次回调）
@@ -112,6 +127,9 @@ impl TextService {
                 tid: Mutex::new(0),
                 buffer: Mutex::new(String::new()),
                 cands: Mutex::new(Vec::new()),
+                page: Mutex::new(0),
+                expanded: Mutex::new(false),
+                sel: Mutex::new(0),
                 matched_len: Mutex::new(0),
                 advised: Mutex::new(false),
                 context: Mutex::new(None),
@@ -138,6 +156,7 @@ impl ITfTextInputProcessor_Impl for TextService_Impl {
         *self.inner.composition.lock().unwrap_or_else(|p| p.into_inner()) = None;
         *self.inner.pending.lock().unwrap_or_else(|p| p.into_inner()) = None;
         *self.inner.cursor.lock().unwrap_or_else(|p| p.into_inner()) = 0;
+        candwin::hide();
         self.unadvise_keys();
         Ok(())
     }
@@ -376,6 +395,7 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
         const VK_RETURN: u32 = 0x0D;
         const VK_ESCAPE: u32 = 0x1B;
         const VK_SPACE: u32 = 0x20;
+        const VK_DELETE: u32 = 0x2E;
         const VK_0: u32 = 0x30;
         const VK_9: u32 = 0x39;
         const VK_A: u32 = 0x41;
@@ -384,6 +404,12 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
         const VK_RIGHT: u32 = 0x27;
         const VK_HOME: u32 = 0x24;
         const VK_END: u32 = 0x23;
+        const VK_UP: u32 = 0x26;
+        const VK_DOWN: u32 = 0x28;
+        const VK_OEM_MINUS: u32 = 0xBD;
+        const VK_OEM_PLUS: u32 = 0xBB;
+        const VK_OEM_COMMA: u32 = 0xBC;
+        const VK_OEM_PERIOD: u32 = 0xBE;
 
         let vk = wparam.0 as u32;
 
@@ -401,6 +427,9 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
         let mut cands = self.inner.cands.lock().unwrap_or_else(|p| p.into_inner());
         let mut matched_len = self.inner.matched_len.lock().unwrap_or_else(|p| p.into_inner());
         let mut cursor = self.inner.cursor.lock().unwrap_or_else(|p| p.into_inner());
+        let mut page = self.inner.page.lock().unwrap_or_else(|p| p.into_inner());
+        let mut expanded = self.inner.expanded.lock().unwrap_or_else(|p| p.into_inner());
+        let mut sel = self.inner.sel.lock().unwrap_or_else(|p| p.into_inner());
         let composing = !buffer.is_empty();
 
         match vk {
@@ -414,6 +443,9 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                 buffer.insert(at, (vk as u8 as char).to_ascii_lowercase());
                 *cursor = at + 1;
                 (*cands, *matched_len) = query_with_fallback(&buffer);
+                *page = 0;
+                *expanded = false;
+                *sel = 0;
                 log_line(&format!(
                     "compose buffer={} cursor={} cands={} matched={} top={:?}",
                     *buffer,
@@ -422,6 +454,8 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                     *matched_len,
                     cands.first()
                 ));
+                // 显示候选窗
+                show_cand_window(&buffer, &cands, *page, *expanded, *sel);
                 // 把拼音写到文档里（组合串）
                 self.request_edit(EditAction::Compose(buffer.clone(), *cursor));
                 Ok(BOOL(1))
@@ -433,9 +467,14 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                     buffer.remove(at - 1);
                     *cursor = at - 1;
                     (*cands, *matched_len) = query_with_fallback(&buffer);
+                    *page = 0;
+                    *expanded = false;
+                    *sel = 0;
                     if buffer.is_empty() {
+                        candwin::hide();
                         self.request_edit(EditAction::Cancel);
                     } else {
+                        show_cand_window(&buffer, &cands, *page, *expanded, *sel);
                         self.request_edit(EditAction::Compose(buffer.clone(), *cursor));
                     }
                     Ok(BOOL(1))
@@ -443,25 +482,72 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                     Ok(BOOL(0))
                 }
             }
-            // 左右键：在组合串内部移动光标（不移动文档光标）
-            VK_LEFT => {
-                if composing {
-                    if *cursor > 0 {
-                        *cursor -= 1;
+            // Delete：删内部光标处那个字母（向前删）
+            VK_DELETE => {
+                if !buffer.is_empty() && *cursor < buffer.len() {
+                    let at = *cursor;
+                    buffer.remove(at);
+                    (*cands, *matched_len) = query_with_fallback(&buffer);
+                    *page = 0;
+                    *expanded = false;
+                    *sel = 0;
+                    if buffer.is_empty() {
+                        candwin::hide();
+                        self.request_edit(EditAction::Cancel);
+                    } else {
+                        show_cand_window(&buffer, &cands, *page, *expanded, *sel);
+                        self.request_edit(EditAction::Compose(buffer.clone(), *cursor));
                     }
-                    self.request_edit(EditAction::MoveCaret(*cursor));
                     Ok(BOOL(1))
                 } else {
                     Ok(BOOL(0))
                 }
             }
+            // 左键：展开时在网格里左移一列（行首则上一页）；收起时移动拼音光标
+            VK_LEFT => {
+                if composing {
+                    if *expanded {
+                        let size = page_size(true);
+                        if *sel % GRID_COLS > 0 {
+                            *sel -= 1;
+                        } else if *page > 0 {
+                            *page -= 1;
+                            let page_start = *page * size;
+                            let page_len = cands.len().saturating_sub(page_start).min(size);
+                            *sel = page_len.saturating_sub(1);
+                        }
+                        show_cand_window(&buffer, &cands, *page, *expanded, *sel);
+                    } else if *cursor > 0 {
+                        *cursor -= 1;
+                        self.request_edit(EditAction::MoveCaret(*cursor));
+                    }
+                    Ok(BOOL(1))
+                } else {
+                    Ok(BOOL(0))
+                }
+            }
+            // 右键：展开时右移一列（行末则下一页）；收起时移动拼音光标
             VK_RIGHT => {
                 if composing {
-                    let len = buffer.len();
-                    if *cursor < len {
-                        *cursor += 1;
+                    if *expanded {
+                        let size = page_size(true);
+                        let page_start = *page * size;
+                        let page_len = cands.len().saturating_sub(page_start).min(size);
+                        let total_pages = (cands.len() + size - 1) / size;
+                        if *sel % GRID_COLS < GRID_COLS - 1 && *sel + 1 < page_len {
+                            *sel += 1;
+                        } else if *page + 1 < total_pages {
+                            *page += 1;
+                            *sel = 0;
+                        }
+                        show_cand_window(&buffer, &cands, *page, *expanded, *sel);
+                    } else {
+                        let len = buffer.len();
+                        if *cursor < len {
+                            *cursor += 1;
+                            self.request_edit(EditAction::MoveCaret(*cursor));
+                        }
                     }
-                    self.request_edit(EditAction::MoveCaret(*cursor));
                     Ok(BOOL(1))
                 } else {
                     Ok(BOOL(0))
@@ -486,14 +572,100 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                     Ok(BOOL(0))
                 }
             }
-            // 空格：首个候选上屏；没有候选时是普通空格
+            // 上键：展开时上移一行（首行则上一页）；收起时不动
+            VK_UP => {
+                if composing {
+                    if *expanded {
+                        let size = page_size(true);
+                        if *sel >= GRID_COLS {
+                            *sel -= GRID_COLS;
+                        } else if *page > 0 {
+                            *page -= 1;
+                            let page_start = *page * size;
+                            let page_len = cands.len().saturating_sub(page_start).min(size);
+                            *sel = page_len.saturating_sub(1);
+                        }
+                        show_cand_window(&buffer, &cands, *page, *expanded, *sel);
+                    }
+                    Ok(BOOL(1))
+                } else {
+                    Ok(BOOL(0))
+                }
+            }
+            // 下键：展开时下移一行（末行则下一页）；收起时展开成 5×5
+            VK_DOWN => {
+                if composing {
+                    if !*expanded {
+                        *expanded = true;
+                        *page = 0;
+                        *sel = 0;
+                    } else {
+                        let size = page_size(true);
+                        let page_start = *page * size;
+                        let page_len = cands.len().saturating_sub(page_start).min(size);
+                        let total_pages = (cands.len() + size - 1) / size;
+                        if *sel + GRID_COLS < page_len {
+                            *sel += GRID_COLS;
+                        } else if *page + 1 < total_pages {
+                            *page += 1;
+                            *sel = 0;
+                        }
+                    }
+                    show_cand_window(&buffer, &cands, *page, *expanded, *sel);
+                    Ok(BOOL(1))
+                } else {
+                    Ok(BOOL(0))
+                }
+            }
+            // - / , ：上一页（展开时首页则收起）
+            VK_OEM_MINUS | VK_OEM_COMMA => {
+                if composing {
+                    if *expanded {
+                        if *page > 0 {
+                            *page -= 1;
+                        } else {
+                            *expanded = false;
+                        }
+                    } else if *page > 0 {
+                        *page -= 1;
+                    }
+                    *sel = 0;
+                    show_cand_window(&buffer, &cands, *page, *expanded, *sel);
+                    Ok(BOOL(1))
+                } else {
+                    Ok(BOOL(0))
+                }
+            }
+            // = / . ：下一页（收起时先展开）
+            VK_OEM_PLUS | VK_OEM_PERIOD => {
+                if composing {
+                    if !*expanded {
+                        *expanded = true;
+                        *page = 0;
+                    } else {
+                        let size = page_size(true);
+                        let total_pages = (cands.len() + size - 1) / size;
+                        if *page + 1 < total_pages {
+                            *page += 1;
+                        }
+                    }
+                    *sel = 0;
+                    show_cand_window(&buffer, &cands, *page, *expanded, *sel);
+                    Ok(BOOL(1))
+                } else {
+                    Ok(BOOL(0))
+                }
+            }
+            // 空格：上屏当前选中的候选
             VK_SPACE => {
-                if let Some(top) = cands.first().cloned() {
+                let pick_idx = *page * page_size(*expanded) + *sel;
+                if let Some(top) = cands.get(pick_idx).cloned() {
                     // 上屏后清空整个缓冲——多余/打错的字母一并删掉（用户要求）
                     buffer.clear();
                     cands.clear();
                     *matched_len = 0;
                     *cursor = 0;
+                    candwin::hide();
                     log_line(&format!("commit {top}"));
                     self.request_edit(EditAction::Commit(top));
                     Ok(BOOL(1))
@@ -509,6 +681,7 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                     cands.clear();
                     *matched_len = 0;
                     *cursor = 0;
+                    candwin::hide();
                     log_line(&format!("commit-raw {raw}"));
                     self.request_edit(EditAction::Commit(raw));
                     Ok(BOOL(1))
@@ -516,18 +689,22 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                     Ok(BOOL(0))
                 }
             }
-            // 数字键：选第 N 个候选
+            // 数字键：选当前页第 N 个候选
             VK_0..=VK_9 => {
                 if buffer.is_empty() {
                     return Ok(BOOL(0));
                 }
                 let idx = (vk - VK_0) as usize;
                 if idx >= 1 {
-                    if let Some(pick) = cands.get(idx - 1).cloned() {
+                    // 页内序号 → 全局下标
+                    *sel = idx - 1;
+                    let global = *page * page_size(*expanded) + (idx - 1);
+                    if let Some(pick) = cands.get(global).cloned() {
                         buffer.clear();
                         cands.clear();
                         *matched_len = 0;
                         *cursor = 0;
+                        candwin::hide();
                         log_line(&format!("commit {pick}"));
                         self.request_edit(EditAction::Commit(pick));
                         return Ok(BOOL(1));
@@ -542,6 +719,7 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                 cands.clear();
                 *matched_len = 0;
                 *cursor = 0;
+                candwin::hide();
                 if had {
                     self.request_edit(EditAction::Cancel);
                 }
@@ -595,14 +773,21 @@ fn should_claim(vk: u32, composing: bool) -> bool {
     const VK_RETURN: u32 = 0x0D;
     const VK_ESCAPE: u32 = 0x1B;
     const VK_SPACE: u32 = 0x20;
+    const VK_DELETE: u32 = 0x2E;
     const VK_END: u32 = 0x23;
     const VK_HOME: u32 = 0x24;
     const VK_LEFT: u32 = 0x25;
     const VK_RIGHT: u32 = 0x27;
+    const VK_UP: u32 = 0x26;
+    const VK_DOWN: u32 = 0x28;
     const VK_0: u32 = 0x30;
     const VK_9: u32 = 0x39;
     const VK_A: u32 = 0x41;
     const VK_Z: u32 = 0x5A;
+    const VK_OEM_MINUS: u32 = 0xBD;
+    const VK_OEM_PLUS: u32 = 0xBB;
+    const VK_OEM_COMMA: u32 = 0xBC;
+    const VK_OEM_PERIOD: u32 = 0xBE;
 
     // 快捷键永远放行
     if ctrl_alt_win_held() {
@@ -610,12 +795,13 @@ fn should_claim(vk: u32, composing: bool) -> bool {
     }
 
     if composing {
-        // 正在拼写：字母/数字/候选操作键 + 组合串内移动光标的键
+        // 正在拼写：字母/数字/候选操作键 + 组合串内移动光标的键 + 翻页键
         return matches!(
             vk,
             VK_A..=VK_Z
                 | VK_0..=VK_9
                 | VK_BACK
+                | VK_DELETE
                 | VK_SPACE
                 | VK_RETURN
                 | VK_ESCAPE
@@ -623,6 +809,12 @@ fn should_claim(vk: u32, composing: bool) -> bool {
                 | VK_RIGHT
                 | VK_HOME
                 | VK_END
+                | VK_UP
+                | VK_DOWN
+                | VK_OEM_MINUS
+                | VK_OEM_PLUS
+                | VK_OEM_COMMA
+                | VK_OEM_PERIOD
         );
     }
 
@@ -631,6 +823,32 @@ fn should_claim(vk: u32, composing: bool) -> bool {
         return true;
     }
     false
+}
+
+/// 当前每页候选数：收起 5，展开 25。
+fn page_size(expanded: bool) -> usize {
+    if expanded {
+        PAGE_SIZE_EXPANDED
+    } else {
+        PAGE_SIZE_COLLAPSED
+    }
+}
+
+/// 显示候选窗：取光标屏幕坐标，贴在光标下方。
+/// 收起时一行 5 个，展开后 5×5 共 25 个。
+fn show_cand_window(pinyin: &str, cands: &[String], page: usize, expanded: bool, sel: usize) {
+    let size = page_size(expanded);
+    let total_pages = (cands.len() + size - 1) / size;
+    let start = page * size;
+    if start >= cands.len() {
+        candwin::hide();
+        return;
+    }
+    let end = (start + size).min(cands.len());
+    let slice = &cands[start..end];
+    if let Some((x, y)) = ipc::caret_screen_pos() {
+        candwin::show(pinyin, slice, sel, page + 1, total_pages, x + 4, y + 8);
+    }
 }
 
 /// 查候选；整串查不到就逐步缩短，返回 (候选, 命中的前缀长度)。

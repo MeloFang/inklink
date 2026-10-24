@@ -13,6 +13,39 @@ use windows_sys::Win32::Storage::FileSystem::{
 
 pub const PIPE_NAME: &str = r"\\.\pipe\inklink-engine";
 
+/// 取当前光标（插入点）的屏幕坐标：返回 (x, 光标底边 y)。
+/// 用 GetGUIThreadInfo 拿前台线程的光标矩形，再 ClientToScreen。
+pub fn caret_screen_pos() -> Option<(i32, i32)> {
+    use windows_sys::Win32::Graphics::Gdi::ClientToScreen;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetForegroundWindow, GetGUIThreadInfo, GetWindowThreadProcessId, GUITHREADINFO,
+    };
+    // SAFETY: 纯查询，结构体已按 cbSize 初始化
+    unsafe {
+        let fg = GetForegroundWindow();
+        if fg.is_null() {
+            return None;
+        }
+        let tid = GetWindowThreadProcessId(fg, std::ptr::null_mut());
+        if tid == 0 {
+            return None;
+        }
+        let mut info: GUITHREADINFO = std::mem::zeroed();
+        info.cbSize = std::mem::size_of::<GUITHREADINFO>() as u32;
+        if GetGUIThreadInfo(tid, &mut info) == 0 || info.hwndCaret.is_null() {
+            return None;
+        }
+        let mut pt = windows_sys::Win32::Foundation::POINT {
+            x: info.rcCaret.left,
+            y: info.rcCaret.bottom,
+        };
+        if ClientToScreen(info.hwndCaret, &mut pt) == 0 {
+            return None;
+        }
+        Some((pt.x, pt.y))
+    }
+}
+
 /// 引擎进程是否在跑（管道是否有可用实例）。
 pub fn engine_alive() -> bool {
     use windows_sys::Win32::System::Pipes::WaitNamedPipeW;
