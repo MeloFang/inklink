@@ -8,6 +8,7 @@
 //! 当前阶段：T4 —— 组合串显示（拼音直接显示在文档光标处）。
 
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use windows::Win32::Foundation::{
     CLASS_E_NOAGGREGATION, E_NOINTERFACE, HINSTANCE, LPARAM, S_FALSE, S_OK, WPARAM,
@@ -111,6 +112,8 @@ struct TextServiceInner {
     cursor: Mutex<usize>,
     /// 待编辑会话执行的动作
     pending: Mutex<Option<EditAction>>,
+    /// 是否由我们主动结束组合（提交/取消），用于区分外部终止
+    self_terminating: AtomicBool,
 }
 
 #[implement(ITfTextInputProcessorEx, ITfKeyEventSink, ITfEditSession, ITfCompositionSink)]
@@ -136,6 +139,7 @@ impl TextService {
                 composition: Mutex::new(None),
                 cursor: Mutex::new(0),
                 pending: Mutex::new(None),
+                self_terminating: AtomicBool::new(false),
             },
         }
     }
@@ -248,32 +252,31 @@ impl TextService_Impl {
 
     /// 把文档选区移到组合串内部的第 `cursor` 个字符处，让光标"看得见"。
     ///
-    /// 做法：拿当前选区 range 当临时范围，起点对齐组合串起点，再右移 cursor 个字符。
-    /// （windows-rs 没有 `ITfRange::Clone`，只能借当前选区这个现成 range 来用。）
+    /// 注意：**必须传入已经取出的 context**，不能在这里加锁——
+    /// 锁一旦跨越 TSF 调用，就可能和同步回调（OnCompositionTerminated）互相等待。
     fn place_caret(
         &self,
+        ctx: &ITfContext,
         ec: u32,
         comp_range: &windows::Win32::UI::TextServices::ITfRange,
         cursor: usize,
     ) -> windows::core::Result<()> {
         let mut scratch = [TF_SELECTION::default()];
         let mut fetched = 0u32;
-        if let Some(ctx) = self.inner.context.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
-            // SAFETY: 标准 TSF range 操作，全部在同一个编辑会话内
-            unsafe {
-                ctx.GetSelection(ec, TF_DEFAULT_SELECTION, &mut scratch, &mut fetched)?;
-                if let Some(s) = scratch[0].range.as_ref() {
-                    s.ShiftStartToRange(ec, comp_range, TF_ANCHOR_START)?;
-                    s.Collapse(ec, TF_ANCHOR_START)?;
-                    let mut shifted = 0i32;
-                    s.ShiftEnd(ec, cursor as i32, &mut shifted, std::ptr::null())?;
-                    s.Collapse(ec, TF_ANCHOR_END)?;
-                    let caret = [TF_SELECTION {
-                        range: std::mem::ManuallyDrop::new(Some(s.clone())),
-                        style: Default::default(),
-                    }];
-                    ctx.SetSelection(ec, &caret)?;
-                }
+        // SAFETY: 标准 TSF range 操作，全部在同一个编辑会话内
+        unsafe {
+            ctx.GetSelection(ec, TF_DEFAULT_SELECTION, &mut scratch, &mut fetched)?;
+            if let Some(s) = scratch[0].range.as_ref() {
+                s.ShiftStartToRange(ec, comp_range, TF_ANCHOR_START)?;
+                s.Collapse(ec, TF_ANCHOR_START)?;
+                let mut shifted = 0i32;
+                s.ShiftEnd(ec, cursor as i32, &mut shifted, std::ptr::null())?;
+                s.Collapse(ec, TF_ANCHOR_END)?;
+                let caret = [TF_SELECTION {
+                    range: std::mem::ManuallyDrop::new(Some(s.clone())),
+                    style: Default::default(),
+                }];
+                ctx.SetSelection(ec, &caret)?;
             }
         }
         Ok(())
@@ -282,78 +285,117 @@ impl TextService_Impl {
 
 impl ITfEditSession_Impl for TextService_Impl {
     fn DoEditSession(&self, ec: u32) -> windows::core::Result<()> {
-        // 取出待执行的动作
-        let action = self.inner.pending.lock().unwrap_or_else(|p| p.into_inner()).take();
+        let action = self
+            .inner
+            .pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
+        let Some(action) = action else {
+            return Ok(());
+        };
 
-        // 取出当前组合
-        let mut comp = self.inner.composition.lock().unwrap_or_else(|p| p.into_inner());
+        // 取出副本后**立刻释放锁**：下面的 TSF 调用可能同步回调我们，
+        // 持锁调用 = 死锁（鼠标点到别处导致组合终止时就必现）。
+        let comp = self
+            .inner
+            .composition
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        let ctx = self
+            .inner
+            .context
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        let Some(ctx) = ctx else {
+            return Ok(());
+        };
 
         match action {
-            None => Ok(()),
-            Some(EditAction::Compose(text, cursor)) => {
+            EditAction::Compose(text, cursor) => {
                 let utf16: Vec<u16> = text.encode_utf16().collect();
-                // 没有组合就新建一个；有就更新
-                if comp.is_none() {
-                    if let Some(ctx) = self.inner.context.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
-                        // 取光标位置的 range
+                // 没有组合就新建一个
+                let comp = match comp {
+                    Some(c) => Some(c),
+                    None => {
                         let mut sel = [TF_SELECTION::default()];
                         let mut fetched = 0u32;
+                        // SAFETY: 标准 TSF 调用
                         unsafe {
                             ctx.GetSelection(ec, TF_DEFAULT_SELECTION, &mut sel, &mut fetched)?;
                         }
-                        let range = &sel[0].range;
-                        if let Some(range) = range.as_ref() {
-                            let sink: ITfCompositionSink = self.to_interface();
-                            // StartComposition 在 ITfContextComposition 上，先从 ITfContext cast 过去
-                            let ctx_comp: ITfContextComposition = ctx.cast()?;
-                            let c = unsafe { ctx_comp.StartComposition(ec, range, &sink)? };
-                            *comp = Some(c);
+                        match sel[0].range.as_ref() {
+                            Some(range) => {
+                                let sink: ITfCompositionSink = self.to_interface();
+                                let ctx_comp: ITfContextComposition = ctx.cast()?;
+                                // SAFETY: 标准 TSF 调用
+                                Some(unsafe { ctx_comp.StartComposition(ec, range, &sink)? })
+                            }
+                            None => None,
                         }
                     }
-                }
-                if let Some(c) = comp.as_ref() {
+                };
+                if let Some(c) = comp {
                     let range = unsafe { c.GetRange()? };
                     unsafe { range.SetText(ec, 0, &utf16)? };
-                    self.place_caret(ec, &range, cursor)?;
+                    self.place_caret(&ctx, ec, &range, cursor)?;
+                    // 写回（短锁，不跨越 TSF 调用）
+                    *self
+                        .inner
+                        .composition
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner()) = Some(c);
                 }
                 Ok(())
             }
-            Some(EditAction::MoveCaret(cursor)) => {
-                // 只移动光标，不改文字（方向键用）
-                if let Some(c) = comp.as_ref() {
+            EditAction::MoveCaret(cursor) => {
+                if let Some(c) = comp {
                     let range = unsafe { c.GetRange()? };
-                    self.place_caret(ec, &range, cursor)?;
+                    self.place_caret(&ctx, ec, &range, cursor)?;
                 }
                 Ok(())
             }
-            Some(EditAction::Commit(text)) => {
+            EditAction::Commit(text) => {
                 let utf16: Vec<u16> = text.encode_utf16().collect();
-                if let Some(c) = comp.as_ref() {
+                if let Some(c) = comp {
                     let range = unsafe { c.GetRange()? };
                     unsafe { range.SetText(ec, 0, &utf16)? };
-                    unsafe { c.EndComposition(ec)? };
+                    self.inner.self_terminating.store(true, Ordering::SeqCst);
+                    let end_res = unsafe { c.EndComposition(ec) };
+                    self.inner.self_terminating.store(false, Ordering::SeqCst);
+                    end_res?;
                     // 结束组合只是"定格"文字，光标仍停在文本开头。
-                    // 把 range 折叠到末尾、设为选区，光标才会落到文字之后。
                     unsafe { range.Collapse(ec, TF_ANCHOR_END)? };
                     let sel = [TF_SELECTION {
                         range: std::mem::ManuallyDrop::new(Some(range)),
                         style: Default::default(),
                     }];
-                    if let Some(ctx) = self.inner.context.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
-                        unsafe { ctx.SetSelection(ec, &sel)? };
-                    }
+                    unsafe { ctx.SetSelection(ec, &sel)? };
                 }
-                *comp = None;
+                *self
+                    .inner
+                    .composition
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner()) = None;
                 Ok(())
             }
-            Some(EditAction::Cancel) => {
-                if let Some(c) = comp.as_ref() {
+            EditAction::Cancel => {
+                if let Some(c) = comp {
                     let range = unsafe { c.GetRange()? };
                     // 先清空文本再结束组合，否则拼音会被当成普通文字留在文档里
                     unsafe { range.SetText(ec, 0, &[])? };
-                    unsafe { c.EndComposition(ec)? };
+                    self.inner.self_terminating.store(true, Ordering::SeqCst);
+                    let end_res = unsafe { c.EndComposition(ec) };
+                    self.inner.self_terminating.store(false, Ordering::SeqCst);
+                    end_res?;
                 }
-                *comp = None;
+                *self
+                    .inner
+                    .composition
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner()) = None;
                 Ok(())
             }
         }
@@ -361,14 +403,70 @@ impl ITfEditSession_Impl for TextService_Impl {
 }
 
 impl ITfCompositionSink_Impl for TextService_Impl {
-    fn OnCompositionTerminated(&self, _ecwrite: u32, _pcomposition: Ref<ITfComposition>) -> windows::core::Result<()> {
-        *self.inner.composition.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    fn OnCompositionTerminated(
+        &self,
+        ecwrite: u32,
+        pcomposition: Ref<ITfComposition>,
+    ) -> windows::core::Result<()> {
+        // 外部终止（鼠标点到别处 / 切窗口）：把残留的拼音文本清掉，等于"关掉这次输入"。
+        // 我们自己 EndComposition（提交/取消）时不能清——那会把上屏的中文一起擦掉。
+        if !self.inner.self_terminating.load(Ordering::SeqCst) {
+            if let Some(c) = pcomposition.as_ref() {
+                // SAFETY: 当前处于写会话，允许改文本
+                unsafe {
+                    if let Ok(range) = c.GetRange() {
+                        let _ = range.SetText(ecwrite, 0, &[]);
+                    }
+                }
+            }
+            self.inner
+                .buffer
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clear();
+            self.inner
+                .cands
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clear();
+            *self.inner.matched_len.lock().unwrap_or_else(|p| p.into_inner()) = 0;
+            *self.inner.cursor.lock().unwrap_or_else(|p| p.into_inner()) = 0;
+            *self.inner.sel.lock().unwrap_or_else(|p| p.into_inner()) = 0;
+            *self.inner.page.lock().unwrap_or_else(|p| p.into_inner()) = 0;
+            *self.inner.expanded.lock().unwrap_or_else(|p| p.into_inner()) = false;
+            candwin::hide();
+        }
+        *self
+            .inner
+            .composition
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = None;
         Ok(())
     }
 }
 
 impl ITfKeyEventSink_Impl for TextService_Impl {
-    fn OnSetFocus(&self, _fforeground: BOOL) -> windows::core::Result<()> {
+    fn OnSetFocus(&self, fforeground: BOOL) -> windows::core::Result<()> {
+        if !fforeground.as_bool() {
+            // 失焦（切窗口 / 鼠标点到别处）：清掉组合状态，隐藏候选窗。
+            // 组合本身由 TSF 结束，会走 OnCompositionTerminated。
+            self.inner
+                .buffer
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clear();
+            self.inner
+                .cands
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clear();
+            *self.inner.matched_len.lock().unwrap_or_else(|p| p.into_inner()) = 0;
+            *self.inner.cursor.lock().unwrap_or_else(|p| p.into_inner()) = 0;
+            *self.inner.sel.lock().unwrap_or_else(|p| p.into_inner()) = 0;
+            *self.inner.page.lock().unwrap_or_else(|p| p.into_inner()) = 0;
+            *self.inner.expanded.lock().unwrap_or_else(|p| p.into_inner()) = false;
+            candwin::hide();
+        }
         Ok(())
     }
 
@@ -395,6 +493,8 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
         const VK_RETURN: u32 = 0x0D;
         const VK_ESCAPE: u32 = 0x1B;
         const VK_SPACE: u32 = 0x20;
+        const VK_SHIFT: u32 = 0x10;
+        const VK_CAPITAL: u32 = 0x14;
         const VK_DELETE: u32 = 0x2E;
         const VK_0: u32 = 0x30;
         const VK_9: u32 = 0x39;
@@ -683,6 +783,26 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                     *cursor = 0;
                     candwin::hide();
                     log_line(&format!("commit-raw {raw}"));
+                    self.request_edit(EditAction::Commit(raw));
+                    Ok(BOOL(1))
+                } else {
+                    Ok(BOOL(0))
+                }
+            }
+            // Shift / CapsLock：拼音还在组合时按下，直接把拼音当英文上屏（对齐搜狗）。
+            // 空闲时放行（交给应用，或用于打英文大写）。
+            VK_SHIFT | VK_CAPITAL => {
+                if !buffer.is_empty() {
+                    let raw = buffer.clone();
+                    buffer.clear();
+                    cands.clear();
+                    *matched_len = 0;
+                    *cursor = 0;
+                    *sel = 0;
+                    *page = 0;
+                    *expanded = false;
+                    candwin::hide();
+                    log_line(&format!("commit-raw(shift) {raw}"));
                     self.request_edit(EditAction::Commit(raw));
                     Ok(BOOL(1))
                 } else {

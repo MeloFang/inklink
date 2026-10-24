@@ -19,9 +19,10 @@ use std::sync::Mutex;
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, SIZE, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
-    BeginPaint, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint, FillRect, GetDC,
-    GetStockObject, GetTextExtentPoint32W, InvalidateRect, ReleaseDC, SelectObject, SetBkMode,
-    SetTextColor, DEFAULT_GUI_FONT, DT_LEFT, DT_SINGLELINE, DT_VCENTER, PAINTSTRUCT, TRANSPARENT,
+    BeginPaint, CreatePen, CreateRoundRectRgn, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint,
+    FillRect, GetDC, GetStockObject, GetTextExtentPoint32W, InvalidateRect, ReleaseDC, RoundRect,
+    CreateFontW, SelectObject, SetBkMode, SetTextColor, SetWindowRgn, DT_LEFT, DT_SINGLELINE,
+    DT_VCENTER, PAINTSTRUCT, PS_SOLID, TRANSPARENT,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, GetClientRect, RegisterClassW, SetWindowPos, ShowWindow,
@@ -37,25 +38,30 @@ static PINYIN: Mutex<String> = Mutex::new(String::new());
 static SELECTED: AtomicUsize = AtomicUsize::new(0);
 static PAGE: AtomicUsize = AtomicUsize::new(1);
 static TOTAL_PAGES: AtomicUsize = AtomicUsize::new(1);
+static FONT_CAND: AtomicIsize = AtomicIsize::new(0);
+static FONT_PINYIN: AtomicIsize = AtomicIsize::new(0);
 
 const CLASS_NAME: &str = "inklink-candidate";
 
 /// 网格列数
 const COLS: usize = 5;
 /// 内边距
-const PAD: i32 = 12;
+const PAD: i32 = 14;
 /// 拼音行高
-const PINYIN_H: i32 = 26;
+const PINYIN_H: i32 = 24;
 /// 候选行高
-const ROW_H: i32 = 30;
+const ROW_H: i32 = 34;
 /// 单元格最小宽度
-const MIN_CELL_W: i32 = 90;
+const MIN_CELL_W: i32 = 96;
 
-const BG_COLOR: u32 = 0x0022_1F1E; // #1e1f22 (COLORREF 是 BGR)
-const PINYIN_COLOR: u32 = 0x00F6_823B; // #3b82f6
-const TEXT_COLOR: u32 = 0x00F4_EFEC; // #eceff4
-const NUM_COLOR: u32 = 0x0091_8880; // #808891
-const SEL_BG: u32 = 0x00F6_823B; // 选中项背景
+// 浅色主题（对齐主流输入法）
+const BG_COLOR: u32 = 0x00FF_FFFF; // #ffffff 白底
+const PINYIN_COLOR: u32 = 0x0099_9999; // 灰
+const TEXT_COLOR: u32 = 0x0022_2222; // #222222 深灰
+const NUM_COLOR: u32 = 0x00AA_AAAA; // 浅灰序号
+const SEL_COLOR: u32 = 0x0000_66FF; // #ff6600 橙色高亮（BGR）
+const BORDER_COLOR: u32 = 0x00E0_E0E0; // 浅灰边框
+const CORNER_RADIUS: i32 = 8; // 圆角半径
 
 /// 显示候选窗。`x, y` 是屏幕坐标（左上角）。
 pub fn show(
@@ -89,6 +95,9 @@ pub fn show(
             h,
             SWP_NOZORDER | SWP_NOACTIVATE,
         );
+        // 圆角：用区域把窗口裁成圆角矩形
+        let region = CreateRoundRectRgn(0, 0, w + 1, h + 1, CORNER_RADIUS, CORNER_RADIUS);
+        SetWindowRgn(hwnd as HWND, region, 1);
         ShowWindow(hwnd as HWND, SW_SHOWNOACTIVATE);
         InvalidateRect(hwnd as HWND, std::ptr::null(), 1);
     }
@@ -119,7 +128,7 @@ fn cell_width(candidates: &[String]) -> i32 {
         if hdc.is_null() {
             return MIN_CELL_W;
         }
-        let font = GetStockObject(DEFAULT_GUI_FONT as i32);
+        let font = get_font(&FONT_CAND, 17);
         let old = SelectObject(hdc, font);
         let mut max_w = MIN_CELL_W;
         for c in candidates {
@@ -177,13 +186,14 @@ unsafe fn draw_text(
     y: i32,
     text: &str,
     color: u32,
+    height: i32,
 ) {
     let wide: Vec<u16> = text.encode_utf16().collect();
     let mut rc = RECT {
         left: x,
         top: y,
         right: x + 600,
-        bottom: y + ROW_H,
+        bottom: y + height,
     };
     SetTextColor(hdc, color);
     DrawTextW(
@@ -210,15 +220,43 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             FillRect(hdc, &rc, bg);
             DeleteObject(bg as *mut core::ffi::c_void);
 
-            let font = GetStockObject(DEFAULT_GUI_FONT as i32);
-            let old = SelectObject(hdc, font);
+            // 圆角边框
+            let pen = CreatePen(PS_SOLID, 1, BORDER_COLOR);
+            let old_pen = SelectObject(hdc, pen);
+            let null_brush = SelectObject(hdc, GetStockObject(5 /* NULL_BRUSH */));
+            RoundRect(
+                hdc,
+                0,
+                0,
+                rc.right,
+                rc.bottom,
+                CORNER_RADIUS * 2,
+                CORNER_RADIUS * 2,
+            );
+            SelectObject(hdc, null_brush);
+            SelectObject(hdc, old_pen);
+            DeleteObject(pen as *mut core::ffi::c_void);
+
+            let cand_font = get_font(&FONT_CAND, 17);
+            let pinyin_font = get_font(&FONT_PINYIN, 14);
             SetBkMode(hdc, TRANSPARENT as i32);
 
-            // 拼音行
+            // 拼音行（小号灰字）
+            let old = SelectObject(hdc, pinyin_font);
             let pinyin = PINYIN.lock().unwrap().clone();
-            draw_text(hdc, PAD, PAD, &pinyin, PINYIN_COLOR);
+            draw_text(hdc, PAD, PAD + 2, &pinyin, PINYIN_COLOR, PINYIN_H);
 
-            // 候选网格
+            // 翻页指示（右上角，小灰字）
+            let page = PAGE.load(Ordering::SeqCst);
+            let total = TOTAL_PAGES.load(Ordering::SeqCst);
+            if total > 1 {
+                let indicator = format!("{page}/{total}");
+                let iw = text_width(hdc, &indicator);
+                draw_text(hdc, rc.right - PAD - iw, PAD + 2, &indicator, NUM_COLOR, PINYIN_H);
+            }
+
+            // 候选网格（大号深色字，选中橙色）
+            SelectObject(hdc, cand_font);
             let cands = CANDIDATES.lock().unwrap().clone();
             let cell_w = cell_width(&cands);
             let sel = SELECTED.load(Ordering::SeqCst);
@@ -227,30 +265,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 let row = (i / COLS) as i32;
                 let x = PAD + col * cell_w;
                 let y = PAD + PINYIN_H + row * ROW_H;
-                // 选中项高亮
-                if i == sel {
-                    let mut sel_rect = RECT {
-                        left: x,
-                        top: y + 2,
-                        right: x + cell_w - 4,
-                        bottom: y + ROW_H - 2,
-                    };
-                    let brush = CreateSolidBrush(SEL_BG);
-                    FillRect(hdc, &mut sel_rect, brush);
-                    DeleteObject(brush as *mut core::ffi::c_void);
-                }
-                let num_color = if i == sel { 0x00FF_FFFF } else { NUM_COLOR };
-                let txt_color = if i == sel { 0x00FF_FFFF } else { TEXT_COLOR };
-                draw_text(hdc, x + 6, y, &format!("{}.", i + 1), num_color);
-                draw_text(hdc, x + 22, y, c, txt_color);
-            }
-
-            // 翻页指示
-            let page = PAGE.load(Ordering::SeqCst);
-            let total = TOTAL_PAGES.load(Ordering::SeqCst);
-            if total > 1 {
-                let indicator = format!("{page}/{total}");
-                draw_text(hdc, rc.right - 56, rc.bottom - ROW_H - 2, &indicator, NUM_COLOR);
+                let color = if i == sel { SEL_COLOR } else { NUM_COLOR };
+                draw_text(hdc, x, y, &format!("{}.", i + 1), color, ROW_H);
+                let txt_color = if i == sel { SEL_COLOR } else { TEXT_COLOR };
+                draw_text(hdc, x + 22, y, c, txt_color, ROW_H);
             }
 
             SelectObject(hdc, old);
@@ -259,4 +277,45 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
     }
+}
+
+/// 测量一段文字的宽度。
+unsafe fn text_width(hdc: windows_sys::Win32::Graphics::Gdi::HDC, text: &str) -> i32 {
+    let wide: Vec<u16> = text.encode_utf16().collect();
+    let mut size = SIZE { cx: 0, cy: 0 };
+    GetTextExtentPoint32W(hdc, wide.as_ptr(), wide.len() as i32, &mut size);
+    size.cx
+}
+
+/// 懒创建字体并缓存。
+unsafe fn get_font(
+    slot: &AtomicIsize,
+    size: i32,
+) -> windows_sys::Win32::Graphics::Gdi::HFONT {
+    let existing = slot.load(Ordering::SeqCst);
+    if existing != 0 {
+        return existing as _;
+    }
+    let face: Vec<u16> = "Microsoft YaHei UI"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let f = CreateFontW(
+        -size,
+        0,
+        0,
+        0,
+        400,
+        0,
+        0,
+        0,
+        1, // DEFAULT_CHARSET
+        0,
+        0,
+        5, // CLEARTYPE_QUALITY
+        0,
+        face.as_ptr(),
+    );
+    slot.store(f as isize, Ordering::SeqCst);
+    f
 }
