@@ -11,15 +11,16 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use windows::Win32::Foundation::{
-    CLASS_E_NOAGGREGATION, E_NOINTERFACE, HINSTANCE, LPARAM, S_FALSE, S_OK, WPARAM,
+    CLASS_E_NOAGGREGATION, E_NOINTERFACE, HINSTANCE, LPARAM, RECT, S_FALSE, S_OK, WPARAM,
 };
 use windows::core::BOOL;
 use windows::Win32::System::Com::{IClassFactory, IClassFactory_Impl};
 use windows::Win32::UI::TextServices::{
     ITfComposition, ITfCompositionSink, ITfCompositionSink_Impl, ITfContext, ITfContextComposition,
     ITfEditSession, ITfEditSession_Impl, ITfKeyEventSink, ITfKeyEventSink_Impl, ITfKeystrokeMgr,
-    ITfTextInputProcessorEx, ITfTextInputProcessorEx_Impl, ITfTextInputProcessor_Impl, ITfThreadMgr,
-    TF_ANCHOR_END, TF_ANCHOR_START, TF_DEFAULT_SELECTION, TF_ES_ASYNC, TF_ES_READWRITE, TF_SELECTION,
+    ITfRange, ITfTextInputProcessorEx, ITfTextInputProcessorEx_Impl, ITfTextInputProcessor_Impl,
+    ITfThreadMgr, TF_ANCHOR_END, TF_ANCHOR_START, TF_DEFAULT_SELECTION, TF_ES_ASYNC,
+    TF_ES_READWRITE, TF_SELECTION,
 };
 mod ipc;
 mod candwin;
@@ -114,6 +115,8 @@ struct TextServiceInner {
     pending: Mutex<Option<EditAction>>,
     /// 是否由我们主动结束组合（提交/取消），用于区分外部终止
     self_terminating: AtomicBool,
+    /// 最近一次 GetTextExt 拿到的组合串屏幕位置
+    last_pos: Mutex<Option<(i32, i32)>>,
 }
 
 #[implement(ITfTextInputProcessorEx, ITfKeyEventSink, ITfEditSession, ITfCompositionSink)]
@@ -140,6 +143,7 @@ impl TextService {
                 cursor: Mutex::new(0),
                 pending: Mutex::new(None),
                 self_terminating: AtomicBool::new(false),
+                last_pos: Mutex::new(None),
             },
         }
     }
@@ -250,6 +254,24 @@ impl TextService_Impl {
         }
     }
 
+    /// 按当前状态重画候选窗（位置取 last_pos）。
+    ///
+    /// 每次 lock 都是临时 guard，语句结束即释放——不会跨 TSF 调用持锁。
+    fn refresh_cand_window(&self) {
+        let pinyin = self
+            .inner
+            .buffer
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        let cands = self.inner.cands.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        let page = *self.inner.page.lock().unwrap_or_else(|p| p.into_inner());
+        let expanded = *self.inner.expanded.lock().unwrap_or_else(|p| p.into_inner());
+        let sel = *self.inner.sel.lock().unwrap_or_else(|p| p.into_inner());
+        let pos = *self.inner.last_pos.lock().unwrap_or_else(|p| p.into_inner());
+        show_cand_window(&pinyin, &cands, page, expanded, sel, pos);
+    }
+
     /// 把文档选区移到组合串内部的第 `cursor` 个字符处，让光标"看得见"。
     ///
     /// 注意：**必须传入已经取出的 context**，不能在这里加锁——
@@ -341,6 +363,10 @@ impl ITfEditSession_Impl for TextService_Impl {
                     let range = unsafe { c.GetRange()? };
                     unsafe { range.SetText(ec, 0, &utf16)? };
                     self.place_caret(&ctx, ec, &range, cursor)?;
+                    // 用 TSF 的 GetTextExt 问应用"我这段在屏幕哪"（和搜狗同款）
+                    let pos = text_ext_pos(&ctx, ec, &range);
+                    *self.inner.last_pos.lock().unwrap_or_else(|p| p.into_inner()) = pos;
+                    self.refresh_cand_window();
                     // 写回（短锁，不跨越 TSF 调用）
                     *self
                         .inner
@@ -555,7 +581,7 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                     cands.first()
                 ));
                 // 显示候选窗
-                show_cand_window(&buffer, &cands, *page, *expanded, *sel);
+                show_cand_window(&buffer, &cands, *page, *expanded, *sel, *self.inner.last_pos.lock().unwrap_or_else(|p| p.into_inner()));
                 // 把拼音写到文档里（组合串）
                 self.request_edit(EditAction::Compose(buffer.clone(), *cursor));
                 Ok(BOOL(1))
@@ -574,7 +600,7 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                         candwin::hide();
                         self.request_edit(EditAction::Cancel);
                     } else {
-                        show_cand_window(&buffer, &cands, *page, *expanded, *sel);
+                        show_cand_window(&buffer, &cands, *page, *expanded, *sel, *self.inner.last_pos.lock().unwrap_or_else(|p| p.into_inner()));
                         self.request_edit(EditAction::Compose(buffer.clone(), *cursor));
                     }
                     Ok(BOOL(1))
@@ -595,7 +621,7 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                         candwin::hide();
                         self.request_edit(EditAction::Cancel);
                     } else {
-                        show_cand_window(&buffer, &cands, *page, *expanded, *sel);
+                        show_cand_window(&buffer, &cands, *page, *expanded, *sel, *self.inner.last_pos.lock().unwrap_or_else(|p| p.into_inner()));
                         self.request_edit(EditAction::Compose(buffer.clone(), *cursor));
                     }
                     Ok(BOOL(1))
@@ -616,7 +642,7 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                             let page_len = cands.len().saturating_sub(page_start).min(size);
                             *sel = page_len.saturating_sub(1);
                         }
-                        show_cand_window(&buffer, &cands, *page, *expanded, *sel);
+                        show_cand_window(&buffer, &cands, *page, *expanded, *sel, *self.inner.last_pos.lock().unwrap_or_else(|p| p.into_inner()));
                     } else if *cursor > 0 {
                         *cursor -= 1;
                         self.request_edit(EditAction::MoveCaret(*cursor));
@@ -640,7 +666,7 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                             *page += 1;
                             *sel = 0;
                         }
-                        show_cand_window(&buffer, &cands, *page, *expanded, *sel);
+                        show_cand_window(&buffer, &cands, *page, *expanded, *sel, *self.inner.last_pos.lock().unwrap_or_else(|p| p.into_inner()));
                     } else {
                         let len = buffer.len();
                         if *cursor < len {
@@ -685,7 +711,7 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                             let page_len = cands.len().saturating_sub(page_start).min(size);
                             *sel = page_len.saturating_sub(1);
                         }
-                        show_cand_window(&buffer, &cands, *page, *expanded, *sel);
+                        show_cand_window(&buffer, &cands, *page, *expanded, *sel, *self.inner.last_pos.lock().unwrap_or_else(|p| p.into_inner()));
                     }
                     Ok(BOOL(1))
                 } else {
@@ -711,7 +737,7 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                             *sel = 0;
                         }
                     }
-                    show_cand_window(&buffer, &cands, *page, *expanded, *sel);
+                    show_cand_window(&buffer, &cands, *page, *expanded, *sel, *self.inner.last_pos.lock().unwrap_or_else(|p| p.into_inner()));
                     Ok(BOOL(1))
                 } else {
                     Ok(BOOL(0))
@@ -730,7 +756,7 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                         *page -= 1;
                     }
                     *sel = 0;
-                    show_cand_window(&buffer, &cands, *page, *expanded, *sel);
+                    show_cand_window(&buffer, &cands, *page, *expanded, *sel, *self.inner.last_pos.lock().unwrap_or_else(|p| p.into_inner()));
                     Ok(BOOL(1))
                 } else {
                     Ok(BOOL(0))
@@ -750,7 +776,7 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                         }
                     }
                     *sel = 0;
-                    show_cand_window(&buffer, &cands, *page, *expanded, *sel);
+                    show_cand_window(&buffer, &cands, *page, *expanded, *sel, *self.inner.last_pos.lock().unwrap_or_else(|p| p.into_inner()));
                     Ok(BOOL(1))
                 } else {
                     Ok(BOOL(0))
@@ -954,9 +980,17 @@ fn page_size(expanded: bool) -> usize {
     }
 }
 
-/// 显示候选窗：取光标屏幕坐标，贴在光标下方。
-/// 收起时一行 5 个，展开后 5×5 共 25 个。
-fn show_cand_window(pinyin: &str, cands: &[String], page: usize, expanded: bool, sel: usize) {
+/// 显示候选窗。
+///
+/// 位置优先级：`pos`（TSF GetTextExt 拿到的精确坐标，和搜狗同款）→ 光标/鼠标兜底。
+fn show_cand_window(
+    pinyin: &str,
+    cands: &[String],
+    page: usize,
+    expanded: bool,
+    sel: usize,
+    pos: Option<(i32, i32)>,
+) {
     let size = page_size(expanded);
     let total_pages = (cands.len() + size - 1) / size;
     let start = page * size;
@@ -966,8 +1000,27 @@ fn show_cand_window(pinyin: &str, cands: &[String], page: usize, expanded: bool,
     }
     let end = (start + size).min(cands.len());
     let slice = &cands[start..end];
-    if let Some((x, y)) = ipc::caret_screen_pos() {
-        candwin::show(pinyin, slice, sel, page + 1, total_pages, x + 4, y + 8);
+    let (x, y) = pos
+        .or_else(ipc::caret_screen_pos)
+        .unwrap_or((200, 200));
+    candwin::show(pinyin, slice, sel, page + 1, total_pages, x + 4, y + 8);
+}
+
+/// 用 TSF 的 `ITfContextView::GetTextExt` 问应用"这段组合串在屏幕的哪个矩形里"。
+///
+/// 这是主流输入法的做法：坐标由应用自己算，所以 VSCode / WPS / 浏览器都精准。
+/// 失败返回 `None`（老式应用或应用没实现时），调用方再退到光标/鼠标兜底。
+fn text_ext_pos(ctx: &ITfContext, ec: u32, range: &ITfRange) -> Option<(i32, i32)> {
+    // SAFETY: 标准 TSF 查询，处于编辑会话内
+    unsafe {
+        let view = ctx.GetActiveView().ok()?;
+        let mut rect: RECT = std::mem::zeroed();
+        let mut clipped = BOOL(0);
+        view.GetTextExt(ec, range, &mut rect, &mut clipped).ok()?;
+        if rect.left == 0 && rect.top == 0 && rect.right == 0 && rect.bottom == 0 {
+            return None;
+        }
+        Some((rect.left, rect.bottom))
     }
 }
 
