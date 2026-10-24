@@ -125,3 +125,43 @@ cargo build --release --offline                       # 引擎
 | 2026-10-22 | T2：按键流打通（关键：OnTestKeyDown 返回 TRUE 才触发 OnKeyDown） |
 | 2026-10-22 | T3：能打中文（引擎管道 + 候选 + SendInput 上屏 + 错误恢复） |
 | 2026-10-22 | 大量踩坑记录见 `docs/tsf-plan.md` T1/T2/T3a 实测记录 |
+
+---
+
+## 七、T4 完成后的现状（2026-10-23 更新）
+
+### 已实现
+
+| 能力 | 说明 |
+|:---|:---|
+| 组合串显示 | 拼音通过 `ITfComposition` 显示在文档光标处 |
+| 组合串内编辑 | 内部光标 + ←→ 移动 + 插入/退格/Delete 在光标处 |
+| 候选窗 | 拼音行 + 5 列网格；收起 1×5，展开 5×5（25 个） |
+| 候选导航 | 展开后 ↑↓ 换行、←→ 换列、到边界翻页；空格上屏高亮项；1-9 直选 |
+| 引擎自愈 | 命名互斥单例 + DLL 激活时自动拉起（`CreateProcessW`） |
+| 引擎日志 | `C:\inklink-engine\engine.log`，含 panic 钩子 |
+
+### 已知未做：拼音下划线
+
+拼音现在显示为**普通文字**（没有虚线），所以看起来"不像输入法"。要做成主流样式需要新增：
+
+1. `ITfDisplayAttributeInfo`（5 个方法）—— 描述"下划线 + 前景色"样式
+2. `ITfDisplayAttributeProvider`（2 个方法）—— 按 GUID 返回上面的 info
+3. `IEnumTfDisplayAttributeInfo`（4 个方法，含 Clone）—— 枚举支持
+4. **新的 CLSID** 给 provider，并在 `DllGetClassObject` 里分发；注册时加
+   `RegisterCategory(provider_clsid, GUID_TFCAT_DISPLAYATTRIBUTEPROVIDER, provider_clsid)`
+   和 `RegisterGUID(我们的属性 GUID)` 拿到 atom
+5. 在 Compose 编辑会话里对 range 设属性：
+   `context.GetProperty(&GUID_PROP_ATTRIBUTE)` → `ITfProperty::SetValue(ec, range, VARIANT(atom))`
+
+**坑**：`ITfProperty::SetValue` 在 windows-rs 里要有 `Win32_System_Ole` + `Win32_System_Variant`
+特性才会出现（vtable 字段被 cfg 掉了）；`ITfRange::Clone` 和 `ITfRange::GetRect` 则完全缺失。
+
+估计 300–350 行，且要改进注册流程（新增 provider CLSID 属于**加性**改动，不动现有 TIP 注册）。
+
+### 其他待办
+
+- 候选窗美化（圆角/间距/配色）
+- 引擎崩溃原因排查（日志已就位）
+- 各应用兼容（WPS / 浏览器 / VSCode）
+- M1 使用反馈排序、M2 个人词库、M3 AI
