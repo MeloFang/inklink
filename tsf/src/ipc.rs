@@ -14,36 +14,79 @@ use windows_sys::Win32::Storage::FileSystem::{
 pub const PIPE_NAME: &str = r"\\.\pipe\inklink-engine";
 
 /// 取当前光标（插入点）的屏幕坐标：返回 (x, 光标底边 y)。
-/// 用 GetGUIThreadInfo 拿前台线程的光标矩形，再 ClientToScreen。
+///
+/// 三级回退（现代应用如 WPS/Electron 常没有标准光标，GetGUIThreadInfo 会失败）：
+///   1. GetGUIThreadInfo 的光标矩形
+///   2. GetCaretPos + ClientToScreen
+///   3. 鼠标位置（用户一般在点击处打字）
 pub fn caret_screen_pos() -> Option<(i32, i32)> {
+    unsafe {
+        if let Some(p) = caret_via_gui_thread() {
+            return Some(p);
+        }
+        if let Some(p) = caret_via_get_caret_pos() {
+            return Some(p);
+        }
+        // 最后兜底：鼠标位置
+        use windows_sys::Win32::UI::WindowsAndMessaging::GetCursorPos;
+        let mut pt = windows_sys::Win32::Foundation::POINT { x: 0, y: 0 };
+        GetCursorPos(&mut pt);
+        Some((pt.x, pt.y))
+    }
+}
+
+/// 方法 1：前台线程的光标矩形。
+unsafe fn caret_via_gui_thread() -> Option<(i32, i32)> {
     use windows_sys::Win32::Graphics::Gdi::ClientToScreen;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         GetForegroundWindow, GetGUIThreadInfo, GetWindowThreadProcessId, GUITHREADINFO,
     };
-    // SAFETY: 纯查询，结构体已按 cbSize 初始化
-    unsafe {
-        let fg = GetForegroundWindow();
-        if fg.is_null() {
-            return None;
-        }
-        let tid = GetWindowThreadProcessId(fg, std::ptr::null_mut());
-        if tid == 0 {
-            return None;
-        }
-        let mut info: GUITHREADINFO = std::mem::zeroed();
-        info.cbSize = std::mem::size_of::<GUITHREADINFO>() as u32;
-        if GetGUIThreadInfo(tid, &mut info) == 0 || info.hwndCaret.is_null() {
-            return None;
-        }
-        let mut pt = windows_sys::Win32::Foundation::POINT {
-            x: info.rcCaret.left,
-            y: info.rcCaret.bottom,
-        };
-        if ClientToScreen(info.hwndCaret, &mut pt) == 0 {
-            return None;
-        }
-        Some((pt.x, pt.y))
+    let fg = GetForegroundWindow();
+    if fg.is_null() {
+        return None;
     }
+    let tid = GetWindowThreadProcessId(fg, std::ptr::null_mut());
+    if tid == 0 {
+        return None;
+    }
+    let mut info: GUITHREADINFO = std::mem::zeroed();
+    info.cbSize = std::mem::size_of::<GUITHREADINFO>() as u32;
+    if GetGUIThreadInfo(tid, &mut info) == 0 || info.hwndCaret.is_null() {
+        return None;
+    }
+    // rcCaret 全零 = 应用没有真正的光标（Electron/WPS 常见），视为无效
+    let rc = info.rcCaret;
+    if rc.left == 0 && rc.top == 0 && rc.right == 0 && rc.bottom == 0 {
+        return None;
+    }
+    let mut pt = windows_sys::Win32::Foundation::POINT {
+        x: rc.left,
+        y: rc.bottom,
+    };
+    if ClientToScreen(info.hwndCaret, &mut pt) == 0 {
+        return None;
+    }
+    Some((pt.x, pt.y))
+}
+
+/// 方法 2：GetCaretPos（相对于拥有焦点的窗口的客户区）。
+unsafe fn caret_via_get_caret_pos() -> Option<(i32, i32)> {
+    use windows_sys::Win32::Graphics::Gdi::ClientToScreen;
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetFocus;
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetCaretPos;
+    let mut pt = windows_sys::Win32::Foundation::POINT { x: 0, y: 0 };
+    if GetCaretPos(&mut pt) == 0 {
+        return None;
+    }
+    // (0,0) 基本等于"没有光标"（Electron 类应用会这么返回），视为无效
+    if pt.x == 0 && pt.y == 0 {
+        return None;
+    }
+    let focus = GetFocus();
+    if focus.is_null() || ClientToScreen(focus, &mut pt) == 0 {
+        return None;
+    }
+    Some((pt.x, pt.y))
 }
 
 /// 引擎进程是否在跑（管道是否有可用实例）。
