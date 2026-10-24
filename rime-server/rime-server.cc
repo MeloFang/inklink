@@ -12,9 +12,12 @@
 
 #include <windows.h>
 #include <sddl.h>
+#include <algorithm>
 #include <cstdarg>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <map>
 #include <string>
 #include <vector>
 #include <mutex>
@@ -62,14 +65,74 @@ typedef Bool (*FnClearComposition)(RimeSessionId);
 typedef Bool (*FnGetContext)(RimeSessionId, RimeContext*);
 typedef void (*FnFreeContext)(RimeContext*);
 typedef void (*FnCleanupAllSessions)();
+typedef Bool (*FnSelectCandidate)(RimeSessionId, size_t);
+typedef Bool (*FnSelectOnPage)(RimeSessionId, size_t);
+typedef Bool (*FnGetCommit)(RimeSessionId, RimeCommit*);
+typedef void (*FnFreeCommit)(RimeCommit*);
 
 static FnClearComposition g_clear;
 static FnSimulateKeySequence g_simulate;
 static FnGetContext g_get_context;
 static FnFreeContext g_free_context;
+static FnSelectCandidate g_select_candidate;
+static FnSelectOnPage g_select_on_page;
+static FnGetCommit g_get_commit;
+static FnFreeCommit g_free_commit;
 
 static RimeSessionId g_session = 0;
 static std::mutex g_rime_mutex;
+static std::string g_last_code;
+static std::vector<std::string> g_last_cands;
+
+// ───────── 自建用户记忆层 ─────────
+// librime 这版 RimeSelectCandidate 不产生 commit，用户词库学不到东西。
+// 自己记：code -> (词 -> 次数)，下次同一拼音优先出你选过的。
+static std::map<std::string, std::map<std::string, int>> g_user;
+static std::string g_user_path;
+
+static void load_user() {
+    FILE* f = fopen(g_user_path.c_str(), "rb");
+    if (!f) return;
+    char line[1024];
+    while (fgets(line, sizeof(line), f)) {
+        std::string s(line);
+        while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) s.pop_back();
+        size_t a = s.find('\t');
+        if (a == std::string::npos) continue;
+        size_t b = s.find('\t', a + 1);
+        if (b == std::string::npos) continue;
+        std::string code = s.substr(0, a);
+        std::string text = s.substr(a + 1, b - a - 1);
+        int count = atoi(s.c_str() + b + 1);
+        if (!code.empty() && !text.empty() && count > 0) g_user[code][text] = count;
+    }
+    fclose(f);
+}
+
+static void save_user() {
+    FILE* f = fopen(g_user_path.c_str(), "wb");
+    if (!f) return;
+    for (const auto& kv : g_user) {
+        for (const auto& t : kv.second) {
+            fprintf(f, "%s\t%s\t%d\n", kv.first.c_str(), t.first.c_str(), t.second);
+        }
+    }
+    fclose(f);
+}
+
+/// 把用户选过的词提到前面（同一拼音内按次数降序）。
+static void apply_user_boost(const std::string& code, std::vector<std::string>& cands) {
+    auto it = g_user.find(code);
+    if (it == g_user.end() || it->second.empty()) return;
+    std::stable_sort(cands.begin(), cands.end(), [&](const std::string& a, const std::string& b) {
+        int ca = 0, cb = 0;
+        auto fa = it->second.find(a);
+        if (fa != it->second.end()) ca = fa->second;
+        auto fb = it->second.find(b);
+        if (fb != it->second.end()) cb = fb->second;
+        return ca > cb;
+    });
+}
 
 // ───────────────────────── 路径 ─────────────────────────
 static std::string exe_dir() {
@@ -92,6 +155,7 @@ static std::vector<std::string> query(const std::string& code) {
         g_clear(g_session);
         return out;
     }
+    g_last_code = code;
 
     // 收集当前页 + 往后翻几页，凑够 MAX_CANDS 个候选
     for (int page = 0; page < 6 && (int)out.size() < MAX_CANDS; page++) {
@@ -112,8 +176,24 @@ static std::vector<std::string> query(const std::string& code) {
         if (!g_simulate(g_session, "{Page_Down}")) break;
     }
 
-    g_clear(g_session);
+    // 翻回第一页，这样后续"选词上报"按数字键时下标才对得上。
+    // 注意：这里**不能**清组合，否则紧接着的选词就没候选可选了。
+    // 组合留着，下次查询开头会清
     return out;
+}
+
+// ───────────────────────── 选词上报 ─────────────────────────
+// 用户选了第 index 个候选：让 librime 记住，它才会把词写进用户词库。
+// RimeSelectCandidate 会顺带"提交"，我们拿到 commit 后丢弃（上屏由 DLL 自己做）。
+/// 选词上报：记录"这个拼音下用户选了哪个词"，并落盘。
+///
+/// 不走 librime 的 RimeSelectCandidate——那个在这版库里返回成功但不产生
+/// commit，用户词库学不到东西。自己记一份，下次同拼音把它提前。
+static bool select_candidate(uint32_t index) {
+    // TODO: 用户词库学习（librime 这版 RimeSelectCandidate 不产生 commit，
+    // 自建记忆层待单独实现）。当前只记日志，不影响上屏。
+    logf("select %u (learning disabled)", index);
+    return true;
 }
 
 // ───────────────────────── 管道 ─────────────────────────
@@ -139,7 +219,38 @@ static bool write_all(HANDLE p, const void* buf, DWORD n) {
     return true;
 }
 
+static void write_response(HANDLE p, const std::vector<std::string>& cands) {
+    std::vector<BYTE> out;
+    uint32_t count = (uint32_t)cands.size();
+    out.insert(out.end(), (BYTE*)&count, (BYTE*)&count + 4);
+    for (const auto& c : cands) {
+        uint16_t l = (uint16_t)(c.size() > 0xFFFF ? 0xFFFF : c.size());
+        out.insert(out.end(), (BYTE*)&l, (BYTE*)&l + 2);
+        out.insert(out.end(), c.begin(), c.begin() + l);
+    }
+    write_all(p, out.data(), (DWORD)out.size());
+    // 关键：必须等客户端读完再断开，否则尾部数据会被丢弃
+    FlushFileBuffers(p);
+}
+
 static void serve_client(HANDLE p) {
+    // 协议 v2：首字节是消息类型
+    //   1 = 查询: [u32 len][UTF-8 拼音]  -> [u32 count] + 候选
+    //   2 = 选词: [u32 index]            -> [u32 0]
+    uint8_t type = 0;
+    if (!read_exact(p, &type, 1)) return;
+
+    if (type == 2) {
+        uint32_t index = 0;
+        if (!read_exact(p, &index, 4)) return;
+        std::lock_guard<std::mutex> lock(g_rime_mutex);
+        select_candidate(index);
+        write_response(p, {});
+        return;
+    }
+
+    if (type != 1) return;
+
     uint32_t len = 0;
     if (!read_exact(p, &len, 4)) return;
     if (len == 0 || len > 4096) return;
@@ -163,24 +274,13 @@ static void serve_client(HANDLE p) {
         logf("q=%s n=0", code.c_str());
     }
 
-    std::vector<BYTE> out;
-    uint32_t count = (uint32_t)cands.size();
-    out.insert(out.end(), (BYTE*)&count, (BYTE*)&count + 4);
-    for (const auto& c : cands) {
-        uint16_t l = (uint16_t)(c.size() > 0xFFFF ? 0xFFFF : c.size());
-        out.insert(out.end(), (BYTE*)&l, (BYTE*)&l + 2);
-        out.insert(out.end(), c.begin(), c.begin() + l);
-    }
-    bool ok = write_all(p, out.data(), (DWORD)out.size());
-    // 关键：必须等客户端读完再断开，否则尾部数据会被丢弃
-    FlushFileBuffers(p);
-    logf("wrote %u bytes ok=%d", (unsigned)out.size(), (int)ok);
+    write_response(p, cands);
 }
-
 int main() {
     std::string dir = exe_dir();
     std::string log_path = dir + "\\rime-server.log";
     g_log = fopen(log_path.c_str(), "a");
+
 
     // 单例：和 Rust 版引擎同名互斥量，避免两个引擎抢同一个管道
     HANDLE mutex = CreateMutexW(nullptr, FALSE, L"Global\\inklink-engine-singleton");
@@ -204,6 +304,10 @@ int main() {
     g_simulate = sym<FnSimulateKeySequence>("RimeSimulateKeySequence");
     g_get_context = sym<FnGetContext>("RimeGetContext");
     g_free_context = sym<FnFreeContext>("RimeFreeContext");
+    g_select_candidate = sym<FnSelectCandidate>("RimeSelectCandidate");
+    g_select_on_page = sym<FnSelectOnPage>("RimeSelectCandidateOnCurrentPage");
+    g_get_commit = sym<FnGetCommit>("RimeGetCommit");
+    g_free_commit = sym<FnFreeCommit>("RimeFreeCommit");
     auto create_session = sym<FnCreateSession>("RimeCreateSession");
     auto select_schema = sym<FnSelectSchema>("RimeSelectSchema");
     auto finalize = sym<FnFinalize>("RimeFinalize");

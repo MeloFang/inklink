@@ -786,6 +786,8 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
             VK_SPACE => {
                 let pick_idx = *page * page_size(*expanded) + *sel;
                 if let Some(top) = cands.get(pick_idx).cloned() {
+                    // 上报选词，让引擎写进用户词库（失败不影响上屏）
+                    ipc::select(pick_idx);
                     // 上屏后清空整个缓冲——多余/打错的字母一并删掉（用户要求）
                     buffer.clear();
                     cands.clear();
@@ -846,6 +848,7 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                     *sel = idx - 1;
                     let global = *page * page_size(*expanded) + (idx - 1);
                     if let Some(pick) = cands.get(global).cloned() {
+                        ipc::select(global);
                         buffer.clear();
                         cands.clear();
                         *matched_len = 0;

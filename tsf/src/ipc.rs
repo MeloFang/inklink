@@ -207,7 +207,9 @@ pub fn query(code: &str) -> Vec<String> {
         }
 
         let bytes = code.as_bytes();
-        let mut req = Vec::with_capacity(4 + bytes.len());
+        // 协议 v2：首字节是消息类型，1 = 查询
+        let mut req = Vec::with_capacity(5 + bytes.len());
+        req.push(1u8);
         req.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
         req.extend_from_slice(bytes);
         write_all(pipe, &req);
@@ -235,6 +237,37 @@ pub fn query(code: &str) -> Vec<String> {
         }
         let _ = CloseHandle(pipe);
         out
+    }
+}
+
+/// 选词上报：告诉引擎"用户选了第 index 个候选"，让它写进用户词库。
+///
+/// 失败无所谓（不影响上屏），所以不返回错误。
+pub fn select(index: usize) {
+    // SAFETY: 句柄在本函数内配对关闭
+    unsafe {
+        let name = wide(PIPE_NAME);
+        let pipe: HANDLE = CreateFileW(
+            name.as_ptr(),
+            FILE_GENERIC_READ | FILE_GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            0,
+            std::ptr::null_mut(),
+        );
+        if pipe == INVALID_HANDLE_VALUE {
+            return;
+        }
+        // 协议 v2：类型 2 = 选词，后跟 u32 下标
+        let mut req = [0u8; 5];
+        req[0] = 2;
+        req[1..5].copy_from_slice(&(index as u32).to_le_bytes());
+        write_all(pipe, &req);
+        // 读掉响应（count=0），避免服务端阻塞在 flush
+        let mut len_buf = [0u8; 4];
+        let _ = read_exact(pipe, &mut len_buf);
+        let _ = CloseHandle(pipe);
     }
 }
 
