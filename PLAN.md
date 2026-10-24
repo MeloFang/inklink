@@ -339,3 +339,60 @@ Failed to setup app: 拒绝访问。(os error 5)
 
 **测试专用开关**：`INKLINK_TEST_INJECTED=1` 让钩子接受注入事件，仅用于自动化验证 UI 链路。
 正常使用必须不设这个变量。
+
+---
+
+## 阶段 T5 待办（librime 接入之后）
+
+> 当前状态：TSF 输入法 + librime 引擎已在用户本机日常使用。
+> 自研 Ranker 已退役（代码保留在 `app/src-tauri/src/engine/`，未删）。
+
+### T5a 用户词库学习（下次专门处理）
+
+**背景**：librime 自带用户词库（`rime\user\luna_pinyin.userdb`），但实测这个版本学不到东西：
+
+| 尝试 | 结果 |
+|:---|:---|
+| `RimeSelectCandidate(session, index)` | 返回成功，`RimeGetCommit` 拿不到 commit |
+| `RimeSelectCandidateOnCurrentPage(session, slot)` | 同上 |
+| 模拟数字键 `RimeSimulateKeySequence("5")` | 同上 |
+| 恢复 `RimeGetContext` 刷新菜单后再选 | 同上 |
+
+**结论**：不依赖 librime 的学习，自建记忆层（`code -> 词 -> 次数`）。
+
+**教训**：曾一次性把「记录 + 落盘 + 排序提升」全加上，结果**查询路径崩溃**（原因未定位，
+崩溃在 `query()` 内部，连 `q=...` 日志都没写出来）。下次必须分三步，每步验证：
+
+1. **只记录到内存 + 日志**，不动排序 —— 确认连续查询不崩
+2. 加落盘（`user.tsv`，`code\ttext\tcount`）
+3. 才接排序提升（同拼音内按次数降序，`std::stable_sort`）
+
+**已埋好的伏笔**（下次不用改 DLL）：
+- 协议 v2 已保留 `type=2` 选词消息：`[u8 2][u32 index]`
+- DLL 侧 `ipc::select(index)` 已实现，空格/数字键提交时调用
+- 服务端 `select_candidate()` 目前只记日志，**在这里接学习逻辑即可**
+
+### T5b 拼音音节分隔显示
+
+librime 的 preedit 自带 `jian zou pian feng`，但候选窗顶部仍显示原始 `jianzoupianfeng`。
+可在查询响应里附带 preedit，DLL 用它替换拼音行。
+
+### T5c 候选窗美化
+
+选中项圆角、间距微调、配色统一。
+
+### T5d 拼音下划线
+
+`ITfDisplayAttributeProvider` + `IEnumTfDisplayAttributeInfo` + 新 CLSID + `GetTextExt` 已有。
+约 350 行，需动注册（加性改动）。注意 `ITfProperty::SetValue` 要开 `Win32_System_Ole` +
+`Win32_System_Variant` 特性。
+
+### T5e 云词库（自建「个人云」）
+
+不抄搜狗的公共云（几百万用户数据，闭源）。做**个人云**：
+Obsidian 语料 + AI 兜底，默认关闭联网（符合项目铁律）。
+
+### T5f librime 工程化
+
+- `rime.dll` / `rime\data` / `rime\user` 目前靠手工从 Weasel 安装包解出（见 `rime-server/README.md`）
+- 后续可做一键安装脚本，并考虑裁剪 `rime\data`（现在 13MB，包含用不到的方案）

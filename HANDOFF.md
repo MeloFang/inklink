@@ -165,3 +165,58 @@ cargo build --release --offline                       # 引擎
 - 引擎崩溃原因排查（日志已就位）
 - 各应用兼容（WPS / 浏览器 / VSCode）
 - M1 使用反馈排序、M2 个人词库、M3 AI
+
+---
+
+## 八、引擎换成 librime（2026-10-25）
+
+### 为什么换
+
+自研 Ranker 只能做「整词 + 前缀 + 简拼 + 一元词频」，实测打不出：
+
+| 输入 | 自研引擎 | librime |
+|:---|:---|:---|
+| `jianzoupianfeng` | 见走片风（词库还没这个词） | **剑走偏锋** |
+| `jiagjiang`（打错） | 家/加/价/假 | **价格将/价格/架构** |
+| `jintiantianqihenhao` | 今天天气很好（碰巧对） | **今天天气很好** |
+
+librime 是 **BSD-3-Clause**，自带音节切分、词图 + Viterbi、八股文语言模型、用户词库。
+
+### 架构
+
+```
+inklink_tsf.dll (x64, TSF)  ──命名管道──▶  rime-server.exe (x86, 链 librime)
+        │                                        │
+   C:\Program Files\inklink\            C:\inklink-engine\
+```
+
+**为什么单独进程**：Weasel 分发的 `rime.dll` 是 **32 位**，而 TSF DLL 必须是 64 位。
+进程间 32/64 位互不影响——这也正是 Weasel 自己的架构（x86 WeaselServer 服务 x64 前端）。
+
+### 关键实现（`rime-server/`）
+
+- **协议与旧 Rust 引擎完全一致**，DLL 只加了一个消息类型字节：
+  `[u8 type][body]`，`1=查询`，`2=选词`
+- **`FlushFileBuffers` 必须加**：否则 `DisconnectNamedPipe` 会丢掉客户端还没读的数据
+  （表现为客户端只收到 count，收不到候选）
+- **每连接一线程 + librime 互斥**：单实例循环会被一个卡住的客户端堵死
+- **候选靠 `RimeGetContext` + `{Page_Down}` 收集**：`RimeCandidateList*` 这版返回空文本
+- `rime\data\default.yaml` 的 `schema_list` 裁到只剩 `luna_pinyin_simp`，避免每次编译 8 个方案
+
+### 部署
+
+```
+C:\inklink-engine\
+  rime-server.exe     引擎（开机自启，HKCU Run）
+  rime.dll            3.0 MB
+  rime\data\          13 MB  词库与配置（54 万词）
+  rime\user\          ~44 MB librime 构建产物（首次运行自动生成，约 1-2 分钟）
+```
+
+注册表 `HKLM\SOFTWARE\inklink` 的 `EnginePath` → `rime-server.exe`，DLL 会按它自动拉起。
+
+### 已知未做
+
+- **用户词库学习**：librime 这版 `RimeSelectCandidate` 不产生 commit，学不到。
+  自建记忆层试过但导致查询崩溃，已回退。详见 `PLAN.md` T5a。
+- 拼音音节分隔显示（librime 的 preedit 自带 `jian zou pian feng`，尚未用上）
