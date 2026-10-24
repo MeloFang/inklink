@@ -148,12 +148,15 @@ const INITIALS: &[char] = &[
     'w',
 ];
 
-/// 是否可能是简拼：至少 2 个字符，且每个字符都是声母字母。
+/// 是否可能是简拼：每个字符都是声母字母。
+///
+/// 允许**单字母**：用户刚打出 `k` 时也要能出候选（看/可/开…），
+/// 这是主流输入法的基本行为。单字母不可能是完整音节，所以当 1 字母简拼处理。
 ///
 /// 注意：这只是**必要条件**，`zh`/`ch`/`sh` 的两个字母会被当成两个声母，属于可接受的误判。
 pub fn is_abbreviation(input: &str) -> bool {
     let code: String = normalize_input(input).split_whitespace().collect();
-    code.chars().count() >= 2 && code.chars().all(|c| INITIALS.contains(&c))
+    !code.is_empty() && code.chars().all(|c| INITIALS.contains(&c))
 }
 
 #[cfg(test)]
