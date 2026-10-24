@@ -27,28 +27,66 @@ pub const PIPE_NAME: &str = r"\\.\pipe\inklink-engine";
 
 /// 引擎服务主循环：加载词库后一直服务，直到进程被杀。
 pub fn run(lexicon_path: &std::path::Path) -> ! {
+    install_panic_log();
+    log(&format!(
+        "启动 pid={} 词库={}",
+        std::process::id(),
+        lexicon_path.display()
+    ));
+
     // 单例：DLL 可能被多个应用同时拉起引擎，用命名互斥量保证只有一个实例在服务。
     if !claim_singleton() {
-        eprintln!("已有引擎实例在运行，本实例退出");
+        log("已有引擎实例在运行，本实例退出");
         std::process::exit(0);
     }
 
     let lex = match Lexicon::load(lexicon_path) {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("词库加载失败 {}: {e}", lexicon_path.display());
+            log(&format!("词库加载失败 {}: {e}", lexicon_path.display()));
             std::process::exit(2);
         }
     };
-    println!("引擎就绪: {} 条词", lex.len());
+    log(&format!("就绪: {} 条词", lex.len()));
     let ranker = Ranker::new(lex);
 
     loop {
         if let Err(e) = serve_once(&ranker) {
-            eprintln!("管道错误: {e}");
+            log(&format!("管道错误: {e}"));
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
     }
+}
+
+/// 引擎日志路径：exe 同级的 engine.log（Release 是 windows 子系统，stderr 看不到）。
+fn log_path() -> std::path::PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("engine.log")))
+        .unwrap_or_else(|| std::path::PathBuf::from("engine.log"))
+}
+
+/// 追加一行日志（带时间戳）。失败就静默——日志不能影响服务。
+fn log(msg: &str) {
+    use std::io::Write;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path())
+    {
+        let _ = writeln!(f, "[{now}] {msg}");
+    }
+}
+
+/// 装 panic 钩子：崩溃前把信息写进日志（release 是 panic=abort，钩子仍会被调用）。
+fn install_panic_log() {
+    std::panic::set_hook(Box::new(|info| {
+        log(&format!("PANIC: {info}"));
+    }));
 }
 
 /// 用命名互斥量抢占单例。成功返回 true；已有实例返回 false。
