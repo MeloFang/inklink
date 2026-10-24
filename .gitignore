@@ -37,3 +37,13 @@ Thumbs.db
 # TSF 构建产物
 /tsf/target/
 /tsf/target-static/
+
+# rime-server 的二进制与数据（从 Weasel 安装包解出，不进 git）
+/rime-server/rime.dll
+/rime-server/rime/
+/rime-server/*.exe
+/rime-server/*.obj
+/rime-server/*.log
+/rime-server/*.out
+/rime-server/*.err
+/rime-server/*.txt
