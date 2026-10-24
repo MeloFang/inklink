@@ -34,6 +34,7 @@ struct CandidateDto {
 
 fn source_name(s: Source) -> &'static str {
     match s {
+        Source::Sentence => "sentence",
         Source::Exact => "exact",
         Source::Prefix => "prefix",
         Source::Abbrev => "abbrev",

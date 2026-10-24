@@ -13,6 +13,8 @@ use crate::engine::pinyin::{decode, fuzzy_variants, is_abbreviation, normalize_i
 /// 候选来源，决定惩罚分。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Source {
+    /// 整句组合（词图 DP，长输入时给出「我来说说」这种整句候选）。
+    Sentence,
     /// 全拼完全匹配。
     Exact,
     /// 全拼前缀匹配（输入还没打完）。
@@ -26,6 +28,7 @@ pub enum Source {
 impl Source {
     fn penalty(self) -> f32 {
         match self {
+            Source::Sentence => 0.0,
             Source::Exact => 0.0,
             Source::Prefix => 0.4,
             Source::Abbrev => 1.6,
@@ -35,13 +38,15 @@ impl Source {
 
     fn rank(self) -> u8 {
         match self {
-            // 完全匹配的整词排最前
-            Source::Exact => 0,
-            // 模糊音命中也是「整词匹配」，只是读音近似，排在精确之后
-            Source::Fuzzy => 1,
+            // 整句组合排最前（长输入时用户要的就是整句）
+            Source::Sentence => 0,
+            // 完全匹配的整词
+            Source::Exact => 1,
+            // 模糊音命中也是「整词匹配」，只是读音近似
+            Source::Fuzzy => 2,
             // 前缀命中（输入还没打完）排在这之后，避免 `sha` 首选「上」(shang)
-            Source::Prefix => 2,
-            Source::Abbrev => 3,
+            Source::Prefix => 3,
+            Source::Abbrev => 4,
         }
     }
 }
@@ -188,7 +193,89 @@ impl Ranker {
                 .then_with(|| a.text.cmp(&b.text))
         });
         out.truncate(limit);
+
+        // 整句组合：整串没有精确命中时，把音节序列按词图 DP 切成最优词序列。
+        // 这是长输入（wolaishuoshuo → 我来说说）的关键，且不会干扰 `xian` 这类
+        // 本来就有整词命中的输入。
+        let has_exact = out.iter().any(|c| c.source == Source::Exact);
+        if !has_exact {
+            if let Some(syllables) = decode(input) {
+                if syllables.len() >= 2 {
+                    if let Some(sent) = self.best_sentence(&syllables) {
+                        if !out.iter().any(|c| c.text == sent) {
+                            out.insert(
+                                0,
+                                Candidate {
+                                    text: sent,
+                                    pinyin: syllables.join(" "),
+                                    freq: u32::MAX,
+                                    score: f32::MAX,
+                                    source: Source::Sentence,
+                                },
+                            );
+                            out.truncate(limit);
+                        }
+                    }
+                }
+            }
+        }
+
         out
+    }
+
+    /// 词图 DP：把音节序列切成最优的词序列，返回整句文本。
+    ///
+    /// `dp[i]` = 覆盖 `syllables[0..i]` 的最优（累计分，词下标序列）。
+    /// 转移：枚举最后一个词 `syllables[j..i]`，要求词库里存在该编码。
+    /// 打分偏好「词频高 + 切得少（长词）」的切法。
+    fn best_sentence(&self, syllables: &[String]) -> Option<String> {
+        let n = syllables.len();
+        if n < 2 {
+            return None;
+        }
+        let mut dp: Vec<Option<(f32, Vec<u32>)>> = vec![None; n + 1];
+        dp[0] = Some((0.0, Vec::new()));
+
+        for i in 1..=n {
+            for j in (0..i).rev() {
+                let code: String = syllables[j..i].concat();
+                let Some(ids) = self.codes.get(&code) else {
+                    continue;
+                };
+                let Some((prev_score, prev_words)) = dp[j].as_ref() else {
+                    continue;
+                };
+                // 同码取最高频的那个词
+                let Some(&best_id) = ids
+                    .iter()
+                    .max_by_key(|id| self.lex.entries()[**id as usize].freq)
+                else {
+                    continue;
+                };
+                let e = &self.lex.entries()[best_id as usize];
+                let word_score = (1.0 + e.freq as f32).ln();
+                // 单字词重罚：中文里单字多是语素（进/起/翻 词频极高），
+                // 不罚的话 DP 会把「今天天气很好」切成「进+天天+起+很好」。
+                let single_penalty = if i - j == 1 { -8.0 } else { 0.0 };
+                // 长词奖励：每个词奖励 (音节数-1)，累加后等价于「切得越少越好」。
+                let len_bonus = ((i - j) - 1) as f32 * 3.0;
+                let score = prev_score + word_score + single_penalty + len_bonus;
+                let better = dp[i].as_ref().is_none_or(|(s, _)| score > *s);
+                if better {
+                    let mut words = prev_words.clone();
+                    words.push(best_id);
+                    dp[i] = Some((score, words));
+                }
+            }
+        }
+
+        let (_, words) = dp[n].as_ref()?;
+        Some(
+            words
+                .iter()
+                .map(|id| self.lex.entries()[*id as usize].text.as_str())
+                .collect(),
+        )
     }
 
     /// 按编码前缀取候选，同时给出下标。
