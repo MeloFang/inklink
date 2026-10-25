@@ -119,6 +119,10 @@ struct TextServiceInner {
     self_terminating: AtomicBool,
     /// 最近一次 GetTextExt 拿到的组合串屏幕位置
     last_pos: Mutex<Option<(i32, i32)>>,
+    /// 英文模式：Shift 单击切换，开启后所有键原样交给应用
+    english_mode: AtomicBool,
+    /// 本次按下 Shift 期间是否打过字（用于区分"单击"和"按住"）
+    shift_used: AtomicBool,
 }
 
 #[implement(ITfTextInputProcessorEx, ITfKeyEventSink, ITfEditSession, ITfCompositionSink)]
@@ -146,6 +150,8 @@ impl TextService {
                 pending: Mutex::new(None),
                 self_terminating: AtomicBool::new(false),
                 last_pos: Mutex::new(None),
+                english_mode: AtomicBool::new(false),
+                shift_used: AtomicBool::new(false),
             },
         }
     }
@@ -572,6 +578,16 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
             return Ok(BOOL(0));
         }
 
+        // 英文模式：所有键原样交给应用（Shift 除外，用 Shift 单击切回中文）
+        if self.inner.english_mode.load(Ordering::SeqCst) {
+            const VK_SHIFT_KEY: u32 = 0x10;
+            if vk == VK_SHIFT_KEY {
+                // 让 OnKeyUp 去处理切换
+                self.inner.shift_used.store(false, Ordering::SeqCst);
+            }
+            return Ok(BOOL(0));
+        }
+
         // 没在拼写、也不在英文模式时：把英文标点键换成中文标点（`\` → `、` 等）。
         // Shift 按住 / CapsLock 开着 = 英文输入，标点必须原样透传。
         let composing_now = !self
@@ -602,6 +618,9 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
             VK_A..=VK_Z => {
                 // 空闲 + Shift/CapsLock：是要打英文大写，放行给应用
                 if !composing && shift_or_caps() {
+                    if shift_held() {
+                        self.inner.shift_used.store(true, Ordering::SeqCst);
+                    }
                     return Ok(BOOL(0));
                 }
                 let at = (*cursor).min(buffer.len());
@@ -856,8 +875,8 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                     Ok(BOOL(0))
                 }
             }
-            // Shift / CapsLock：拼音还在组合时按下，直接把拼音当英文上屏（对齐搜狗）。
-            // 空闲时放行（交给应用，或用于打英文大写）。
+            // Shift / CapsLock：拼音还在组合时按下，直接把拼音当英文上屏（对齐搜狗），
+            // 并进入英文模式。空闲时 Shift 单击会在 OnKeyUp 里切换中英文。
             VK_SHIFT | VK_CAPITAL => {
                 if !buffer.is_empty() {
                     let raw = buffer.clone();
@@ -871,6 +890,11 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                     candwin::hide();
                     log_line(&format!("commit-raw(shift) {raw}"));
                     self.request_edit(EditAction::Commit(raw));
+                    // 切到英文模式，且这次 Shift 不再触发 OnKeyUp 的切换
+                    if vk == VK_SHIFT {
+                        self.inner.english_mode.store(true, Ordering::SeqCst);
+                        self.inner.shift_used.store(true, Ordering::SeqCst);
+                    }
                     Ok(BOOL(1))
                 } else {
                     Ok(BOOL(0))
@@ -929,9 +953,20 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
     fn OnKeyUp(
         &self,
         _pic: Ref<ITfContext>,
-        _wparam: WPARAM,
+        wparam: WPARAM,
         _lparam: LPARAM,
     ) -> windows::core::Result<BOOL> {
+        const VK_SHIFT: u32 = 0x10;
+        let vk = wparam.0 as u32;
+        if vk == VK_SHIFT {
+            // Shift 单击（按下期间没打字）→ 切换中英文模式
+            if !self.inner.shift_used.load(Ordering::SeqCst) {
+                let cur = self.inner.english_mode.load(Ordering::SeqCst);
+                self.inner.english_mode.store(!cur, Ordering::SeqCst);
+                log_line(&format!("english_mode -> {}", !cur));
+            }
+            self.inner.shift_used.store(false, Ordering::SeqCst);
+        }
         Ok(BOOL(0))
     }
 
