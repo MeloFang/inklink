@@ -396,3 +396,27 @@ Obsidian 语料 + AI 兜底，默认关闭联网（符合项目铁律）。
 
 - `rime.dll` / `rime\data` / `rime\user` 目前靠手工从 Weasel 安装包解出（见 `rime-server/README.md`）
 - 后续可做一键安装脚本，并考虑裁剪 `rime\data`（现在 13MB，包含用不到的方案）
+### T5g 模糊音（an/ang、zh/z 等）
+
+**现象**：打 `chuanjianba`（少打一个 g）出「船舰吧」，期望「创建吧」。
+
+**已确认不是词库问题**：`创建` 在词库里，`chuangjianba` 能出「创建吧」。
+
+**根因**：rime 默认不开模糊音，`chuan` 和 `chuang` 是两个不同音节。
+
+**试过的方案**：
+1. 用户目录 `luna_pinyin.custom.yaml` + `speller/algebra/__append` —— 无效，
+   而且把原来的 `__patch`（简拼/纠错）覆盖掉了
+2. 直接改 `luna_pinyin.schema.yaml` 的 algebra 加 derive 规则 —— 生成了正确的
+   build schema，但 rime 不重新编译 prism，**改动不生效**
+3. 删除 `user\build` + `*.prism.bin` 强制重建 —— rime 报 maintenance done
+   但没生成任何 schema/prism，**中文直接没了**（已从安装包副本恢复）
+
+**结论**：rime 的 prism 重建路径还没摸清，动数据风险高。
+
+**下次可选路线**（按风险从低到高）：
+- A. 在 `rime-server` 里做模糊音：拿到 preedit 的音节切分后，逐音节生成
+  an↔ang / en↔eng / in↔ing / zh↔z / ch↔c / sh↔s 变体，再 simulate 变体合并候选。
+  不动 rime 数据，完全可控。
+- B. 搞清 rime 的 deploy 流程（看 rime 自己的日志），让 prism 正常重建。
+- C. 用 `RimeDeploySchema` / `RimePrebuildAllSchemas` 主动触发单方案重建。
