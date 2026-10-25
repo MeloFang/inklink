@@ -1,0 +1,30 @@
+== inklink 自动化测试 ==
+输入法已激活
+
+CapsLock = 0
+
+  FAIL  拼音 xiangmu + 空格 -> 项目
+        got  = ""
+        want = "  FAIL  拼音 nihao + 空格 -> 你好
+        got  = ""
+        want = "  FAIL  反斜杠 -> 顿号
+        got  = "\"
+        want = "  FAIL  逗号 -> 中文逗号
+        got  = ""
+        want = "  FAIL  Shift+/ -> ？
+        got  = "?"
+        want = "  FAIL  打 ? 之后仍是中文模式
+        got  = ""
+        want = "  FAIL  Shift 单击后打英文
+        got  = ""
+        want = "nihao"
+  FAIL  再 Shift 单击回到中文
+        got  = ""
+        want = "  FAIL  CapsLock 开 -> NIHAO
+        got  = ""
+        want = "NIHAO"
+  FAIL  回车 -> 拼音原样上屏
+        got  = "xiangmunihaonihaonihaonihaonihaoceshi"
+        want = "ceshi"
+
+结果: 0 通过, 10 失败

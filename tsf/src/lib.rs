@@ -549,7 +549,7 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
     ) -> windows::core::Result<BOOL> {
         let vk = wparam.0 as u32;
         let composing = !self.inner.buffer.lock().unwrap_or_else(|p| p.into_inner()).is_empty();
-        let claim = should_claim(vk, composing);
+        let claim = should_claim(vk, composing, shift_held(), caps_on());
         log_line(&format!("test vk={vk} claim={claim} composing={composing}"));
         Ok(BOOL(if claim { 1 } else { 0 }))
     }
@@ -622,8 +622,8 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .is_empty();
-        if !composing_now && !shift_or_caps() {
-            if let Some(ch) = cn_punct(vk) {
+        if !composing_now && !caps_on() {
+            if let Some(ch) = cn_punct(vk, shift_held()) {
                 log_line(&format!("punct vk={vk:#x} -> {ch}"));
                 self.request_edit(EditAction::Insert(ch.to_string()));
                 return Ok(BOOL(1));
@@ -1012,11 +1012,6 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
     }
 }
 
-/// 把按键记到临时目录的日志（按进程分文件，便于诊断按键流是否到达）。
-///
-/// 这个键要不要由输入法认领。
-///
-/// 原则：**只认领真正要处理的**。方向键、Tab、F 键一律放行；
 /// 这个键该不该由输入法认领（TSF 按键状态机）。
 ///
 /// 规则（对照主流输入法）：
@@ -1024,7 +1019,9 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
 /// - **正在拼写**：认领 A-Z、数字、退格、空格、Esc（候选相关操作）
 /// - **空闲**：只认领"无 Shift/CapsLock 的纯字母"来启动拼写；
 ///   Tab、CapsLock、Shift、Enter、空格、方向键、退格、符号 → 全部放行给应用
-fn should_claim(vk: u32, composing: bool) -> bool {
+///
+/// `shift` / `caps` 显式传进来（而不是内部查键盘），这样纯逻辑可单测。
+fn should_claim(vk: u32, composing: bool, shift: bool, caps: bool) -> bool {
     const VK_BACK: u32 = 0x08;
     const VK_RETURN: u32 = 0x0D;
     const VK_ESCAPE: u32 = 0x1B;
@@ -1075,7 +1072,7 @@ fn should_claim(vk: u32, composing: bool) -> bool {
     }
 
     // 空闲：只有"无 Shift/CapsLock 的纯字母"才启动拼写
-    if (VK_A..=VK_Z).contains(&vk) && !shift_or_caps() {
+    if (VK_A..=VK_Z).contains(&vk) && !shift && !caps {
         return true;
     }
     false
@@ -1196,19 +1193,33 @@ fn shift_held() -> bool {
 ///
 /// 只在"中文模式且没按 Shift"时调用；`\` → `、` 就是顿号。
 /// 返回 `None` 表示不是标点键，交给应用。
-fn cn_punct(vk: u32) -> Option<&'static str> {
-    Some(match vk {
-        VK_OEM_COMMA => "，",
-        VK_OEM_PERIOD => "。",
-        VK_OEM_1 => "；",
-        VK_OEM_2 => "／",
-        VK_OEM_3 => "·",
-        VK_OEM_4 => "【",
-        VK_OEM_5 => "、",
-        VK_OEM_6 => "】",
-        VK_OEM_7 => "‘",
-        VK_OEM_MINUS => "－",
-        VK_OEM_PLUS => "＝",
+fn cn_punct(vk: u32, shift: bool) -> Option<&'static str> {
+    Some(match (vk, shift) {
+        // 不按 Shift
+        (VK_OEM_COMMA, false) => "，",
+        (VK_OEM_PERIOD, false) => "。",
+        (VK_OEM_1, false) => "；",
+        (VK_OEM_2, false) => "／",
+        (VK_OEM_3, false) => "·",
+        (VK_OEM_4, false) => "【",
+        (VK_OEM_5, false) => "、",
+        (VK_OEM_6, false) => "】",
+        (VK_OEM_7, false) => "‘",
+        (VK_OEM_MINUS, false) => "－",
+        (VK_OEM_PLUS, false) => "＝",
+        // 按住 Shift：问号、叹号、冒号这些都要 Shift 才打得出来，
+        // 所以 Shift 只影响字母大小写，不影响标点转换。
+        (VK_OEM_COMMA, true) => "《",
+        (VK_OEM_PERIOD, true) => "》",
+        (VK_OEM_1, true) => "：",
+        (VK_OEM_2, true) => "？",
+        (VK_OEM_3, true) => "～",
+        (VK_OEM_4, true) => "「",
+        (VK_OEM_5, true) => "｜",
+        (VK_OEM_6, true) => "」",
+        (VK_OEM_7, true) => "“",
+        (VK_OEM_MINUS, true) => "—",
+        (VK_OEM_PLUS, true) => "＋",
         _ => return None,
     })
 }
@@ -1533,5 +1544,93 @@ mod registry {
                 CoUninitialize();
             }
         }
+    }
+}
+
+// ─────────────────────────── 单元测试 ───────────────────────────
+//
+// 这些是"按键该不该认领"和"标点怎么映射"的纯逻辑，
+// 不依赖 GUI，能直接 cargo test 跑——之前几个 bug 都藏在这里。
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const VK_A_KEY: u32 = 0x41; // A
+    const VK_N_KEY: u32 = 0x4E; // N
+    const VK_SPACE_KEY: u32 = 0x20;
+    const VK_RETURN_KEY: u32 = 0x0D;
+    const VK_BACK_KEY: u32 = 0x08;
+    const VK_ESCAPE_KEY: u32 = 0x1B;
+    const VK_TAB_KEY: u32 = 0x09;
+    const VK_LEFT_KEY: u32 = 0x25;
+
+    #[test]
+    fn 空闲时普通字母要认领() {
+        assert!(should_claim(VK_A_KEY, false, false, false));
+        assert!(should_claim(VK_N_KEY, false, false, false));
+    }
+
+    #[test]
+    fn 空闲时带_shift_或_capslock_的字母不认领() {
+        // 这是大写/英文的入口：必须放行给应用
+        assert!(!should_claim(VK_A_KEY, false, true, false), "Shift 按住应放行");
+        assert!(!should_claim(VK_A_KEY, false, false, true), "CapsLock 开着应放行");
+    }
+
+    #[test]
+    fn 空闲时标点和功能键不认领() {
+        assert!(!should_claim(VK_SPACE_KEY, false, false, false));
+        assert!(!should_claim(VK_RETURN_KEY, false, false, false));
+        assert!(!should_claim(VK_TAB_KEY, false, false, false));
+        assert!(!should_claim(VK_LEFT_KEY, false, false, false));
+        assert!(!should_claim(VK_OEM_5, false, false, false), "反斜杠交给标点逻辑");
+    }
+
+    #[test]
+    fn 拼写中认领候选操作键() {
+        assert!(should_claim(VK_A_KEY, true, false, false));
+        assert!(should_claim(VK_SPACE_KEY, true, false, false));
+        assert!(should_claim(VK_RETURN_KEY, true, false, false));
+        assert!(should_claim(VK_BACK_KEY, true, false, false));
+        assert!(should_claim(VK_ESCAPE_KEY, true, false, false));
+        assert!(should_claim(VK_LEFT_KEY, true, false, false));
+    }
+
+    #[test]
+    fn 拼写中不认领_tab() {
+        assert!(!should_claim(VK_TAB_KEY, true, false, false));
+    }
+
+    #[test]
+    fn 顿号是反斜杠() {
+        assert_eq!(cn_punct(VK_OEM_5, false), Some("、"));
+    }
+
+    #[test]
+    fn 中文标点不按_shift() {
+        assert_eq!(cn_punct(VK_OEM_COMMA, false), Some("，"));
+        assert_eq!(cn_punct(VK_OEM_PERIOD, false), Some("。"));
+        assert_eq!(cn_punct(VK_OEM_1, false), Some("；"));
+        assert_eq!(cn_punct(VK_OEM_2, false), Some("／"));
+        assert_eq!(cn_punct(VK_OEM_4, false), Some("【"));
+        assert_eq!(cn_punct(VK_OEM_6, false), Some("】"));
+        assert_eq!(cn_punct(VK_OEM_MINUS, false), Some("－"));
+    }
+
+    #[test]
+    fn 中文标点按_shift_也能出() {
+        // ? ! : 这些本来就要按 Shift，不能因为 Shift 就不转换
+        assert_eq!(cn_punct(VK_OEM_2, true), Some("？"));
+        assert_eq!(cn_punct(VK_OEM_1, true), Some("："));
+        assert_eq!(cn_punct(VK_OEM_COMMA, true), Some("《"));
+        assert_eq!(cn_punct(VK_OEM_PERIOD, true), Some("》"));
+        assert_eq!(cn_punct(VK_OEM_4, true), Some("「"));
+        assert_eq!(cn_punct(VK_OEM_6, true), Some("」"));
+    }
+
+    #[test]
+    fn 字母不是标点() {
+        assert_eq!(cn_punct(VK_A_KEY, false), None);
+        assert_eq!(cn_punct(VK_SPACE_KEY, false), None);
     }
 }

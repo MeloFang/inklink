@@ -1,0 +1,27 @@
+== inklink 自动化测试 ==
+输入法已激活
+
+CapsLock = 0
+前台窗口 = 0000000000410C4E (本窗口 0000000000B30708) 焦点 = 00000000004A07E4 (edit 00000000004A07E4)
+
+重新聚焦后前台 = 0000000000410C4E
+
+  FAIL  拼音 xiangmu + 空格 -> 项目
+        got  = ""
+        want = "  FAIL  拼音 nihao + 空格 -> 你好
+        got  = ""
+        want = "  FAIL  反斜杠 -> 顿号
+        got  = "\"
+        want = "  FAIL  逗号 -> 中文逗号
+        got  = ","
+        want = "  FAIL  Shift+/ -> ？
+        got  = "?"
+        want = "  FAIL  打 ? 之后仍是中文模式
+        got  = "nihao"
+        want = "  PASS  Shift 单击后打英文
+  FAIL  再 Shift 单击回到中文
+        got  = "nihao"
+        want = "  PASS  CapsLock 开 -> NIHAO
+  PASS  回车 -> 拼音原样上屏
+
+结果: 3 通过, 7 失败
