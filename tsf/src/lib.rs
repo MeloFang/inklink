@@ -85,6 +85,8 @@ enum EditAction {
     Commit(String),
     /// 取消：结束组合，清空
     Cancel,
+    /// 插入一段文字到当前选区（中文标点用，没有组合）
+    Insert(String),
 }
 
 struct TextServiceInner {
@@ -424,6 +426,26 @@ impl ITfEditSession_Impl for TextService_Impl {
                     .unwrap_or_else(|p| p.into_inner()) = None;
                 Ok(())
             }
+            EditAction::Insert(text) => {
+                // 中文标点：直接替换当前选区，不需要组合
+                let utf16: Vec<u16> = text.encode_utf16().collect();
+                let mut sel = [TF_SELECTION::default()];
+                let mut fetched = 0u32;
+                // SAFETY: 标准 TSF 调用
+                unsafe {
+                    ctx.GetSelection(ec, TF_DEFAULT_SELECTION, &mut sel, &mut fetched)?;
+                    if let Some(range) = sel[0].range.as_ref() {
+                        range.SetText(ec, 0, &utf16)?;
+                        range.Collapse(ec, TF_ANCHOR_END)?;
+                        let caret = [TF_SELECTION {
+                            range: std::mem::ManuallyDrop::new(Some(range.clone())),
+                            style: Default::default(),
+                        }];
+                        ctx.SetSelection(ec, &caret)?;
+                    }
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -547,6 +569,21 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
         // OnTestKeyDown 直接调 OnKeyDown，所以修饰键检查放 OnTestKeyDown 是死代码。
         if ctrl_alt_win_held() {
             return Ok(BOOL(0));
+        }
+
+        // 没在拼写时：把英文标点键换成中文标点（`\` → `、` 等）。
+        // 必须在拿 buffer 锁之前判断，否则会和下面的 match 逻辑缠在一起。
+        let composing_now = !self
+            .inner
+            .buffer
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_empty();
+        if !composing_now {
+            if let Some(ch) = cn_punct(vk, shift_held()) {
+                self.request_edit(EditAction::Insert(ch.to_string()));
+                return Ok(BOOL(1));
+            }
         }
 
         let mut buffer = self.inner.buffer.lock().unwrap_or_else(|p| p.into_inner());
@@ -1071,6 +1108,56 @@ fn shift_or_caps() -> bool {
             || (GetAsyncKeyState(VK_CAPITAL) as u16 & 0x0001) != 0
     }
 }
+
+/// 只看 Shift 是否按下（中文标点用，CapsLock 不参与）。
+fn shift_held() -> bool {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+    const VK_SHIFT: i32 = 0x10;
+    // SAFETY: 纯查询
+    unsafe { (GetAsyncKeyState(VK_SHIFT) as u16 & 0x8000) != 0 }
+}
+
+/// 中文标点映射：英文符号键 → 中文标点（对齐微软拼音/搜狗）。
+///
+/// `\` → `、` 就是顿号；`/` → `／`。返回 `None` 表示不是标点键，交给应用。
+fn cn_punct(vk: u32, shift: bool) -> Option<&'static str> {
+    Some(match (vk, shift) {
+        (VK_OEM_COMMA, false) => "，",
+        (VK_OEM_COMMA, true) => "《",
+        (VK_OEM_PERIOD, false) => "。",
+        (VK_OEM_PERIOD, true) => "》",
+        (VK_OEM_1, false) => "；",
+        (VK_OEM_1, true) => "：",
+        (VK_OEM_2, false) => "／",
+        (VK_OEM_2, true) => "？",
+        (VK_OEM_3, false) => "·",
+        (VK_OEM_4, false) => "【",
+        (VK_OEM_4, true) => "「",
+        (VK_OEM_5, false) => "、",
+        (VK_OEM_5, true) => "｜",
+        (VK_OEM_6, false) => "】",
+        (VK_OEM_6, true) => "」",
+        (VK_OEM_7, false) => "‘",
+        (VK_OEM_7, true) => "“",
+        (VK_OEM_MINUS, false) => "－",
+        (VK_OEM_MINUS, true) => "—",
+        (VK_OEM_PLUS, false) => "＝",
+        (VK_OEM_PLUS, true) => "＋",
+        _ => return None,
+    })
+}
+
+const VK_OEM_1: u32 = 0xBA;
+const VK_OEM_2: u32 = 0xBF;
+const VK_OEM_3: u32 = 0xC0;
+const VK_OEM_4: u32 = 0xDB;
+const VK_OEM_5: u32 = 0xDC;
+const VK_OEM_6: u32 = 0xDD;
+const VK_OEM_7: u32 = 0xDE;
+const VK_OEM_MINUS: u32 = 0xBD;
+const VK_OEM_PLUS: u32 = 0xBB;
+const VK_OEM_COMMA: u32 = 0xBC;
+const VK_OEM_PERIOD: u32 = 0xBE;
 
 /// 注册类接口在"已存在"时返回 S_FALSE(HRESULT 1)，windows-rs 会当成 Err。
 /// 这里把 S_FALSE 视为成功，让重复注册变成幂等操作。
