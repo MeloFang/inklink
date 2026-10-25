@@ -1199,7 +1199,9 @@ fn cn_punct(vk: u32, shift: bool) -> Option<&'static str> {
         (VK_OEM_COMMA, false) => "，",
         (VK_OEM_PERIOD, false) => "。",
         (VK_OEM_1, false) => "；",
-        (VK_OEM_2, false) => "／",
+        // `/` 和 `\` 都出顿号：主流输入法里 `/` 就是顿号。
+        // 之前 `/` 映射成全角 `／`，看起来跟 `/` 一样，用户以为没转换。
+        (VK_OEM_2, false) => "、",
         (VK_OEM_3, false) => "·",
         (VK_OEM_4, false) => "【",
         (VK_OEM_5, false) => "、",
@@ -1611,7 +1613,7 @@ mod tests {
         assert_eq!(cn_punct(VK_OEM_COMMA, false), Some("，"));
         assert_eq!(cn_punct(VK_OEM_PERIOD, false), Some("。"));
         assert_eq!(cn_punct(VK_OEM_1, false), Some("；"));
-        assert_eq!(cn_punct(VK_OEM_2, false), Some("／"));
+        assert_eq!(cn_punct(VK_OEM_2, false), Some("、"), "斜杠也出顿号");
         assert_eq!(cn_punct(VK_OEM_4, false), Some("【"));
         assert_eq!(cn_punct(VK_OEM_6, false), Some("】"));
         assert_eq!(cn_punct(VK_OEM_MINUS, false), Some("－"));
