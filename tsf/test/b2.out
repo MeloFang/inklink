@@ -1,7 +1,0 @@
-test-harness.cc
-test-harness.cc(172): error C2001: newline in constant
-test-harness.cc(172): error C2015: too many characters in constant
-test-harness.cc(175): error C2143: syntax error: missing ';' before 'if'
-test-harness.cc(182): error C2001: newline in constant
-test-harness.cc(182): error C2137: empty character constant
-test-harness.cc(185): error C2146: syntax error: missing ';' before identifier 'edit_clear'

@@ -51,3 +51,15 @@ Thumbs.db
 # 安装包产物（二进制与 zip 不进 git；脚本与说明保留）
 /dist/*/files/
 /dist/*.zip
+
+# 调试残留（编译日志、临时输出、截图）
+/tmp/
+*.out
+*.err
+*.obj
+/dist/*.out
+/dist/*.err
+/dist/*.txt
+/tsf/test/*.exe
+/tsf/test/*.obj
+/app/node_modules/

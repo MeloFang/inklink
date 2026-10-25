@@ -1,8 +1,0 @@
-Copy-Item : The process cannot access the file 'C:\Program Files\inklink\inklink_tsf32.dll' because it is being used by
- another process.
-At C:\dsh\work\inklink\dist\inklink-0.1.0\install.ps1:31 char:1
-+ Copy-Item "$SRC\inklink_tsf32.dll" "$PF\inklink_tsf32.dll"  -Force
-+ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    + CategoryInfo          : NotSpecified: (:) [Copy-Item], IOException
-    + FullyQualifiedErrorId : System.IO.IOException,Microsoft.PowerShell.Commands.CopyItemCommand
- 
