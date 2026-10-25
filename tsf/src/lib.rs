@@ -618,6 +618,11 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
             VK_A..=VK_Z => {
                 // 空闲 + Shift/CapsLock：是要打英文大写，放行给应用
                 if !composing && shift_or_caps() {
+                    log_line(&format!(
+                        "letter passthrough vk={vk:#x} shift={} caps={}",
+                        shift_held(),
+                        caps_on()
+                    ));
                     if shift_held() {
                         self.inner.shift_used.store(true, Ordering::SeqCst);
                     }
@@ -631,12 +636,14 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                 *expanded = false;
                 *sel = 0;
                 log_line(&format!(
-                    "compose buffer={} cursor={} cands={} matched={} top={:?}",
+                    "compose buffer={} cursor={} cands={} matched={} top={:?} caps={} shift={}",
                     *buffer,
                     *cursor,
                     cands.len(),
                     *matched_len,
-                    cands.first()
+                    cands.first(),
+                    caps_on(),
+                    shift_held()
                 ));
                 // 显示候选窗
                 show_cand_window(&buffer, &cands, *page, *expanded, *sel, *self.inner.last_pos.lock().unwrap_or_else(|p| p.into_inner()));
@@ -1136,14 +1143,19 @@ fn ctrl_alt_win_held() -> bool {
 
 /// Shift 按下 或 CapsLock 开着（用户想打英文大写，应交给应用）。
 fn shift_or_caps() -> bool {
-    use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
-    const VK_SHIFT: i32 = 0x10;
+    shift_held() || caps_on()
+}
+
+/// CapsLock 是否开着。
+///
+/// 用 `GetKeyState` 而不是 `GetAsyncKeyState`：后者的低字节（开关状态）
+/// 在 MSDN 里明确标注"不可靠"，实测开了 CapsLock 仍返回 0，导致大写失效。
+/// `GetKeyState` 返回的是"当前线程处理最后一条消息时"的状态，正是我们要的。
+fn caps_on() -> bool {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetKeyState;
     const VK_CAPITAL: i32 = 0x14;
-    // SAFETY: 纯查询；Shift 看高位（按下），CapsLock 看低位（开关状态）
-    unsafe {
-        (GetAsyncKeyState(VK_SHIFT) as u16 & 0x8000) != 0
-            || (GetAsyncKeyState(VK_CAPITAL) as u16 & 0x0001) != 0
-    }
+    // SAFETY: 纯查询
+    unsafe { (GetKeyState(VK_CAPITAL) as u16 & 0x0001) != 0 }
 }
 
 /// 只看 Shift 是否按下（中文标点用，CapsLock 不参与）。
