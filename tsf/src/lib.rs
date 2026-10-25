@@ -433,23 +433,39 @@ impl ITfEditSession_Impl for TextService_Impl {
                 Ok(())
             }
             EditAction::Insert(text) => {
-                // 中文标点：直接替换当前选区，不需要组合
-                log_line(&format!("insert '{text}'"));
+                // 中文标点：直接替换当前选区，不需要组合。
+                // 某些应用（Electron 系）对裸选区 SetText 不认，失败时回退到 SendInput。
                 let utf16: Vec<u16> = text.encode_utf16().collect();
                 let mut sel = [TF_SELECTION::default()];
                 let mut fetched = 0u32;
+                let mut why = "ok";
                 // SAFETY: 标准 TSF 调用
                 unsafe {
-                    ctx.GetSelection(ec, TF_DEFAULT_SELECTION, &mut sel, &mut fetched)?;
-                    if let Some(range) = sel[0].range.as_ref() {
-                        range.SetText(ec, 0, &utf16)?;
-                        range.Collapse(ec, TF_ANCHOR_END)?;
-                        let caret = [TF_SELECTION {
-                            range: std::mem::ManuallyDrop::new(Some(range.clone())),
-                            style: Default::default(),
-                        }];
-                        ctx.SetSelection(ec, &caret)?;
+                    match ctx.GetSelection(ec, TF_DEFAULT_SELECTION, &mut sel, &mut fetched) {
+                        Err(_) => why = "GetSelection failed",
+                        Ok(()) => match sel[0].range.as_ref() {
+                            None => why = "no range",
+                            Some(range) => {
+                                if range.SetText(ec, 0, &utf16).is_err() {
+                                    why = "SetText failed";
+                                } else {
+                                    let _ = range.Collapse(ec, TF_ANCHOR_END);
+                                    let caret = [TF_SELECTION {
+                                        range: std::mem::ManuallyDrop::new(Some(range.clone())),
+                                        style: Default::default(),
+                                    }];
+                                    if ctx.SetSelection(ec, &caret).is_err() {
+                                        why = "SetSelection failed";
+                                    }
+                                }
+                            }
+                        },
                     }
+                }
+                log_line(&format!("insert '{text}' -> {why}"));
+                if why != "ok" {
+                    // TSF 这条路不通，退回注入字符
+                    ipc::send_text(&text);
                 }
                 Ok(())
             }
@@ -576,6 +592,16 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
         // OnTestKeyDown 直接调 OnKeyDown，所以修饰键检查放 OnTestKeyDown 是死代码。
         if ctrl_alt_win_held() {
             return Ok(BOOL(0));
+        }
+
+        // Shift 期间按过任何别的键（包括 ? ! : " 这类要 Shift 的标点），
+        // 就说明这不是"单击切换中英文"，只是用 Shift 打字符。
+        // 少了这一条，打 `?`（Shift+/）会顺便把输入法切到英文。
+        {
+            const VK_SHIFT_ONLY: u32 = 0x10;
+            if vk != VK_SHIFT_ONLY && shift_held() {
+                self.inner.shift_used.store(true, Ordering::SeqCst);
+            }
         }
 
         // 英文模式：所有键原样交给应用（Shift 除外，用 Shift 单击切回中文）
