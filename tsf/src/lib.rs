@@ -571,16 +571,16 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
             return Ok(BOOL(0));
         }
 
-        // 没在拼写时：把英文标点键换成中文标点（`\` → `、` 等）。
-        // 必须在拿 buffer 锁之前判断，否则会和下面的 match 逻辑缠在一起。
+        // 没在拼写、也不在英文模式时：把英文标点键换成中文标点（`\` → `、` 等）。
+        // Shift 按住 / CapsLock 开着 = 英文输入，标点必须原样透传。
         let composing_now = !self
             .inner
             .buffer
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .is_empty();
-        if !composing_now {
-            if let Some(ch) = cn_punct(vk, shift_held()) {
+        if !composing_now && !shift_or_caps() {
+            if let Some(ch) = cn_punct(vk) {
                 self.request_edit(EditAction::Insert(ch.to_string()));
                 return Ok(BOOL(1));
             }
@@ -1119,30 +1119,21 @@ fn shift_held() -> bool {
 
 /// 中文标点映射：英文符号键 → 中文标点（对齐微软拼音/搜狗）。
 ///
-/// `\` → `、` 就是顿号；`/` → `／`。返回 `None` 表示不是标点键，交给应用。
-fn cn_punct(vk: u32, shift: bool) -> Option<&'static str> {
-    Some(match (vk, shift) {
-        (VK_OEM_COMMA, false) => "，",
-        (VK_OEM_COMMA, true) => "《",
-        (VK_OEM_PERIOD, false) => "。",
-        (VK_OEM_PERIOD, true) => "》",
-        (VK_OEM_1, false) => "；",
-        (VK_OEM_1, true) => "：",
-        (VK_OEM_2, false) => "／",
-        (VK_OEM_2, true) => "？",
-        (VK_OEM_3, false) => "·",
-        (VK_OEM_4, false) => "【",
-        (VK_OEM_4, true) => "「",
-        (VK_OEM_5, false) => "、",
-        (VK_OEM_5, true) => "｜",
-        (VK_OEM_6, false) => "】",
-        (VK_OEM_6, true) => "」",
-        (VK_OEM_7, false) => "‘",
-        (VK_OEM_7, true) => "“",
-        (VK_OEM_MINUS, false) => "－",
-        (VK_OEM_MINUS, true) => "—",
-        (VK_OEM_PLUS, false) => "＝",
-        (VK_OEM_PLUS, true) => "＋",
+/// 只在"中文模式且没按 Shift"时调用；`\` → `、` 就是顿号。
+/// 返回 `None` 表示不是标点键，交给应用。
+fn cn_punct(vk: u32) -> Option<&'static str> {
+    Some(match vk {
+        VK_OEM_COMMA => "，",
+        VK_OEM_PERIOD => "。",
+        VK_OEM_1 => "；",
+        VK_OEM_2 => "／",
+        VK_OEM_3 => "·",
+        VK_OEM_4 => "【",
+        VK_OEM_5 => "、",
+        VK_OEM_6 => "】",
+        VK_OEM_7 => "‘",
+        VK_OEM_MINUS => "－",
+        VK_OEM_PLUS => "＝",
         _ => return None,
     })
 }
