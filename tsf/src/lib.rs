@@ -428,6 +428,7 @@ impl ITfEditSession_Impl for TextService_Impl {
             }
             EditAction::Insert(text) => {
                 // 中文标点：直接替换当前选区，不需要组合
+                log_line(&format!("insert '{text}'"));
                 let utf16: Vec<u16> = text.encode_utf16().collect();
                 let mut sel = [TF_SELECTION::default()];
                 let mut fetched = 0u32;
@@ -581,6 +582,7 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
             .is_empty();
         if !composing_now && !shift_or_caps() {
             if let Some(ch) = cn_punct(vk) {
+                log_line(&format!("punct vk={vk:#x} -> {ch}"));
                 self.request_edit(EditAction::Insert(ch.to_string()));
                 return Ok(BOOL(1));
             }

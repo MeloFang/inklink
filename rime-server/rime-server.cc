@@ -157,6 +157,10 @@ static std::vector<std::string> query(const std::string& code) {
     }
     g_last_code = code;
 
+    // 先取一次 preedit：rime 的音节切分会用空格/撇号分隔。
+    // 去掉分隔符后如果和输入一致，说明整串都是合法拼音；否则当成英文。
+    bool looks_pinyin = true;
+
     // 收集当前页 + 往后翻几页，凑够 MAX_CANDS 个候选
     for (int page = 0; page < 6 && (int)out.size() < MAX_CANDS; page++) {
         RimeContext ctx;
@@ -178,6 +182,29 @@ static std::vector<std::string> query(const std::string& code) {
 
     // 翻回第一页，这样后续"选词上报"按数字键时下标才对得上。
     // 注意：这里**不能**清组合，否则紧接着的选词就没候选可选了。
+    // 英文候选：把原始输入作为一个候选追加（github、vscode 这类英文词）。
+    // librime 只认拼音，纯英文会被切成 给/过/跟，用户就没法直接上屏英文了。
+    if (code.size() >= 2) {
+        bool is_pure_alpha = true;
+        for (char c : code) {
+            if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'))) { is_pure_alpha = false; break; }
+        }
+        // 前 5 个候选全是单字（且输入较长）→ 基本可以断定不是拼音，是英文
+        bool all_single = !out.empty();
+        for (size_t i = 0; i < out.size() && i < 5; i++) {
+            if (out[i].size() != 3) { all_single = false; break; }
+        }
+        looks_pinyin = !(all_single && code.size() >= 5);
+
+        if (is_pure_alpha && out.size() < (size_t)MAX_CANDS) {
+            auto it = std::find(out.begin(), out.end(), code);
+            if (it == out.end()) {
+                // 不像拼音的（github/vscode）排最前；像拼音的（wang）排最后当兜底
+                if (!looks_pinyin) out.insert(out.begin(), code);
+                else out.push_back(code);
+            }
+        }
+    }
     // 组合留着，下次查询开头会清
     return out;
 }
