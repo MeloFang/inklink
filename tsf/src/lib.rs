@@ -549,7 +549,7 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
     ) -> windows::core::Result<BOOL> {
         let vk = wparam.0 as u32;
         let composing = !self.inner.buffer.lock().unwrap_or_else(|p| p.into_inner()).is_empty();
-        let claim = should_claim(vk, composing, shift_held(), caps_on());
+        let claim = should_claim(vk, composing, shift_held(), caps_on(), self.inner.english_mode.load(Ordering::SeqCst));
         log_line(&format!("test vk={vk} claim={claim} composing={composing}"));
         Ok(BOOL(if claim { 1 } else { 0 }))
     }
@@ -1024,7 +1024,7 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
 ///   Tab、CapsLock、Shift、Enter、空格、方向键、退格、符号 → 全部放行给应用
 ///
 /// `shift` / `caps` 显式传进来（而不是内部查键盘），这样纯逻辑可单测。
-fn should_claim(vk: u32, composing: bool, shift: bool, caps: bool) -> bool {
+fn should_claim(vk: u32, composing: bool, shift: bool, caps: bool, english: bool) -> bool {
     const VK_BACK: u32 = 0x08;
     const VK_RETURN: u32 = 0x0D;
     const VK_ESCAPE: u32 = 0x1B;
@@ -1047,6 +1047,13 @@ fn should_claim(vk: u32, composing: bool, shift: bool, caps: bool) -> bool {
 
     // 快捷键永远放行
     if ctrl_alt_win_held() {
+        return false;
+    }
+
+    // 英文模式：一律不认领。
+    // 注意不能"认领后再在 OnKeyDown 里返回 FALSE"——WPS 这类应用认领了就不给回，
+    // 表现为一个字母都打不出来。
+    if english {
         return false;
     }
 
@@ -1578,39 +1585,39 @@ mod tests {
 
     #[test]
     fn 空闲时普通字母要认领() {
-        assert!(should_claim(VK_A_KEY, false, false, false));
-        assert!(should_claim(VK_N_KEY, false, false, false));
+        assert!(should_claim(VK_A_KEY, false, false, false, false));
+        assert!(should_claim(VK_N_KEY, false, false, false, false));
     }
 
     #[test]
     fn 空闲时带_shift_或_capslock_的字母不认领() {
         // 这是大写/英文的入口：必须放行给应用
-        assert!(!should_claim(VK_A_KEY, false, true, false), "Shift 按住应放行");
-        assert!(!should_claim(VK_A_KEY, false, false, true), "CapsLock 开着应放行");
+        assert!(!should_claim(VK_A_KEY, false, true, false, false), "Shift 按住应放行");
+        assert!(!should_claim(VK_A_KEY, false, false, true, false), "CapsLock 开着应放行");
     }
 
     #[test]
     fn 空闲时标点和功能键不认领() {
-        assert!(!should_claim(VK_SPACE_KEY, false, false, false));
-        assert!(!should_claim(VK_RETURN_KEY, false, false, false));
-        assert!(!should_claim(VK_TAB_KEY, false, false, false));
-        assert!(!should_claim(VK_LEFT_KEY, false, false, false));
-        assert!(should_claim(VK_OEM_5, false, false, false), "标点键必须认领，否则不调 OnKeyDown");
+        assert!(!should_claim(VK_SPACE_KEY, false, false, false, false));
+        assert!(!should_claim(VK_RETURN_KEY, false, false, false, false));
+        assert!(!should_claim(VK_TAB_KEY, false, false, false, false));
+        assert!(!should_claim(VK_LEFT_KEY, false, false, false, false));
+        assert!(should_claim(VK_OEM_5, false, false, false, false), "标点键必须认领，否则不调 OnKeyDown");
     }
 
     #[test]
     fn 拼写中认领候选操作键() {
-        assert!(should_claim(VK_A_KEY, true, false, false));
-        assert!(should_claim(VK_SPACE_KEY, true, false, false));
-        assert!(should_claim(VK_RETURN_KEY, true, false, false));
-        assert!(should_claim(VK_BACK_KEY, true, false, false));
-        assert!(should_claim(VK_ESCAPE_KEY, true, false, false));
-        assert!(should_claim(VK_LEFT_KEY, true, false, false));
+        assert!(should_claim(VK_A_KEY, true, false, false, false));
+        assert!(should_claim(VK_SPACE_KEY, true, false, false, false));
+        assert!(should_claim(VK_RETURN_KEY, true, false, false, false));
+        assert!(should_claim(VK_BACK_KEY, true, false, false, false));
+        assert!(should_claim(VK_ESCAPE_KEY, true, false, false, false));
+        assert!(should_claim(VK_LEFT_KEY, true, false, false, false));
     }
 
     #[test]
     fn 拼写中不认领_tab() {
-        assert!(!should_claim(VK_TAB_KEY, true, false, false));
+        assert!(!should_claim(VK_TAB_KEY, true, false, false, false));
     }
 
     #[test]
@@ -1655,33 +1662,44 @@ mod punct_claim_tests {
     #[test]
     fn 标点键必须认领否则微信里不转换() {
         // 微信这类应用：OnTestKeyDown 返回 false 就不调 OnKeyDown
-        assert!(should_claim(VK_OEM_5, false, false, false), "反斜杠");
-        assert!(should_claim(VK_SLASH, false, false, false), "斜杠");
-        assert!(should_claim(VK_OEM_COMMA, false, false, false), "逗号");
-        assert!(should_claim(VK_OEM_PERIOD, false, false, false), "句号");
+        assert!(should_claim(VK_OEM_5, false, false, false, false), "反斜杠");
+        assert!(should_claim(VK_SLASH, false, false, false, false), "斜杠");
+        assert!(should_claim(VK_OEM_COMMA, false, false, false, false), "逗号");
+        assert!(should_claim(VK_OEM_PERIOD, false, false, false, false), "句号");
     }
 
     #[test]
     fn 标点带_shift_也要认领() {
         // Shift+/ 要出 ？，必须认领后才能转换
-        assert!(should_claim(VK_SLASH, false, true, false));
-        assert!(should_claim(VK_OEM_1, false, true, false), "Shift+; 要出 ：");
+        assert!(should_claim(VK_SLASH, false, true, false, false));
+        assert!(should_claim(VK_OEM_1, false, true, false, false), "Shift+; 要出 ：");
     }
 
     #[test]
     fn capslock_开着时不认领标点() {
         // CapsLock = 英文模式，标点保持英文
-        assert!(!should_claim(VK_OEM_5, false, false, true));
-        assert!(!should_claim(VK_SLASH, false, false, true));
+        assert!(!should_claim(VK_OEM_5, false, false, true, false));
+        assert!(!should_claim(VK_SLASH, false, false, true, false));
+    }
+
+    #[test]
+    fn 英文模式下一律不认领() {
+        // 关键：WPS/Excel 这类应用，认领后 OnKeyDown 返回 FALSE 也不给回，
+        // 表现为一个字母都打不出来。所以英文模式必须完全不认领。
+        assert!(!should_claim(VK_A_KEY, false, false, false, true), "字母");
+        assert!(!should_claim(VK_OEM_5, false, false, false, true), "标点");
+        assert!(!should_claim(VK_SLASH, false, false, false, true), "斜杠");
+        assert!(!should_claim(VK_SPACE_KEY, false, false, false, true), "空格");
     }
 
     #[test]
     fn 空闲时功能键仍不认领() {
-        assert!(!should_claim(VK_TAB_KEY, false, false, false));
-        assert!(!should_claim(VK_SHIFT_KEY, false, false, false));
-        assert!(!should_claim(VK_SPACE_KEY, false, false, false));
+        assert!(!should_claim(VK_TAB_KEY, false, false, false, false));
+        assert!(!should_claim(VK_SHIFT_KEY, false, false, false, false));
+        assert!(!should_claim(VK_SPACE_KEY, false, false, false, false));
     }
 
+    const VK_A_KEY: u32 = 0x41;
     const VK_TAB_KEY: u32 = 0x09;
     const VK_SHIFT_KEY: u32 = 0x10;
     const VK_SPACE_KEY: u32 = 0x20;
