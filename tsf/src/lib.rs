@@ -24,6 +24,7 @@ use windows::Win32::UI::TextServices::{
 };
 mod ipc;
 mod candwin;
+mod pinyin;
 use windows::core::{GUID, HRESULT, Interface, Ref, implement};
 use windows::core::IUnknownImpl;
 
@@ -83,6 +84,10 @@ enum EditAction {
     MoveCaret(usize),
     /// 提交：把组合串替换成最终文字，然后结束组合
     Commit(String),
+    /// 只上屏一部分：先把 `picked` 定格成真正的文本，再在它后面开一个新的组合串
+    /// 装剩下的拼音 `rest`（光标放在 `rest` 末尾）。这样 `pikeqiu` 选完「皮」
+    /// 之后，文章里已经落下「皮」，而候选窗继续给 `keqiu` 的候选。
+    PickCompose(String, String),
     /// 取消：结束组合，清空
     Cancel,
     /// 插入一段文字到当前选区（中文标点用，没有组合）
@@ -415,6 +420,59 @@ impl ITfEditSession_Impl for TextService_Impl {
                     .unwrap_or_else(|p| p.into_inner()) = None;
                 Ok(())
             }
+            EditAction::PickCompose(picked, rest) => {
+                // 第一步：把已选的字定格成真正的文本（结束组合），光标停到它后面。
+                // 和 Commit 一样要打 self_terminating，否则 OnCompositionTerminated
+                // 会把刚上屏的字擦掉。
+                if let Some(c) = comp {
+                    let pick16: Vec<u16> = picked.encode_utf16().collect();
+                    let range = unsafe { c.GetRange()? };
+                    unsafe { range.SetText(ec, 0, &pick16)? };
+                    self.inner.self_terminating.store(true, Ordering::SeqCst);
+                    let end_res = unsafe { c.EndComposition(ec) };
+                    self.inner.self_terminating.store(false, Ordering::SeqCst);
+                    end_res?;
+                    unsafe { range.Collapse(ec, TF_ANCHOR_END)? };
+                    let sel = [TF_SELECTION {
+                        range: std::mem::ManuallyDrop::new(Some(range)),
+                        style: Default::default(),
+                    }];
+                    unsafe { ctx.SetSelection(ec, &sel)? };
+                }
+                *self
+                    .inner
+                    .composition
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner()) = None;
+
+                // 第二步：在光标处开一个新的组合串装剩下的拼音
+                let mut sel = [TF_SELECTION::default()];
+                let mut fetched = 0u32;
+                // SAFETY: 标准 TSF 调用
+                unsafe {
+                    ctx.GetSelection(ec, TF_DEFAULT_SELECTION, &mut sel, &mut fetched)?;
+                }
+                let Some(start_range) = sel[0].range.as_ref() else {
+                    return Ok(());
+                };
+                let rest16: Vec<u16> = rest.encode_utf16().collect();
+                let sink: ITfCompositionSink = self.to_interface();
+                let ctx_comp: ITfContextComposition = ctx.cast()?;
+                // SAFETY: 标准 TSF 调用
+                let c = unsafe { ctx_comp.StartComposition(ec, start_range, &sink)? };
+                let range = unsafe { c.GetRange()? };
+                unsafe { range.SetText(ec, 0, &rest16)? };
+                self.place_caret(&ctx, ec, &range, rest.len())?;
+                let pos = text_ext_pos(&ctx, ec, &range);
+                *self.inner.last_pos.lock().unwrap_or_else(|p| p.into_inner()) = pos;
+                self.refresh_cand_window();
+                *self
+                    .inner
+                    .composition
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner()) = Some(c);
+                Ok(())
+            }
             EditAction::Cancel => {
                 if let Some(c) = comp {
                     let range = unsafe { c.GetRange()? };
@@ -633,10 +691,21 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
         // 不在这里拦，就会被当成中文标点，把「想」提交进文章（v20 的错误）。
         // 注意：分隔符只影响显示与最终原样上屏，查询引擎前会去掉（见 query_with_fallback）。
         if composing_now {
-            let sep = match (vk, shift_held()) {
-                (VK_OEM_MINUS, true) => Some('_'),
-                (VK_OEM_MINUS, false) => Some('-'),
-                _ => None,
+            // 展开成 5×5 时，`-` / `=` 是翻页键（用户要求"加减键切换行数"）；
+            // 收起时 `-` 才是拼音分词符。展开态是临时的导航态（打字会收起），
+            // 所以按 `-` 只可能是在翻候选。
+            let is_expanded = {
+                let e = self.inner.expanded.lock().unwrap_or_else(|p| p.into_inner());
+                *e
+            };
+            let sep = if is_expanded {
+                None
+            } else {
+                match (vk, shift_held()) {
+                    (VK_OEM_MINUS, true) => Some('_'),
+                    (VK_OEM_MINUS, false) => Some('-'),
+                    _ => None,
+                }
             };
             if let Some(sep) = sep {
                 let mut buffer = self.inner.buffer.lock().unwrap_or_else(|p| p.into_inner());
@@ -956,23 +1025,27 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                     Ok(BOOL(0))
                 }
             }
-            // 空格：上屏当前选中的候选
+            // 空格：上屏当前选中的候选（选完可能还剩拼音，留给 apply_pick 判断）
             VK_SPACE => {
                 let pick_idx = *page * page_size(*expanded) + *sel;
-                if let Some(top) = cands.get(pick_idx).cloned() {
-                    // 上报选词，让引擎写进用户词库（失败不影响上屏）
-                    ipc::select(pick_idx);
-                    // 上屏后清空整个缓冲——多余/打错的字母一并删掉（用户要求）
-                    buffer.clear();
-                    cands.clear();
-                    *matched_len = 0;
-                    *cursor = 0;
-                    candwin::hide();
-                    log_line(&format!("commit {top}"));
-                    self.request_edit(EditAction::Commit(top));
-                    Ok(BOOL(1))
-                } else {
-                    Ok(BOOL(0))
+                let pos = *self.inner.last_pos.lock().unwrap_or_else(|p| p.into_inner());
+                match apply_pick(
+                    pick_idx,
+                    &mut cands,
+                    &mut buffer,
+                    &mut cursor,
+                    &mut matched_len,
+                    &mut page,
+                    &mut expanded,
+                    &mut sel,
+                    pos,
+                ) {
+                    Some(action) => {
+                        log_line(&format!("pick {pick_idx} buffer={buffer}"));
+                        self.request_edit(action);
+                        Ok(BOOL(1))
+                    }
+                    None => Ok(BOOL(0)),
                 }
             }
             // 回车：把当前拼音原样上屏（等于直接打英文），是打错后的恢复通道
@@ -1014,26 +1087,41 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                     Ok(BOOL(0))
                 }
             }
-            // 数字键：选当前页第 N 个候选
+            // 数字键：选**当前这一行**的第 N 个候选
+            //
+            // 展开成 5×5 后不再从 1 标到 25 —— 只给选中那一行标 1~5，
+            // 上下键换行，左右键/数字键在行内选（用户要求）。
             VK_0..=VK_9 => {
                 if buffer.is_empty() {
                     return Ok(BOOL(0));
                 }
                 let idx = (vk - VK_0) as usize;
-                if idx >= 1 {
-                    // 页内序号 → 全局下标
-                    *sel = idx - 1;
-                    let global = *page * page_size(*expanded) + (idx - 1);
-                    if let Some(pick) = cands.get(global).cloned() {
-                        ipc::select(global);
-                        buffer.clear();
-                        cands.clear();
-                        *matched_len = 0;
-                        *cursor = 0;
-                        candwin::hide();
-                        log_line(&format!("commit {pick}"));
-                        self.request_edit(EditAction::Commit(pick));
-                        return Ok(BOOL(1));
+                if idx >= 1 && idx <= GRID_COLS {
+                    let row = *sel / GRID_COLS;
+                    let local = row * GRID_COLS + (idx - 1);
+                    let page_len = cands
+                        .len()
+                        .saturating_sub(*page * page_size(*expanded))
+                        .min(page_size(*expanded));
+                    if local < page_len {
+                        *sel = local;
+                        let global = *page * page_size(*expanded) + local;
+                        let pos = *self.inner.last_pos.lock().unwrap_or_else(|p| p.into_inner());
+                        if let Some(action) = apply_pick(
+                            global,
+                            &mut cands,
+                            &mut buffer,
+                            &mut cursor,
+                            &mut matched_len,
+                            &mut page,
+                            &mut expanded,
+                            &mut sel,
+                            pos,
+                        ) {
+                            log_line(&format!("pick(number {idx}) buffer={buffer}"));
+                            self.request_edit(action);
+                            return Ok(BOOL(1));
+                        }
                     }
                 }
                 Ok(BOOL(1))
@@ -1283,6 +1371,97 @@ fn text_ext_pos(ctx: &ITfContext, ec: u32, range: &ITfRange) -> Option<(i32, i32
 /// `xiang-mu` 送进引擎前变成 `xiangmu`，才能查到「项目」。
 fn strip_separators(code: &str) -> String {
     code.chars().filter(|c| *c != '-' && *c != '_').collect()
+}
+
+/// 缓冲里消耗掉 `letters` 个字母后，该剪到的字节下标。
+///
+/// 缓冲里可能有分词符（`xiang-mu`），所以字母数不能直接当字节下标用。
+fn consumed_index(raw: &str, letters: usize) -> usize {
+    let mut seen = 0usize;
+    for (i, ch) in raw.char_indices() {
+        if seen >= letters {
+            return i;
+        }
+        if ch != '-' && ch != '_' {
+            seen += 1;
+        }
+    }
+    raw.len()
+}
+
+/// 这串拼音里还有没有元音？没有（`x`、`ng`）就是打错的辅音，可以直接丢掉。
+fn has_vowel(s: &str) -> bool {
+    s.chars().any(|c| matches!(c, 'a' | 'e' | 'i' | 'o' | 'u' | 'v'))
+}
+
+/// 选中第 `pick_idx` 个候选之后怎么收场，返回要执行的编辑动作。
+///
+/// 规则（用户要求，见对话）：选掉几个字，就只从拼音里剪掉这几个字对应的音节，
+/// 剩下的拼音**留在组合串里继续选**；而不是像以前那样整串清空。
+///
+/// `pikeqiu` → 选「皮」→ 文章里落下「皮」，候选窗接着显示 `keqiu` 的候选
+/// → 选「克」→ 接着 `qiu` → 选「球」→ 没有剩余，正常提交。
+///
+/// 剩余部分为空、没有元音、或者查不到候选时收尾：把选中的字上屏，
+/// 多打/打错的字母一起丢掉。
+#[allow(clippy::too_many_arguments)]
+fn apply_pick(
+    pick_idx: usize,
+    cands: &mut Vec<String>,
+    buffer: &mut String,
+    cursor: &mut usize,
+    matched_len: &mut usize,
+    page: &mut usize,
+    expanded: &mut bool,
+    sel: &mut usize,
+    pos: Option<(i32, i32)>,
+) -> Option<EditAction> {
+    let pick = cands.get(pick_idx)?.clone();
+    // 上报选词，让引擎记录用户偏好（失败不影响上屏）
+    ipc::select(pick_idx);
+
+    let stripped = strip_separators(buffer);
+    let chars = pick.chars().count();
+    // 这次选掉的字消耗多少个拼音字母；整串都切不出音节（英文候选）就按整串算
+    let mut used = pinyin::consumed_letters(&stripped, chars);
+    if used == 0 || used >= stripped.len() {
+        used = stripped.len();
+    }
+    let cut = consumed_index(buffer, used);
+    let rest: String = buffer[cut..].trim_start_matches(['-', '_']).to_string();
+
+    // 还剩有效拼音吗？
+    let mut cont = None;
+    if !rest.is_empty() && has_vowel(&rest) {
+        let (rc, rm) = query_with_fallback(&rest);
+        if !rc.is_empty() {
+            cont = Some((rc, rm));
+        }
+    }
+
+    let Some((rc, rm)) = cont else {
+        // 收尾
+        buffer.clear();
+        cands.clear();
+        *matched_len = 0;
+        *cursor = 0;
+        *page = 0;
+        *expanded = false;
+        *sel = 0;
+        candwin::hide();
+        return Some(EditAction::Commit(pick));
+    };
+
+    // 继续拼剩下的拼音
+    *buffer = rest;
+    *cursor = buffer.len();
+    *cands = rc;
+    *matched_len = rm;
+    *page = 0;
+    *expanded = false;
+    *sel = 0;
+    show_cand_window(buffer, cands, *page, *expanded, *sel, pos);
+    Some(EditAction::PickCompose(pick, buffer.clone()))
 }
 
 fn query_with_fallback(code: &str) -> (Vec<String>, usize) {

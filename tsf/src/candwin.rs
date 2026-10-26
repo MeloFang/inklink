@@ -260,13 +260,22 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let cands = CANDIDATES.lock().unwrap().clone();
             let cell_w = cell_width(&cands);
             let sel = SELECTED.load(Ordering::SeqCst);
+            // 只给「选中项所在的那一行」标数字 1~5。
+            //
+            // 展开成 5×5 后如果从 1 标到 25，数字会和上下键/左右键的行列语义
+            // 冲突（用户看不出「2」到底是这行的第 2 个还是整页第 2 个）。
+            // 现在一行一标，上下换行、左右/数字选行内。
+            let sel_row = sel / COLS;
             for (i, c) in cands.iter().enumerate() {
                 let col = (i % COLS) as i32;
                 let row = (i / COLS) as i32;
                 let x = PAD + col * cell_w;
                 let y = PAD + PINYIN_H + row * ROW_H;
-                let color = if i == sel { SEL_COLOR } else { NUM_COLOR };
-                draw_text(hdc, x, y, &format!("{}.", i + 1), color, ROW_H);
+                if i / COLS == sel_row {
+                    let color = if i == sel { SEL_COLOR } else { NUM_COLOR };
+                    draw_text(hdc, x, y, &format!("{}.", col + 1), color, ROW_H);
+                }
+                // 非选中行不画数字，但文字仍从 x+22 起，保证上下行对齐
                 let txt_color = if i == sel { SEL_COLOR } else { TEXT_COLOR };
                 draw_text(hdc, x + 22, y, c, txt_color, ROW_H);
             }
