@@ -980,7 +980,10 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
         _wparam: WPARAM,
         _lparam: LPARAM,
     ) -> windows::core::Result<BOOL> {
-        Ok(BOOL(0))
+        // 必须认领 key-up：TSF 只在 OnTestKeyUp 返回 TRUE 时才调 OnKeyUp，
+        // 而 Shift 单击切换中英文就发生在 OnKeyUp 里。
+        // （微信里不认领 = Shift 永远切不了英文，DSH 里碰巧会直接调所以没暴露）
+        Ok(BOOL(1))
     }
 
     fn OnKeyUp(
@@ -1072,7 +1075,14 @@ fn should_claim(vk: u32, composing: bool, shift: bool, caps: bool) -> bool {
     }
 
     // 空闲：只有"无 Shift/CapsLock 的纯字母"才启动拼写
+    // 纯字母（无 Shift/CapsLock）→ 认领，开始拼写
     if (VK_A..=VK_Z).contains(&vk) && !shift && !caps {
+        return true;
+    }
+    // 中文标点键 → 也要认领。
+    // 关键：微信这类应用在 OnTestKeyDown 返回 false 时**不会调用 OnKeyDown**，
+    // 不认领就等于标点转换代码永远不执行（表现为标点保持英文）。
+    if !caps && cn_punct(vk, shift).is_some() {
         return true;
     }
     false
@@ -1585,7 +1595,7 @@ mod tests {
         assert!(!should_claim(VK_RETURN_KEY, false, false, false));
         assert!(!should_claim(VK_TAB_KEY, false, false, false));
         assert!(!should_claim(VK_LEFT_KEY, false, false, false));
-        assert!(!should_claim(VK_OEM_5, false, false, false), "反斜杠交给标点逻辑");
+        assert!(should_claim(VK_OEM_5, false, false, false), "标点键必须认领，否则不调 OnKeyDown");
     }
 
     #[test]
@@ -1635,4 +1645,44 @@ mod tests {
         assert_eq!(cn_punct(VK_A_KEY, false), None);
         assert_eq!(cn_punct(VK_SPACE_KEY, false), None);
     }
+}
+#[cfg(test)]
+mod punct_claim_tests {
+    use super::*;
+
+    const VK_SLASH: u32 = 0xBF;
+
+    #[test]
+    fn 标点键必须认领否则微信里不转换() {
+        // 微信这类应用：OnTestKeyDown 返回 false 就不调 OnKeyDown
+        assert!(should_claim(VK_OEM_5, false, false, false), "反斜杠");
+        assert!(should_claim(VK_SLASH, false, false, false), "斜杠");
+        assert!(should_claim(VK_OEM_COMMA, false, false, false), "逗号");
+        assert!(should_claim(VK_OEM_PERIOD, false, false, false), "句号");
+    }
+
+    #[test]
+    fn 标点带_shift_也要认领() {
+        // Shift+/ 要出 ？，必须认领后才能转换
+        assert!(should_claim(VK_SLASH, false, true, false));
+        assert!(should_claim(VK_OEM_1, false, true, false), "Shift+; 要出 ：");
+    }
+
+    #[test]
+    fn capslock_开着时不认领标点() {
+        // CapsLock = 英文模式，标点保持英文
+        assert!(!should_claim(VK_OEM_5, false, false, true));
+        assert!(!should_claim(VK_SLASH, false, false, true));
+    }
+
+    #[test]
+    fn 空闲时功能键仍不认领() {
+        assert!(!should_claim(VK_TAB_KEY, false, false, false));
+        assert!(!should_claim(VK_SHIFT_KEY, false, false, false));
+        assert!(!should_claim(VK_SPACE_KEY, false, false, false));
+    }
+
+    const VK_TAB_KEY: u32 = 0x09;
+    const VK_SHIFT_KEY: u32 = 0x10;
+    const VK_SPACE_KEY: u32 = 0x20;
 }
