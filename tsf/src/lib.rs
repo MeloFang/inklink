@@ -581,6 +581,8 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
         const VK_OEM_PLUS: u32 = 0xBB;
         const VK_OEM_COMMA: u32 = 0xBC;
         const VK_OEM_PERIOD: u32 = 0xBE;
+        const VK_PRIOR: u32 = 0x21;
+        const VK_NEXT: u32 = 0x22;
 
         let vk = wparam.0 as u32;
 
@@ -624,6 +626,53 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .is_empty();
+
+        // 拼写中打 `-` / `_`：这是拼音里的分词符（写标识符用），
+        // 直接进组合串，像字母一样参与拼写。
+        //   xiang-mu → 输入法里显示 xiang-mu，候选照常出，回车原样上屏 xiang-mu
+        // 不在这里拦，就会被当成中文标点，把「想」提交进文章（v20 的错误）。
+        // 注意：分隔符只影响显示与最终原样上屏，查询引擎前会去掉（见 query_with_fallback）。
+        if composing_now {
+            let sep = match (vk, shift_held()) {
+                (VK_OEM_MINUS, true) => Some('_'),
+                (VK_OEM_MINUS, false) => Some('-'),
+                _ => None,
+            };
+            if let Some(sep) = sep {
+                let mut buffer = self.inner.buffer.lock().unwrap_or_else(|p| p.into_inner());
+                let mut cands = self.inner.cands.lock().unwrap_or_else(|p| p.into_inner());
+                let mut matched_len =
+                    self.inner.matched_len.lock().unwrap_or_else(|p| p.into_inner());
+                let mut cursor = self.inner.cursor.lock().unwrap_or_else(|p| p.into_inner());
+                let mut page = self.inner.page.lock().unwrap_or_else(|p| p.into_inner());
+                let mut expanded = self.inner.expanded.lock().unwrap_or_else(|p| p.into_inner());
+                let mut sel = self.inner.sel.lock().unwrap_or_else(|p| p.into_inner());
+                let at = (*cursor).min(buffer.len());
+                buffer.insert(at, sep);
+                *cursor = at + 1;
+                (*cands, *matched_len) = query_with_fallback(&buffer);
+                *page = 0;
+                *expanded = false;
+                *sel = 0;
+                log_line(&format!(
+                    "compose(sep {sep}) buffer={} cursor={} cands={}",
+                    *buffer,
+                    *cursor,
+                    cands.len()
+                ));
+                show_cand_window(
+                    &buffer,
+                    &cands,
+                    *page,
+                    *expanded,
+                    *sel,
+                    *self.inner.last_pos.lock().unwrap_or_else(|p| p.into_inner()),
+                );
+                self.request_edit(EditAction::Compose(buffer.clone(), *cursor));
+                return Ok(BOOL(1));
+            }
+        }
+
         if !caps_on() {
             let shift = shift_held();
             let is_paging = (vk == VK_OEM_MINUS || vk == VK_OEM_PLUS) && !shift;
@@ -640,26 +689,6 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                         let mut expanded =
                             self.inner.expanded.lock().unwrap_or_else(|p| p.into_inner());
                         let mut sel = self.inner.sel.lock().unwrap_or_else(|p| p.into_inner());
-                        // 下划线是标识符/文件名的分隔符，中文正文里几乎不用。
-                        // 拼写中按下划线 = "我要原样 ASCII"：
-                        // 上屏拼音原文 + `_`，并切到英文模式，
-                        // 这样 xiang + Shift+- + mu 直接打出 xiang_mu，不用先手动切英文。
-                        if ch == "_" {
-                            let raw = buffer.clone();
-                            buffer.clear();
-                            cands.clear();
-                            *matched_len = 0;
-                            *cursor = 0;
-                            *page = 0;
-                            *expanded = false;
-                            *sel = 0;
-                            candwin::hide();
-                            self.inner.english_mode.store(true, Ordering::SeqCst);
-                            let text = format!("{raw}_");
-                            log_line(&format!("commit-raw(underscore) {text} english=true"));
-                            self.request_edit(EditAction::Commit(text));
-                            return Ok(BOOL(1));
-                        }
                         let idx = *page * page_size(*expanded) + *sel;
                         let head = cands.get(idx).cloned().unwrap_or_default();
                         let text = format!("{head}{ch}");
@@ -887,8 +916,9 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                     Ok(BOOL(0))
                 }
             }
-            // - / , ：上一页（展开时首页则收起）
-            VK_OEM_MINUS => {
+            // PageUp / `-`：上一页（展开时首页则收起）
+            // `-` 拼写中已改为分词符，这里只剩 PageUp 实际可达，留着不碍事。
+            VK_OEM_MINUS | VK_PRIOR => {
                 if composing {
                     if *expanded {
                         if *page > 0 {
@@ -906,8 +936,8 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                     Ok(BOOL(0))
                 }
             }
-            // = / . ：下一页（收起时先展开）
-            VK_OEM_PLUS => {
+            // PageDown / `=`：下一页（收起时先展开）
+            VK_OEM_PLUS | VK_NEXT => {
                 if composing {
                     if !*expanded {
                         *expanded = true;
@@ -1132,6 +1162,8 @@ fn should_claim(vk: u32, composing: bool, shift: bool, caps: bool, english: bool
     const VK_OEM_PLUS: u32 = 0xBB;
     const VK_OEM_COMMA: u32 = 0xBC;
     const VK_OEM_PERIOD: u32 = 0xBE;
+    const VK_PRIOR: u32 = 0x21;
+    const VK_NEXT: u32 = 0x22;
 
     // 快捷键永远放行
     if ctrl_alt_win_held() {
@@ -1168,6 +1200,8 @@ fn should_claim(vk: u32, composing: bool, shift: bool, caps: bool, english: bool
                 | VK_DOWN
                 | VK_OEM_MINUS
                 | VK_OEM_PLUS
+                | VK_PRIOR
+                | VK_NEXT
                 | VK_OEM_COMMA
                 | VK_OEM_PERIOD
         );
@@ -1243,11 +1277,20 @@ fn text_ext_pos(ctx: &ITfContext, ec: u32, range: &ITfRange) -> Option<(i32, i32
 /// 查候选；整串查不到就逐步缩短，返回 (候选, 命中的前缀长度)。
 ///
 /// 这样 `xiangmm` 会退到 `xiang` 出候选，而不是整串查不到直接卡死。
+/// 去掉拼音缓冲里的分词符（`-` / `_`）。
+///
+/// 分隔符只做显示与最终原样上屏，不参与音节匹配：
+/// `xiang-mu` 送进引擎前变成 `xiangmu`，才能查到「项目」。
+fn strip_separators(code: &str) -> String {
+    code.chars().filter(|c| *c != '-' && *c != '_').collect()
+}
+
 fn query_with_fallback(code: &str) -> (Vec<String>, usize) {
+    let code = strip_separators(code);
     if code.is_empty() {
         return (Vec::new(), 0);
     }
-    let mut probe = code.to_string();
+    let mut probe = code;
     while probe.len() >= 1 {
         let r = ipc::query(&probe);
         if !r.is_empty() {
@@ -1705,6 +1748,28 @@ mod tests {
         assert!(should_claim(VK_BACK_KEY, true, false, false, false));
         assert!(should_claim(VK_ESCAPE_KEY, true, false, false, false));
         assert!(should_claim(VK_LEFT_KEY, true, false, false, false));
+    }
+
+    #[test]
+    fn 拼写中认领翻页键() {
+        // `-` 现在是拼音分词符，翻页改由 PageUp/PageDown 承担
+        assert!(should_claim(VK_OEM_MINUS, true, false, false, false), "-");
+        assert!(should_claim(VK_OEM_MINUS, true, true, false, false), "_");
+        assert!(should_claim(0x21, true, false, false, false), "PageUp");
+        assert!(should_claim(0x22, true, false, false, false), "PageDown");
+        // 空闲时不认领 PageUp/PageDown，让应用自己滚文档
+        assert!(!should_claim(0x21, false, false, false, false));
+        assert!(!should_claim(0x22, false, false, false, false));
+    }
+
+    #[test]
+    fn 分词符不参与音节查询() {
+        assert_eq!(strip_separators("xiang-mu"), "xiangmu");
+        assert_eq!(strip_separators("xiang_mu"), "xiangmu");
+        assert_eq!(strip_separators("xiang-mu-"), "xiangmu");
+        assert_eq!(strip_separators("xiangmu"), "xiangmu");
+        assert_eq!(strip_separators("-"), "");
+        assert_eq!(strip_separators(""), "");
     }
 
     #[test]
