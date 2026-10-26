@@ -215,6 +215,9 @@ impl TextService_Impl {
         // 从 thread manager 取 ITfKeystrokeMgr
         let keystroke_mgr: ITfKeystrokeMgr = thread_mgr.cast()?;
         *self.inner.keystroke_mgr.lock().unwrap() = Some(keystroke_mgr.clone());
+        // 留着它问"现在焦点在哪个文档"——判断有没有可编辑光标要用
+        // （`unadvise_keys` 里会清掉）
+        *self.inner.thread_mgr.lock().unwrap() = Some(thread_mgr.clone());
 
         // 激活时顺手确保引擎在跑——引擎崩了下次切输入法就自动复活
         ipc::ensure_engine();
@@ -268,6 +271,37 @@ impl TextService_Impl {
     fn store_context(&self, pic: Ref<ITfContext>) {
         if let Some(ctx) = pic.as_ref() {
             *self.inner.context.lock().unwrap_or_else(|p| p.into_inner()) = Some(ctx.clone());
+        }
+    }
+
+    /// 现在按键真的能往文档里塞字吗？
+    ///
+    /// 焦点一旦离开可编辑区域（点到工具栏、停在面板空白处、Explorer 列表、
+    /// 桌面……），TSF 仍然会把按键送进来（我们是 `fForeground=TRUE` 的接收器），
+    /// 但这时候**没有光标可以挂组合串**。不挡住就会在屏幕上飘出一个候选窗。
+    ///
+    /// 判断依据两条，命中任意一条就当"能打字"：
+    /// 1. TSF 给了本进程一个 `ITfContext`（绝大多数正常情况）；
+    /// 2. 线程焦点里确实有一个顶层上下文（兜住少数不传 context 的应用）。
+    fn can_compose(&self, pic: Option<&ITfContext>) -> bool {
+        if pic.is_some() {
+            return true;
+        }
+        let mgr = self
+            .inner
+            .thread_mgr
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        let Some(mgr) = mgr else {
+            return false;
+        };
+        // SAFETY: 只读查询焦点文档管理器，不涉及编辑会话
+        unsafe {
+            let Ok(doc) = mgr.GetFocus() else {
+                return false;
+            };
+            doc.GetTop().is_ok()
         }
     }
 
@@ -390,6 +424,10 @@ impl ITfEditSession_Impl for TextService_Impl {
                         .composition
                         .lock()
                         .unwrap_or_else(|p| p.into_inner()) = Some(c);
+                } else {
+                    // 连组合都起不来（没有可写选区/应用不让改）：候选窗也别显示，
+                    // 否则就是一个跟光标无关的飘窗
+                    candwin::hide();
                 }
                 Ok(())
             }
@@ -605,13 +643,14 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
 
     fn OnTestKeyDown(
         &self,
-        _pic: Ref<ITfContext>,
+        pic: Ref<ITfContext>,
         wparam: WPARAM,
         _lparam: LPARAM,
     ) -> windows::core::Result<BOOL> {
         let vk = wparam.0 as u32;
         let composing = !self.inner.buffer.lock().unwrap_or_else(|p| p.into_inner()).is_empty();
-        let claim = should_claim(vk, composing, shift_held(), caps_on(), self.inner.english_mode.load(Ordering::SeqCst));
+        let claim = self.can_compose(pic.as_ref())
+            && should_claim(vk, composing, shift_held(), caps_on(), self.inner.english_mode.load(Ordering::SeqCst));
         log_line(&format!("test vk={vk} claim={claim} composing={composing}"));
         Ok(BOOL(if claim { 1 } else { 0 }))
     }
@@ -648,8 +687,15 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
 
         let vk = wparam.0 as u32;
 
+        // 光标不在可编辑区域时一个键都不认领，否则会在没有光标的地方冒出候选窗
+        let composable = self.can_compose(pic.as_ref());
+
         // 存下输入上下文，编辑会话要用
         self.store_context(pic);
+
+        if !composable {
+            return Ok(BOOL(0));
+        }
 
         // Ctrl/Alt/Win 组合键：整体放行给应用（Ctrl+A/C/V/X/Z 等快捷键）。
         // 注意必须放在 OnKeyDown 里——fForeground=TRUE 的接收器，TSF 会跳过
@@ -1344,9 +1390,12 @@ fn show_cand_window(
     }
     let end = (start + size).min(cands.len());
     let slice = &cands[start..end];
-    let (x, y) = pos
-        .or_else(ipc::caret_screen_pos)
-        .unwrap_or((200, 200));
+    // 没有可信的光标位置就干脆不显示：宁可看不到候选窗，也不要在屏幕某个
+    // 角落飘一个和光标无关的框（以前的 (200, 200) 兜底就是这个毛病）。
+    let Some((x, y)) = pos.or_else(ipc::caret_screen_pos) else {
+        candwin::hide();
+        return;
+    };
     candwin::show(pinyin, slice, sel, page + 1, total_pages, x + 4, y + 8);
 }
 
