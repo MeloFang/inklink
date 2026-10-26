@@ -236,11 +236,11 @@ C:\inklink-engine\
 | 翻页 | `-`/`=`（收起态 `-` 是分词符，展开态才是翻页）、PgUp/PgDn |
 | 分词符 | `-`/`_` 留在组合串里、查询前剥离；`xiang-mu` 显示为 `xiang-mu` |
 | 分段上屏 | 选了一个字后**剩下的拼音保留**继续选（`pikeqiu` 选「皮」→ 串变 `keqiu`）；尾巴上多打的字母按汉字数吃掉 |
-| 标点 | `,` `。` `;` `/` `\` `[` `]` `'` `-` `=` 全转中文，Shift 变体 `？：《》` |
+| 标点 | `,` `。` `;` `/` `\` `[` `]` `-` `=` 全转中文，Shift 变体 `？：《》「」`；**Shift+1~0 出全角 `！＠＃￥％……＆＊（）`**；**引号按一下开、再按一下合，自动成对 `“”` `‘’`**（`DQUOTE_OPEN`/`SQUOTE_OPEN` 两个全局开关） |
 | 英文模式 | Shift 单击切（按下不动、松开才生效，期间按过别的键就不算单击）；CapsLock 开 = 大写英文；英文模式下不认领任何键（WPS/Excel 兼容） |
 | 32 位 | `inklink_tsf32.dll` 注册在 `WOW6432Node`，WPS 等可用 |
 | 安装器 | 脚本模板在 `installer\`，打包成 `dist\inklink-<版本>.zip`；`install.cmd` 一键装，带完整日志 `C:\Users\Public\inklink-install.log`，结尾 8 项自检 |
-| 单测 | `cd tsf && cargo test --release` → 21 passed（按键认领、标点映射、拼音切分、分段上屏消耗字母数） |
+| 单测 | `cd tsf && cargo test --release` → 24 passed（按键认领、标点映射含引号交替、拼音切分、分段上屏消耗字母数） |
 
 ### 还没做的（按建议优先级）
 

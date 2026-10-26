@@ -750,7 +750,9 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
             let shift = shift_held();
             let is_paging = (vk == VK_OEM_MINUS || vk == VK_OEM_PLUS) && !shift;
             if !is_paging {
-                if let Some(ch) = cn_punct(vk, shift) {
+                if let Some(base) = cn_punct(vk, shift) {
+                    // 引号要成对交替，其余原样
+                    let ch = resolve_punct(base);
                     if composing_now {
                         // 先上屏候选，再跟上标点
                         let mut buffer = self.inner.buffer.lock().unwrap_or_else(|p| p.into_inner());
@@ -778,7 +780,7 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                         self.request_edit(EditAction::Commit(text));
                     } else {
                         log_line(&format!("punct vk={vk:#x} -> {ch}"));
-                        self.request_edit(EditAction::Insert(ch.to_string()));
+                        self.request_edit(EditAction::Insert(ch));
                     }
                     return Ok(BOOL(1));
                 }
@@ -1526,7 +1528,8 @@ fn shift_held() -> bool {
 
 /// 中文标点映射：英文符号键 → 中文标点（对齐微软拼音/搜狗）。
 ///
-/// 只在"中文模式且没按 Shift"时调用；`\` → `、` 就是顿号。
+/// 只在"中文模式且 CapsLock 没开"时调用；`\` → `、` 就是顿号。
+/// 引号这里只给**左引号**，开合交替在 `resolve_punct` 里做。
 /// 返回 `None` 表示不是标点键，交给应用。
 fn cn_punct(vk: u32, shift: bool) -> Option<&'static str> {
     Some(match (vk, shift) {
@@ -1541,6 +1544,7 @@ fn cn_punct(vk: u32, shift: bool) -> Option<&'static str> {
         (VK_OEM_4, false) => "【",
         (VK_OEM_5, false) => "、",
         (VK_OEM_6, false) => "】",
+        // 单引号/双引号给的是**左引号**，实际输出由 `resolve_quote` 按开合状态交替。
         (VK_OEM_7, false) => "‘",
         (VK_OEM_MINUS, false) => "－",
         (VK_OEM_PLUS, false) => "＝",
@@ -1554,12 +1558,63 @@ fn cn_punct(vk: u32, shift: bool) -> Option<&'static str> {
         (VK_OEM_4, true) => "「",
         (VK_OEM_5, true) => "｜",
         (VK_OEM_6, true) => "」",
-        (VK_OEM_7, true) => "“",
+        (VK_OEM_7, true) => "“", // 左双引号，实际输出见 `resolve_quote`
         (VK_OEM_MINUS, true) => "_", // 下划线：写代码/标识符常用，比破折号实用
         (VK_OEM_PLUS, true) => "＋",
+        // Shift + 数字：全角符号（对齐搜狗/微软拼音的习惯）。
+        // 括号是用户反馈最直接的缺口——原来 `(` `)` 直接漏给应用，打出来是半角。
+        (VK_1, true) => "！",
+        (VK_2, true) => "＠",
+        (VK_3, true) => "＃",
+        (VK_4, true) => "￥",
+        (VK_5, true) => "％",
+        (VK_6, true) => "……",
+        (VK_7, true) => "＆",
+        (VK_8, true) => "＊",
+        (VK_9, true) => "（",
+        (VK_0, true) => "）",
         _ => return None,
     })
 }
+
+/// 中文引号的开合状态：`true` = 下一个该打左引号。
+///
+/// 主流输入法的引号是「按一下开、再按一下合」的交替行为，没有别的上下文可依据。
+/// 用 `swap(false)` 读并翻转：返回旧值，供本次输出决定用左还是右。
+static DQUOTE_OPEN: AtomicBool = AtomicBool::new(true);
+static SQUOTE_OPEN: AtomicBool = AtomicBool::new(true);
+
+/// 纯逻辑：根据"是否该打左引号"把左引号换成对应的一半。
+/// 拆出来是为了能单测，不依赖全局状态。
+fn pick_quote(left: &'static str, open: bool) -> &'static str {
+    match (left, open) {
+        ("“", true) => "“",
+        ("“", false) => "”",
+        ("‘", true) => "‘",
+        ("‘", false) => "’",
+        _ => left,
+    }
+}
+
+/// 把 `cn_punct` 给出的标点解析成最终要上屏的字符串（引号会交替成对）。
+fn resolve_punct(ch: &'static str) -> String {
+    match ch {
+        "“" => pick_quote("“", DQUOTE_OPEN.swap(false, Ordering::SeqCst)).to_string(),
+        "‘" => pick_quote("‘", SQUOTE_OPEN.swap(false, Ordering::SeqCst)).to_string(),
+        other => other.to_string(),
+    }
+}
+
+const VK_0: u32 = 0x30;
+const VK_1: u32 = 0x31;
+const VK_2: u32 = 0x32;
+const VK_3: u32 = 0x33;
+const VK_4: u32 = 0x34;
+const VK_5: u32 = 0x35;
+const VK_6: u32 = 0x36;
+const VK_7: u32 = 0x37;
+const VK_8: u32 = 0x38;
+const VK_9: u32 = 0x39;
 
 const VK_OEM_1: u32 = 0xBA;
 const VK_OEM_2: u32 = 0xBF;
@@ -1992,6 +2047,43 @@ mod tests {
         assert_eq!(cn_punct(VK_A_KEY, false), None);
         assert_eq!(cn_punct(VK_SPACE_KEY, false), None);
     }
+
+    #[test]
+    fn 括号和叹号走全角() {
+        // 用户反馈：`(` `)` 原来漏给应用，打出来是半角
+        assert_eq!(cn_punct(VK_9, true), Some("（"));
+        assert_eq!(cn_punct(VK_0, true), Some("）"));
+        assert_eq!(cn_punct(VK_1, true), Some("！"));
+        assert_eq!(cn_punct(VK_4, true), Some("￥"));
+        // 不按 Shift 的数字是选候选用的，不能当标点
+        assert_eq!(cn_punct(VK_9, false), None);
+        assert_eq!(cn_punct(VK_0, false), None);
+    }
+
+    #[test]
+    fn 引号成对交替() {
+        // 第一次给左引号，第二次给右引号 —— 对齐主流输入法
+        assert_eq!(pick_quote("“", true), "“");
+        assert_eq!(pick_quote("“", false), "”");
+        assert_eq!(pick_quote("‘", true), "‘");
+        assert_eq!(pick_quote("‘", false), "’");
+        // 不是引号的字符原样返回
+        assert_eq!(pick_quote("，", false), "，");
+
+        // 全局状态：连续按两次 `"` 得到 “”
+        let a = resolve_punct("“");
+        let b = resolve_punct("“");
+        assert_ne!(a, b, "两次双引号必须一开一合");
+        assert_eq!(format!("{a}{b}"), "“”");
+
+        // 单引号是独立的一套状态
+        let c = resolve_punct("‘");
+        let d = resolve_punct("‘");
+        assert_eq!(format!("{c}{d}"), "‘’");
+
+        // 非引号不受状态影响
+        assert_eq!(resolve_punct("，"), "，");
+    }
 }
 #[cfg(test)]
 mod punct_claim_tests {
@@ -2013,6 +2105,17 @@ mod punct_claim_tests {
         // Shift+/ 要出 ？，必须认领后才能转换
         assert!(should_claim(VK_SLASH, false, true, false, false));
         assert!(should_claim(VK_OEM_1, false, true, false, false), "Shift+; 要出 ：");
+    }
+
+    #[test]
+    fn 括号和引号必须认领() {
+        // 不认领就等于漏给应用，用户看到的还是半角 ( ) 和英文引号
+        assert!(should_claim(VK_9, false, true, false, false), "Shift+9 要出 （");
+        assert!(should_claim(VK_0, false, true, false, false), "Shift+0 要出 ）");
+        assert!(should_claim(VK_OEM_7, false, true, false, false), "Shift+' 要出 “");
+        assert!(should_claim(VK_OEM_7, false, false, false, false), "' 要出 ‘");
+        // 不按 Shift 的数字仍然给应用（不抢数字键）
+        assert!(!should_claim(VK_9, false, false, false, false));
     }
 
     #[test]
