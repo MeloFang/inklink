@@ -941,9 +941,12 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                     Ok(BOOL(0))
                 }
             }
-            // Shift / CapsLock：拼音还在组合时按下，直接把拼音当英文上屏（对齐搜狗），
-            // 并进入英文模式。空闲时 Shift 单击会在 OnKeyUp 里切换中英文。
-            VK_SHIFT | VK_CAPITAL => {
+            // Shift：**按下时什么也不做**，交给 OnKeyUp 判断是不是"单击"。
+            // 原因：按 Shift 常常是为了接着按组合键（`_` 就是 Shift+-），
+            // 按下就提交拼音会把组合键的第二个键（-）的上下文弄丢。
+            // CapsLock 不是修饰键，仍按原行为处理。
+            VK_SHIFT => Ok(BOOL(0)),
+            VK_CAPITAL => {
                 if !buffer.is_empty() {
                     let raw = buffer.clone();
                     buffer.clear();
@@ -954,13 +957,8 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                     *page = 0;
                     *expanded = false;
                     candwin::hide();
-                    log_line(&format!("commit-raw(shift) {raw}"));
+                    log_line(&format!("commit-raw(caps) {raw}"));
                     self.request_edit(EditAction::Commit(raw));
-                    // 切到英文模式，且这次 Shift 不再触发 OnKeyUp 的切换
-                    if vk == VK_SHIFT {
-                        self.inner.english_mode.store(true, Ordering::SeqCst);
-                        self.inner.shift_used.store(true, Ordering::SeqCst);
-                    }
                     Ok(BOOL(1))
                 } else {
                     Ok(BOOL(0))
@@ -1030,9 +1028,46 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
         if vk == VK_SHIFT {
             // Shift 单击（按下期间没打字）→ 切换中英文模式
             if !self.inner.shift_used.load(Ordering::SeqCst) {
-                let cur = self.inner.english_mode.load(Ordering::SeqCst);
-                self.inner.english_mode.store(!cur, Ordering::SeqCst);
-                log_line(&format!("english_mode -> {}", !cur));
+                // Shift 单击（按下期间没按别的键）：
+                // - 正在拼写 → 拼音原样上屏 + 进英文模式（对齐搜狗）
+                // - 空闲     → 切换中英文
+                let composing = !self
+                    .inner
+                    .buffer
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .is_empty();
+                if composing {
+                    let raw = self
+                        .inner
+                        .buffer
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .clone();
+                    self.inner
+                        .buffer
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .clear();
+                    self.inner
+                        .cands
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .clear();
+                    *self.inner.matched_len.lock().unwrap_or_else(|p| p.into_inner()) = 0;
+                    *self.inner.cursor.lock().unwrap_or_else(|p| p.into_inner()) = 0;
+                    *self.inner.sel.lock().unwrap_or_else(|p| p.into_inner()) = 0;
+                    *self.inner.page.lock().unwrap_or_else(|p| p.into_inner()) = 0;
+                    *self.inner.expanded.lock().unwrap_or_else(|p| p.into_inner()) = false;
+                    candwin::hide();
+                    self.inner.english_mode.store(true, Ordering::SeqCst);
+                    log_line(&format!("commit-raw(shift-up) {raw}"));
+                    self.request_edit(EditAction::Commit(raw));
+                } else {
+                    let cur = self.inner.english_mode.load(Ordering::SeqCst);
+                    self.inner.english_mode.store(!cur, Ordering::SeqCst);
+                    log_line(&format!("english_mode -> {}", !cur));
+                }
             }
             self.inner.shift_used.store(false, Ordering::SeqCst);
         }
