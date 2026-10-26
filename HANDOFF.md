@@ -1,6 +1,6 @@
 # 续接文档：inklink
 
-> **最后更新**：2026-10-22 ｜ **当前阶段**：T3 完成（TSF 能打中文），T4 进行中 ｜ **总体进度**：TSF 里程碑 3/5
+> **最后更新**：2026-10-26 ｜ **当前阶段**：T1–T4 全部完成，日常可用；安装器可用 ｜ **总体进度**：TSF 里程碑 4/5，M1 未开始
 
 ---
 
@@ -29,8 +29,10 @@
 | T1 | 注册成 TSF 输入法，出现在 Win+Space 列表 | ✅ |
 | T2 | 按键流打通到 OnKeyDown | ✅ |
 | T3 | 能打中文（查词库→候选→上屏），快捷键/退格/错误恢复 | ✅ |
-| T4 | 组合串显示（拼音显示在光标处带下划线） | ⏳ |
-| T5 | 兼容与兜底（引擎进程生命周期、各应用兼容） | ⏳ |
+| T4 | 组合串显示（拼音显示在光标处）+ 候选窗（收起 1×5 / 展开 5×5） | ✅ |
+| T5 | 兼容与兜底（引擎进程生命周期、32 位、安装器、标点/英文模式） | ✅ |
+| M1 | 用户词库学习（`code -> 词 -> 次数`，自建记忆层） | ⬜ 未开始，**下一步** |
+| T5d | 拼音下划线（`ITfDisplayAttributeProvider`） | ⬜ |
 
 ### 已完成的细节（实测验证）
 
@@ -220,3 +222,61 @@ C:\inklink-engine\
 - **用户词库学习**：librime 这版 `RimeSelectCandidate` 不产生 commit，学不到。
   自建记忆层试过但导致查询崩溃，已回退。详见 `PLAN.md` T5a。
 - 拼音音节分隔显示（librime 的 preedit 自带 `jian zou pian feng`，尚未用上）
+---
+
+## 九、现状与下一步（2026-10-26 更新）
+
+### 已经能用的（用户本机日常在打）
+
+| 能力 | 说明 |
+|:---|:---|
+| 中文输入 | librime 引擎（`C:\inklink-engine\rime-server.exe`，x86 链 `rime.dll`），整句/词组/简拼 |
+| 组合串 | 拼音显示在光标处，←→ 在串内移动，Backspace/Delete 在光标处删 |
+| 候选窗 | 拼音行 + 5 列网格；收起 1×5，展开 5×5（25 个）；**只给选中行标 1-5**，↑↓ 换行、←→ 换列、数字键选当前行 |
+| 翻页 | `-`/`=`（收起态 `-` 是分词符，展开态才是翻页）、PgUp/PgDn |
+| 分词符 | `-`/`_` 留在组合串里、查询前剥离；`xiang-mu` 显示为 `xiang-mu` |
+| 分段上屏 | 选了一个字后**剩下的拼音保留**继续选（`pikeqiu` 选「皮」→ 串变 `keqiu`）；尾巴上多打的字母按汉字数吃掉 |
+| 标点 | `,` `。` `;` `/` `\` `[` `]` `'` `-` `=` 全转中文，Shift 变体 `？：《》` |
+| 英文模式 | Shift 单击切（按下不动、松开才生效，期间按过别的键就不算单击）；CapsLock 开 = 大写英文；英文模式下不认领任何键（WPS/Excel 兼容） |
+| 32 位 | `inklink_tsf32.dll` 注册在 `WOW6432Node`，WPS 等可用 |
+| 安装器 | `dist\inklink-0.1.0\install.cmd` 一键装，带完整日志 `C:\Users\Public\inklink-install.log`，结尾 8 项自检 |
+| 单测 | `cd tsf && cargo test --release` → 21 passed（按键认领、标点映射、拼音切分、分段上屏消耗字母数） |
+
+### 还没做的（按建议优先级）
+
+| # | 任务 | 为什么现在做 |
+|:---|:---|:---|
+| 1 | **M1 用户词库学习** | 产品核心卖点（"每人专属词库"）一条都还没有；协议 `type=2` 和 `ipc::select()` 都已埋好，服务端 `select_candidate()` 现在只写日志 |
+| 2 | T5d 拼音下划线 | 拼音现在像普通英文，"最不像输入法"的地方 |
+| 3 | T5b 音节分隔显示 | librime preedit 已有 `jian zou pian feng`，未接到候选窗 |
+| 4 | T5g 模糊音 | `chuan`→`chuang` 打不出「创建」；建议走服务端方案（PLAN.md T5g 路线 A） |
+| 5 | T5c 候选窗美化 | 圆角/间距/配色 |
+| 6 | T5e 个人云词库 + M3 AI | Obsidian 语料 + 翻译/续写，原始愿景，最后做 |
+
+### M1 必须分三步（上次一次性全加导致查询崩溃）
+
+1. 只记录到内存 + 日志，不动排序 —— 确认连续查询不崩
+2. 加落盘（`user.tsv`，`code\ttext\tcount`）
+3. 才接排序提升（同拼音内按次数降序，`std::stable_sort`）
+
+入口就在 `C:\dsh\work\inklink\rime-server\rime-server.cc` 的 `select_candidate()`。
+
+### 构建 / 部署 / 打包
+
+```powershell
+$env:PATH = "$env:USERPROFILE\.cargo\bin;$env:PATH"
+cd C:\dsh\work\inklink\tsf
+cargo test --release
+cargo build --release --target-dir target-static                      # 64 位
+cargo build --release --target i686-pc-windows-msvc --target-dir target-static   # 32 位
+```
+
+DLL 被加载后无法卸载：**换新文件名 + 改注册表 + 重启目标程序**，否则跑的还是旧 DLL。
+打包：`dist\inklink-0.1.0\files\` 放二进制 → `Compress-Archive` 到 `dist\inklink-0.1.0.zip`（`dist\*\files\` 被 gitignore，不进仓库）。
+
+### 踩过的坑（本阶段新增）
+
+- `git commit -m` 带中文多行会被 PowerShell 拆坏（`error: unknown switch /`）→ 用 `git commit -F msg.txt`，文件 UTF-8 无 BOM。
+- `.ps1` 必须 UTF-8 **带 BOM**；`.cmd` 必须**纯 ASCII + CRLF**（cmd.exe 按 OEM 代码页读，`goto` 在 LF-only 文件里会失效）。
+- `net session` 判管理员不可靠（Server 服务被禁就恒失败）→ 用 `fltmc`。
+- 拼写中按 `-` 的语义取决于是否展开：展开=翻页，收起=分词符。判定前必须先把 `expanded` 的 MutexGuard 放到块里释放，否则再 lock 会死锁。
