@@ -63,9 +63,13 @@ inklink/
 |:---|:---|
 | X | 里程碑序号：0 = M0 能打字，1 = M1 个人词库，2 = M2 Obsidian 语料，3 = M3 AI |
 | V | 里程碑内的阶段序号，进入新阶段时 +1 |
-| Z | 修订号，每次发版/部署自增，跨里程碑不清零 |
+| Z | 修订号，每次发版/部署自增；**进入新阶段（V+1）或新里程碑（X+1）时归零** |
 
-例：`0.1.22` = M0 第 1 阶段第 22 次修订（即旧命名的 v22）。
+归零规则沿用 SemVer 2.0.0（主版本号递增时次版本号与修订号归零，次版本号递增时修订号归零）：
+X 变 → V/Z 都归零（`tools\version.ps1` 里 `Set-InklinkVersion 1.0.0`）；
+V 变 → Z 归零（`Step-InklinkStage`）；其余 → Z+1（`Step-InklinkVersion`，`deploy-local.ps1` 自动做）。
+
+例：`0.1.22` = M0 第 1 阶段的第 22 次修订（即旧命名的 v22）；**M0 之后的 M1 第一个版本是 `1.0.0`，不是 `1.0.23`**。
 
 命名出现在四处且必须一致：`VERSION`、DLL 文件名（`inklink_tsf_0.1.23.dll`）、
 安装包（`dist\inklink-0.1.23.zip`）、安装界面与日志（`C:\Users\Public\inklink-install.log`）。

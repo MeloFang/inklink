@@ -1,17 +1,24 @@
-﻿# inklink 版本号工具 —— 单一真相源是仓库根目录的 VERSION 文件
+# inklink 版本号工具 —— 单一真相源是仓库根目录的 VERSION 文件
 #
-# 版本格式：X.V.Z
+# 版本格式：X.V.Z（沿用 SemVer 的「高位递增、低位归零」规则）
 #   X = 里程碑序号     0 = M0（能打字）  1 = M1（个人词库）  2 = M2（Obsidian 语料）  3 = M3（AI）
 #   V = 里程碑内阶段序号   0 起步，进入新阶段时 +1
-#   Z = 修订号            每次发版/部署自增，跨里程碑不清零
+#   Z = 修订号            每次发版/部署自增；**进入新阶段或新里程碑时归零**
 #
-# 例：0.1.22 = M0 第 1 阶段第 22 次修订（旧命名的 v22）
+# 归零规则（SemVer 2.0.0：主版本号递增时次版本号与修订号归零，次版本号递增时修订号归零）：
+#   X 变 → V 和 Z 都归零     Set-InklinkVersion 1.0.0
+#   V 变 → Z 归零            Step-InklinkStage
+#   其余 → Z +1              Step-InklinkVersion
+#
+# 例：0.1.22 = M0 第 1 阶段的第 22 次修订（旧命名的 v22）。
+#     M0 结束后打 M1 的第一个版本就是 1.0.0，而不是 1.0.23。
 #
 # 用法：
 #   . .\tools\version.ps1
-#   Get-InklinkVersion                 # 0.1.22
-#   Set-InklinkVersion 0.2.0           # 手动设定并同步 Cargo.toml
-#   Step-InklinkVersion                # Z+1，返回 0.1.23
+#   Get-InklinkVersion                 # 0.1.23
+#   Set-InklinkVersion 1.0.0           # 手动设定（换里程碑）并同步 Cargo.toml
+#   Step-InklinkStage                  # V+1、Z 归零
+#   Step-InklinkVersion                # Z+1，返回 0.1.24
 
 function Get-InklinkRepoRoot { Split-Path $PSScriptRoot -Parent }
 
@@ -54,5 +61,15 @@ function Step-InklinkVersion {
     $v = Get-InklinkVersion
     $parts = $v.Split('.')
     $parts[2] = [string]([int]$parts[2] + $By)
+    return (Set-InklinkVersion ($parts -join '.'))
+}
+
+# 进入本里程碑的下一个阶段：V+1，Z 归零
+function Step-InklinkStage {
+    param([int]$By = 1)
+    $v = Get-InklinkVersion
+    $parts = $v.Split('.')
+    $parts[1] = [string]([int]$parts[1] + $By)
+    $parts[2] = '0'
     return (Set-InklinkVersion ($parts -join '.'))
 }

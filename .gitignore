@@ -61,3 +61,6 @@ Thumbs.db
 /tsf/test/*.exe
 /tsf/test/*.obj
 /app/node_modules/
+
+# 临时提交信息文件（git commit -F 用）
+msg.txt

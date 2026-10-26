@@ -264,7 +264,8 @@ C:\inklink-engine\
 ### 版本号与构建 / 部署 / 打包
 
 **版本格式 `X.V.Z`**（`VERSION` 是唯一真相源）：X = 里程碑（0=M0，1=M1，2=M2，3=M3），
-V = 里程碑内阶段序号，Z = 修订号（每次发版 +1，跨里程碑不清零）。例：`0.1.22` = 旧命名的 v22。
+V = 里程碑内阶段序号，Z = 修订号（每次发版 +1；**进入新阶段或新里程碑时归零**，沿用 SemVer 规则）。
+例：`0.1.22` = 旧命名的 v22；M1 的第一个版本是 `1.0.0`。换阶段用 `Step-InklinkStage`，换里程碑用 `Set-InklinkVersion 1.0.0`。
 
 ```powershell
 # 改完代码 → 自增 Z → 构建 64+32 位 → 部署到 C:\Program Files\inklink\inklink_tsf_<ver>.dll
