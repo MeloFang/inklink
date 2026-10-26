@@ -614,19 +614,52 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
             return Ok(BOOL(0));
         }
 
-        // 没在拼写、也不在英文模式时：把英文标点键换成中文标点（`\` → `、` 等）。
-        // Shift 按住 / CapsLock 开着 = 英文输入，标点必须原样透传。
+        // 标点键：中文模式下转成中文标点。
+        // - 空闲时：直接插入标点
+        // - 拼写中：先上屏当前候选，再插入标点（主流输入法行为）
+        //   例外：`-` / `=` 不按 Shift 时仍是翻页键
         let composing_now = !self
             .inner
             .buffer
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .is_empty();
-        if !composing_now && !caps_on() {
-            if let Some(ch) = cn_punct(vk, shift_held()) {
-                log_line(&format!("punct vk={vk:#x} -> {ch}"));
-                self.request_edit(EditAction::Insert(ch.to_string()));
-                return Ok(BOOL(1));
+        if !caps_on() {
+            let shift = shift_held();
+            let is_paging = (vk == VK_OEM_MINUS || vk == VK_OEM_PLUS) && !shift;
+            if !is_paging {
+                if let Some(ch) = cn_punct(vk, shift) {
+                    if composing_now {
+                        // 先上屏候选，再跟上标点
+                        let mut buffer = self.inner.buffer.lock().unwrap_or_else(|p| p.into_inner());
+                        let mut cands = self.inner.cands.lock().unwrap_or_else(|p| p.into_inner());
+                        let mut matched_len =
+                            self.inner.matched_len.lock().unwrap_or_else(|p| p.into_inner());
+                        let mut cursor = self.inner.cursor.lock().unwrap_or_else(|p| p.into_inner());
+                        let mut page = self.inner.page.lock().unwrap_or_else(|p| p.into_inner());
+                        let mut expanded =
+                            self.inner.expanded.lock().unwrap_or_else(|p| p.into_inner());
+                        let mut sel = self.inner.sel.lock().unwrap_or_else(|p| p.into_inner());
+                        let idx = *page * page_size(*expanded) + *sel;
+                        let head = cands.get(idx).cloned().unwrap_or_default();
+                        let text = format!("{head}{ch}");
+                        buffer.clear();
+                        cands.clear();
+                        *matched_len = 0;
+                        *cursor = 0;
+                        *page = 0;
+                        *expanded = false;
+                        *sel = 0;
+                        candwin::hide();
+                        log_line(&format!("punct-in-compose vk={vk:#x} -> {text}"));
+                        ipc::select(idx);
+                        self.request_edit(EditAction::Commit(text));
+                    } else {
+                        log_line(&format!("punct vk={vk:#x} -> {ch}"));
+                        self.request_edit(EditAction::Insert(ch.to_string()));
+                    }
+                    return Ok(BOOL(1));
+                }
             }
         }
 
@@ -835,7 +868,7 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                 }
             }
             // - / , ：上一页（展开时首页则收起）
-            VK_OEM_MINUS | VK_OEM_COMMA => {
+            VK_OEM_MINUS => {
                 if composing {
                     if *expanded {
                         if *page > 0 {
@@ -854,7 +887,7 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                 }
             }
             // = / . ：下一页（收起时先展开）
-            VK_OEM_PLUS | VK_OEM_PERIOD => {
+            VK_OEM_PLUS => {
                 if composing {
                     if !*expanded {
                         *expanded = true;
@@ -1058,6 +1091,10 @@ fn should_claim(vk: u32, composing: bool, shift: bool, caps: bool, english: bool
     }
 
     if composing {
+        // 拼写中按标点：要认领，才能"先上屏候选再插标点"
+        if !caps && cn_punct(vk, shift).is_some() {
+            return true;
+        }
         // 正在拼写：字母/数字/候选操作键 + 组合串内移动光标的键 + 翻页键
         return matches!(
             vk,
@@ -1237,7 +1274,7 @@ fn cn_punct(vk: u32, shift: bool) -> Option<&'static str> {
         (VK_OEM_5, true) => "｜",
         (VK_OEM_6, true) => "」",
         (VK_OEM_7, true) => "“",
-        (VK_OEM_MINUS, true) => "—",
+        (VK_OEM_MINUS, true) => "_", // 下划线：写代码/标识符常用，比破折号实用
         (VK_OEM_PLUS, true) => "＋",
         _ => return None,
     })

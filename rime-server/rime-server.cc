@@ -23,6 +23,7 @@
 #include <mutex>
 #include <thread>
 #include "rime_api.h"
+#include "pinyin-syllables.h"
 
 // ───────────────────────── 日志 ─────────────────────────
 static FILE* g_log = nullptr;
@@ -120,6 +121,40 @@ static void save_user() {
     fclose(f);
 }
 
+/// 单个音节是否合法。
+static bool is_syllable(const std::string& s) {
+    for (int i = 0; i < PINYIN_SYLLABLE_COUNT; i++) {
+        if (s == PINYIN_SYLLABLES[i]) return true;
+    }
+    return false;
+}
+
+/// 整串能否完整切成合法拼音音节（动态规划）。
+/// 用来区分「xiang 是拼音」和「github 不是拼音」，比"看候选是不是单字"可靠得多。
+static bool is_pinyin_code(const std::string& code) {
+    if (code.empty()) return false;
+    size_t n = code.size();
+    std::vector<char> dp(n + 1, 0);
+    dp[0] = 1;
+    for (size_t i = 1; i <= n; i++) {
+        size_t lo = (i > 6) ? i - 6 : 0; // 最长音节 6 个字母（zhuang）
+        for (size_t j = lo; j < i; j++) {
+            if (dp[j] && is_syllable(code.substr(j, i - j))) {
+                dp[i] = 1;
+                break;
+            }
+        }
+    }
+    if (dp[n]) return true;
+    // 简拼：全部是声母字母（无元音）也算拼音输入，如 zgrm / pz
+    for (char c : code) {
+        if (c < 'a' || c > 'z' || c == 'a' || c == 'e' || c == 'i' || c == 'o' || c == 'u' || c == 'v') {
+            return false;
+        }
+    }
+    return true;
+}
+
 /// 把用户选过的词提到前面（同一拼音内按次数降序）。
 static void apply_user_boost(const std::string& code, std::vector<std::string>& cands) {
     auto it = g_user.find(code);
@@ -189,12 +224,8 @@ static std::vector<std::string> query(const std::string& code) {
         for (char c : code) {
             if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'))) { is_pure_alpha = false; break; }
         }
-        // 前 5 个候选全是单字（且输入较长）→ 基本可以断定不是拼音，是英文
-        bool all_single = !out.empty();
-        for (size_t i = 0; i < out.size() && i < 5; i++) {
-            if (out[i].size() != 3) { all_single = false; break; }
-        }
-        looks_pinyin = !(all_single && code.size() >= 5);
+        // 用音节校验判断：xiang 是拼音，github 不是
+        looks_pinyin = is_pinyin_code(code);
 
         if (is_pure_alpha && out.size() < (size_t)MAX_CANDS) {
             auto it = std::find(out.begin(), out.end(), code);
