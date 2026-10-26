@@ -13,6 +13,7 @@
 #include <windows.h>
 #include <sddl.h>
 #include <algorithm>
+#include <array>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -129,6 +130,26 @@ static bool is_syllable(const std::string& s) {
     return false;
 }
 
+/// 是不是某个合法音节的**前缀**（1~6 个字母）。
+///
+/// 用于识别"打到一半"的拼音：`zheg` 的最后那个 `g` 是 `ge` 的前缀，
+/// `zhge` 开头的 `zh` 是 `zha/zhe/zhi…` 的前缀。
+static bool is_syllable_prefix(const std::string& s) {
+    if (s.empty() || s.size() > 6) return false;
+    // 音节表是排序的：二分找到第一个 >= s 的，看它是否以 s 开头
+    int lo = 0, hi = PINYIN_SYLLABLE_COUNT;
+    while (lo < hi) {
+        int mid = (lo + hi) / 2;
+        if (std::strcmp(PINYIN_SYLLABLES[mid], s.c_str()) < 0) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    if (lo >= PINYIN_SYLLABLE_COUNT) return false;
+    return std::strncmp(PINYIN_SYLLABLES[lo], s.c_str(), s.size()) == 0;
+}
+
 /// 整串能否完整切成合法拼音音节（动态规划）。
 /// 用来区分「xiang 是拼音」和「github 不是拼音」，比"看候选是不是单字"可靠得多。
 static bool is_pinyin_code(const std::string& code) {
@@ -147,12 +168,41 @@ static bool is_pinyin_code(const std::string& code) {
     }
     if (dp[n]) return true;
     // 简拼：全部是声母字母（无元音）也算拼音输入，如 zgrm / pz
+    bool all_consonant = true;
     for (char c : code) {
         if (c < 'a' || c > 'z' || c == 'a' || c == 'e' || c == 'i' || c == 'o' || c == 'u' || c == 'v') {
-            return false;
+            all_consonant = false;
+            break;
         }
     }
-    return true;
+    if (all_consonant) return true;
+    // 「差一点点」的拼音：允许**一个**音节只打了一半，其余音节必须完整。
+    // 这样 zheg（zhe + g）、zhge（zh + ge）、xiangm（xiang + m）都算拼音，
+    // 而 hello / test / world / code 这类英文词仍然不算。
+    if (n < 3) return false;
+    // dp2[i][inc]：前缀 code[0..i) 切完后，有 inc 段是"半个音节"，
+    // 且至少有一段是完整音节（has = 1）
+    std::vector<std::vector<std::array<char, 2>>> dp2(
+        n + 1, std::vector<std::array<char, 2>>(2, std::array<char, 2>{0, 0}));
+    dp2[0][0][0] = 1;
+    for (size_t i = 1; i <= n; i++) {
+        size_t lo = (i > 6) ? i - 6 : 0;
+        for (size_t j = lo; j < i; j++) {
+            std::string chunk = code.substr(j, i - j);
+            bool whole = is_syllable(chunk);
+            if (!whole && !is_syllable_prefix(chunk)) continue;
+            for (int inc = 0; inc < 2; inc++) {
+                for (int has = 0; has < 2; has++) {
+                    if (!dp2[j][inc][has]) continue;
+                    int ninc = whole ? inc : inc + 1;
+                    if (ninc > 1) continue;
+                    int nhas = whole ? 1 : has;
+                    dp2[i][ninc][nhas] = 1;
+                }
+            }
+        }
+    }
+    return dp2[n][0][1] || dp2[n][1][1];
 }
 
 /// 把用户选过的词提到前面（同一拼音内按次数降序）。

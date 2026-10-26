@@ -55,6 +55,12 @@ DLL 在引擎不在时会按这个路径自动拉起。
 - **写完必须 `FlushFileBuffers`**：否则 `DisconnectNamedPipe` 会把客户端还没读的尾部数据丢掉。
 - **NULL DACL**：输入法会被不同权限的应用调用，管道必须允许任何人连。
 - **候选靠 `RimeGetContext` + `{Page_Down}` 翻页收集**（`RimeCandidateList*` 在本版本返回空）。
+- **英文候选插在哪由 `is_pinyin_code()` 决定**：像拼音就把原始输入排最后（`zheg` → 这个 排第一），
+  不像拼音才排最前（`github` → github 排第一）。判定分三条：
+  1. 整串能完整切成合法音节（`xiangmu`、`nice`）；
+  2. 全是声母（`zg`、`npm`，简拼）；
+  3. 长度 ≥3 且**允许一个音节只打一半**（`zheg` = zhe + g、`zhge` = zh + ge、`xiangm` = xiang + m）。
+     有了第 3 条，打错/漏字母不会再被当成英文；`hello`/`test`/`world`/`code` 这类仍然是 0 或 2+ 个半音节，不受影响。
 
 ## 首选项
 
