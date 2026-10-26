@@ -640,6 +640,26 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                         let mut expanded =
                             self.inner.expanded.lock().unwrap_or_else(|p| p.into_inner());
                         let mut sel = self.inner.sel.lock().unwrap_or_else(|p| p.into_inner());
+                        // 下划线是标识符/文件名的分隔符，中文正文里几乎不用。
+                        // 拼写中按下划线 = "我要原样 ASCII"：
+                        // 上屏拼音原文 + `_`，并切到英文模式，
+                        // 这样 xiang + Shift+- + mu 直接打出 xiang_mu，不用先手动切英文。
+                        if ch == "_" {
+                            let raw = buffer.clone();
+                            buffer.clear();
+                            cands.clear();
+                            *matched_len = 0;
+                            *cursor = 0;
+                            *page = 0;
+                            *expanded = false;
+                            *sel = 0;
+                            candwin::hide();
+                            self.inner.english_mode.store(true, Ordering::SeqCst);
+                            let text = format!("{raw}_");
+                            log_line(&format!("commit-raw(underscore) {text} english=true"));
+                            self.request_edit(EditAction::Commit(text));
+                            return Ok(BOOL(1));
+                        }
                         let idx = *page * page_size(*expanded) + *sel;
                         let head = cands.get(idx).cloned().unwrap_or_default();
                         let text = format!("{head}{ch}");
