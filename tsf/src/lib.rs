@@ -222,7 +222,11 @@ impl TextService_Impl {
         // 把自己作为按键 sink 挂上去（传引用，而不是把 owned 接口交给 Param）
         let sink: ITfKeyEventSink = self.to_interface();
         let r = unsafe { keystroke_mgr.AdviseKeyEventSink(tid, &sink, true) };
-        log_line(&format!("activate tid={tid} advise={}", if r.is_ok() { "ok" } else { "FAILED" }));
+        log_line(&format!(
+            "activate tid={tid} advise={} version={}",
+            if r.is_ok() { "ok" } else { "FAILED" },
+            env!("INKLINK_VERSION")
+        ));
         r?;
         *advised = true;
         Ok(())

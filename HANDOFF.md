@@ -239,7 +239,7 @@ C:\inklink-engine\
 | 标点 | `,` `。` `;` `/` `\` `[` `]` `'` `-` `=` 全转中文，Shift 变体 `？：《》` |
 | 英文模式 | Shift 单击切（按下不动、松开才生效，期间按过别的键就不算单击）；CapsLock 开 = 大写英文；英文模式下不认领任何键（WPS/Excel 兼容） |
 | 32 位 | `inklink_tsf32.dll` 注册在 `WOW6432Node`，WPS 等可用 |
-| 安装器 | `dist\inklink-0.1.0\install.cmd` 一键装，带完整日志 `C:\Users\Public\inklink-install.log`，结尾 8 项自检 |
+| 安装器 | 脚本模板在 `installer\`，打包成 `dist\inklink-<版本>.zip`；`install.cmd` 一键装，带完整日志 `C:\Users\Public\inklink-install.log`，结尾 8 项自检 |
 | 单测 | `cd tsf && cargo test --release` → 21 passed（按键认领、标点映射、拼音切分、分段上屏消耗字母数） |
 
 ### 还没做的（按建议优先级）
@@ -261,18 +261,24 @@ C:\inklink-engine\
 
 入口就在 `C:\dsh\work\inklink\rime-server\rime-server.cc` 的 `select_candidate()`。
 
-### 构建 / 部署 / 打包
+### 版本号与构建 / 部署 / 打包
+
+**版本格式 `X.V.Z`**（`VERSION` 是唯一真相源）：X = 里程碑（0=M0，1=M1，2=M2，3=M3），
+V = 里程碑内阶段序号，Z = 修订号（每次发版 +1，跨里程碑不清零）。例：`0.1.22` = 旧命名的 v22。
 
 ```powershell
-$env:PATH = "$env:USERPROFILE\.cargo\bin;$env:PATH"
-cd C:\dsh\work\inklink\tsf
-cargo test --release
-cargo build --release --target-dir target-static                      # 64 位
-cargo build --release --target i686-pc-windows-msvc --target-dir target-static   # 32 位
+# 改完代码 → 自增 Z → 构建 64+32 位 → 部署到 C:\Program Files\inklink\inklink_tsf_<ver>.dll
+powershell -ExecutionPolicy Bypass -File tools\deploy-local.ps1
+# 只重新构建部署，不动版本号 / 只拷已有产物
+powershell -ExecutionPolicy Bypass -File tools\deploy-local.ps1 -NoBump
+powershell -ExecutionPolicy Bypass -File tools\deploy-local.ps1 -NoBump -NoBuild
+# 打发布包 → dist\inklink-<ver>.zip（脚本从 installer\ 注入版本号，排除个人词库）
+powershell -ExecutionPolicy Bypass -File tools\release.ps1
 ```
 
-DLL 被加载后无法卸载：**换新文件名 + 改注册表 + 重启目标程序**，否则跑的还是旧 DLL。
-打包：`dist\inklink-0.1.0\files\` 放二进制 → `Compress-Archive` 到 `dist\inklink-0.1.0.zip`（`dist\*\files\` 被 gitignore，不进仓库）。
+DLL 被加载后无法卸载：脚本每次用**新文件名 + 改注册表**，目标程序要重启才会用上新 DLL。
+手动构建的话：`cd tsf` → `cargo build --release --lib --target-dir target-static`（64 位）/
+`cargo build --release --lib --target i686-pc-windows-msvc --target-dir target-static`（32 位）。
 
 ### 踩过的坑（本阶段新增）
 

@@ -15,6 +15,7 @@ $PF      = 'C:\Program Files\inklink'
 $ENG     = 'C:\inklink-engine'
 $SRC     = Join-Path $PSScriptRoot 'files'
 $LOG     = Join-Path $env:PUBLIC 'inklink-install.log'
+$Version = '__INKLINK_VERSION__'
 
 function Fail($msg) { throw "安装失败：$msg" }
 function Step($n, $msg) { Write-Host "[$n/7] $msg" -ForegroundColor White }
@@ -22,6 +23,7 @@ function Step($n, $msg) { Write-Host "[$n/7] $msg" -ForegroundColor White }
 # ── 环境信息 ───────────────────────────────────────────────────
 # 这一段是远程排错的关键：系统版本、架构、权限决定后面每一处行为。
 Write-Host '== inklink 输入法安装 ==' -ForegroundColor Cyan
+Write-Host "  版本       : $Version"
 Write-Host "  时间       : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
 Write-Host "  系统       : $([Environment]::OSVersion.VersionString)"
 Write-Host "  架构       : $env:PROCESSOR_ARCHITECTURE"
@@ -180,8 +182,9 @@ Write-Host ''
 Write-Host '使用方法：' -ForegroundColor Yellow
 Write-Host '  1. 按 Win+Space 切换到「inklink 输入法」（可能要先按一次 Ctrl+Shift）'
 Write-Host '  2. 直接打拼音，例如 xiangmu -> 项目'
-Write-Host '  3. 空格=选第一个，数字键=选当前行对应候选，Esc=取消'
-Write-Host '  4. 方向键可以翻候选，+- 翻页'
+Write-Host '  3. 空格=选第一个，数字键 1-5=选当前那一行的第 N 个，Esc=取消'
+Write-Host '  4. ↓ 或 = 展开候选（5x5），↑↓ 换行、←→ 换列，- = / PgUp PgDn 翻页'
+Write-Host '  5. 拼写中按 - 是分词符（xiang-mu），Shift 单击切英文'
 Write-Host ''
 Write-Host '注意：' -ForegroundColor Yellow
 Write-Host '  - 刚装完第一次打字可能没反应，等 2-3 秒再打一次（引擎在加载词库）'

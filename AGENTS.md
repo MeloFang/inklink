@@ -1,13 +1,18 @@
 # AGENTS.md
 
 > 给所有 AI 与人类贡献者：读完这一份就能开工，不必先问基础问题。
-> 最后更新：2026-10-21（阶段②，代码尚未开始）
+> 最后更新：2026-10-26（TSF 输入法 + librime 引擎已在本机日常使用）
 
 ## 这是什么
 
-**inklink**：Windows 上开源的中文输入面板。热键唤起 → 拼音输入 → 用「内置词库 + 个人词库 + 使用习惯」出候选 → 上屏到当前窗口。AI（本地 Ollama / 远程 API）做续写、翻译、段落优化。
+**inklink**：Windows 上开源的中文输入法。装进系统后就是一个正常的 TSF 输入法（Win+Space 切换），
+打拼音 → 候选窗 → 上屏。产品愿景是用个人词库 + Obsidian 语料 + AI 做个性化，目前只到 M0（能打字）。
+
+架构（ADR-0006）：`inklink_tsf.dll`（薄壳，装在应用进程里）──命名管道──▶ `rime-server.exe`（x86，链 librime）。
+**为什么分两个进程**：Weasel 分发的 `rime.dll` 只有 32 位，而 TSF DLL 必须 64 位。
 
 完整设计：[`docs/architecture.md`](docs/architecture.md)。产品边界：[`PRODUCT.md`](PRODUCT.md)。
+当前进度与下一步：[`HANDOFF.md`](HANDOFF.md) 第九节。
 
 **许可证：GPL-3.0**（见 `LICENSE`）。基础词库衍生自 [rime-ice](https://github.com/iDvel/rime-ice)（GPL-3.0），
 以独立资源包分发（`data/` 不进 git），见 `docs/adr/0004`。
@@ -24,48 +29,72 @@
 
 ```
 inklink/
+├─ VERSION               版本号单一真相源（X.V.Z，见下）
 ├─ PRODUCT.md            产品定义与成功标准
 ├─ PLAN.md               实施计划与状态（改代码前先看这里）
 ├─ HANDOFF.md            续接文档（每阶段更新）
 ├─ AGENTS.md             本文件
 ├─ GLOSSARY.md           术语表
-├─ docs/
-│  ├─ architecture.md          架构与数据流
-│  ├─ base-lexicon-eval.md     词库选型实测
-│  ├─ adr/                     决策记录
-│  └─ inklink项目复盘.md        上一版失败复盘
-├─ app/                  【M0 待建】Rust + Tauri 应用
-│  ├─ src-tauri/          引擎、热键、上屏（Rust）
-│  └─ src/                面板 UI（Svelte + TS）
-├─ tools/                词库转换脚本（Python，开发期）
+├─ tsf/                  【现在的主线】TSF 输入法 DLL（Rust，64 + 32 位）
+│  ├─ src/lib.rs         按键状态机 + 组合串 + 候选导航
+│  ├─ src/candwin.rs     候选窗（Win32 弹出窗口）
+│  ├─ src/ipc.rs         命名管道客户端 + 引擎自动拉起
+│  ├─ src/pinyin.rs      402 音节表（贪心最长匹配，算分段上屏吃掉多少字母）
+│  └─ build.rs           把 VERSION 编进 DLL
+├─ rime-server/          C++ 引擎服务（链 librime，x86）
+│  └─ rime-server.cc     协议 [u8 type] + 查询/选词
+├─ installer/            安装/卸载脚本模板（版本号由打包脚本注入）
+├─ tools/                构建部署与打包脚本 + 词库转换
+│  ├─ version.ps1        读写 VERSION
+│  ├─ deploy-local.ps1   构建 + 部署到本机
+│  └─ release.ps1        打 dist\inklink-<版本>.zip
+├─ dist/                 发布产物（**不进 git**）
+├─ docs/                 架构、ADR、阶段记录
+├─ app/                  【已退役】旧 Tauri 面板 + 自研引擎，只作参考
 ├─ data/                 词库资源包（**不进 git**）
 └─ extractor/            v1 笔记抽取管线（M2 复用）
 ```
 
+## 版本号与发布
+
+**格式 `X.V.Z`**（`VERSION` 文件是唯一真相源，`tools/version.ps1` 负责写并同步 `Cargo.toml`）：
+
+| 位 | 含义 |
+|:---|:---|
+| X | 里程碑序号：0 = M0 能打字，1 = M1 个人词库，2 = M2 Obsidian 语料，3 = M3 AI |
+| V | 里程碑内的阶段序号，进入新阶段时 +1 |
+| Z | 修订号，每次发版/部署自增，跨里程碑不清零 |
+
+例：`0.1.22` = M0 第 1 阶段第 22 次修订（即旧命名的 v22）。
+
+命名出现在四处且必须一致：`VERSION`、DLL 文件名（`inklink_tsf_0.1.23.dll`）、
+安装包（`dist\inklink-0.1.23.zip`）、安装界面与日志（`C:\Users\Public\inklink-install.log`）。
+
+```powershell
+# 改完代码后一键构建 + 部署（会自动 Z+1）
+powershell -ExecutionPolicy Bypass -File tools\deploy-local.ps1
+# 只是重新部署、不动版本号
+powershell -ExecutionPolicy Bypass -File tools\deploy-local.ps1 -NoBump
+# 打发布包
+powershell -ExecutionPolicy Bypass -File tools\release.ps1
+```
+
+⚠️ `-ExecutionPolicy Bypass` 必须带：本机 `CurrentUser` 策略是 `RemoteSigned`，未签名的本地脚本会被拒。
+
 ## 构建与测试
 
-**现在可跑（Python，仅词库与语料处理）**
 ```powershell
-cd C:\dsh\work\inklink
-.\.venv\Scripts\python.exe extractor\scan_vault.py
-.\.venv\Scripts\python.exe extractor\build_phrase.py
-```
-
-**M0 之后（Rust，步骤 0 建好后可用）**
-```powershell
-# ⚠️ 必须先修正 PATH：本机 Program Files 下装着 GNU 版 rustc 1.98，
-#    它会盖住 rustup 的 MSVC 版，导致 `dlltool.exe not found`。
+# ⚠️ 必须先修 PATH：Program Files 下装着 GNU 版 rustc，会盖住 rustup 的 MSVC 版
 $env:PATH = "$env:USERPROFILE\.cargo\bin;$env:PATH"
 
-cd app
-npm install
-npm run check                   # svelte-check，0 error 0 warning
-npm run build                   # 产出 ../build
-cargo tauri dev                 # 开发运行
-cargo test                      # 全部单测
-cargo clippy --all-targets -- -D warnings
-cargo fmt --check
+cd C:\dsh\work\inklink\tsf
+cargo test --release                       # 21 个单测（按键认领 / 标点 / 拼音切分 / 分段上屏）
+cargo build --release --lib --target-dir target-static
+cargo build --release --lib --target i686-pc-windows-msvc --target-dir target-static
 ```
+
+引擎是 C++（`rime-server/rime-server.cc`），编译命令写在文件头注释里，需要 32 位 MSVC 环境
+（`vcvars32.bat`）；日常改 DLL 不需要动它。
 
 > 环境事实：rustup 默认 `stable-x86_64-pc-windows-msvc`（1.99.1）；VS 2022 Community + Windows SDK 10.0.26100 已装；Node 24 / Python 3.13 已装；**无 .NET**。
 
