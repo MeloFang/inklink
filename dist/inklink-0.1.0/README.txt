@@ -18,15 +18,20 @@ inklink 输入法 0.1.0  测试版
 
   拼音输入        xiangmu          -> 项目
   长句输入        wolaishuoshuo    -> 我来说说
+  分段上屏        pikeqiu          选「皮」之后剩下的 keqiu 留在候选窗里，
+                                   可以接着选「克」「球」；多打的字母自动丢掉
   空格            上屏当前高亮的候选
-  数字键 1-9      直接选对应候选
+  数字键 1-5      选「当前那一行」的第 N 个候选
   ↓ 或 =          候选窗展开成 5x5
-  ↑ ↓ ← →        在展开的候选窗里移动
+  ↑ ↓             展开后换行
+  ← →            展开后行内左右选；收起时移动拼音光标
+  - =  / PgUp PgDn  展开后翻页
   Esc             取消这次输入
   回车           拼音原样上屏（当英文）
   Shift/CapsLock  拼音原样上屏（当英文）
   \               顿号「、」
   , . ; /         自动转成中文标点「，。；／」
+  -  (拼写中)     拼音分词符，xiang-mu 会显示成 xiang-mu 并正常出候选
   按住 Shift      临时打英文（标点也保持英文）
 
   点鼠标到别处 = 取消当前输入（拼音不残留）
@@ -64,10 +69,24 @@ inklink 输入法 0.1.0  测试版
 遇到问题
 --------
 
-1. 先看日志：C:\inklink-engine\rime-server.log
-2. 输入法没反应：确认 rime-server.exe 在任务管理器里；没有就双击
-   C:\inklink-engine\rime-server.exe
-3. 某个软件里用不了：告诉我软件名和它的位数（64 位一般没问题）
+安装/卸载出问题
+  日志文件：C:\Users\Public\inklink-install.log
+            C:\Users\Public\inklink-uninstall.log
+  直接把这个文件发给开发者，里面记录了系统版本、每一步做了什么、卡在哪。
+
+  如果双击 install.cmd 完全没反应：
+    a) 先确认是从解压后的文件夹里运行的，不是压缩包的预览窗口里
+    b) 右键 install.cmd -> 属性 -> 如果底部有「解除锁定」，勾上确定后再试
+    c) 右键 install.cmd -> 以管理员身份运行（不要直接双击）
+    d) 都不行就手动开一个管理员 PowerShell，执行：
+         cd /d 你解压的目录
+         powershell -ExecutionPolicy Bypass -File install.ps1
+
+打字出问题
+  1. 引擎日志：C:\inklink-engine\rime-server.log
+  2. 输入法没反应：确认 rime-server.exe 在任务管理器里；没有就双击
+     C:\inklink-engine\rime-server.exe
+  3. 某个软件里用不了：告诉我软件名和它的位数（64 位一般没问题）
 
 
 许可证
