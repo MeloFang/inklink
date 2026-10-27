@@ -77,6 +77,11 @@ if (-not (Get-Process rime-server -ErrorAction SilentlyContinue)) {
     }
 }
 
+# ── 模糊音配置 ─────────────────────────────────────────────────
+# 按 rime-config\fuzzy.yaml 生成引擎的 luna_pinyin_simp.custom.yaml；
+# 内容没变就什么都不做（不会白白重启引擎）
+& (Join-Path $PSScriptRoot 'apply-fuzzy.ps1') -Destination (Join-Path $ENG 'rime\user')
+
 Write-Host ''
 Write-Host "已部署 $version" -ForegroundColor Green
 Write-Host "  64 位 : $target64"

@@ -420,6 +420,32 @@ Obsidian 语料 + AI 兜底，默认关闭联网（符合项目铁律）。
   不动 rime 数据，完全可控。
 - B. 搞清 rime 的 deploy 流程（看 rime 自己的日志），让 prism 正常重建。
 - C. 用 `RimeDeploySchema` / `RimePrebuildAllSchemas` 主动触发单方案重建。
+
+#### ✅ 2026-10-27 已解决（走的还是 B 路线，但之前三步都错在细节）
+
+之前三次失败的真实原因：
+
+1. **文件名认错 scheme**：写的是 `luna_pinyin.custom.yaml`，而我们实际 deploy 的是
+   `luna_pinyin_simp`（`rime-server.cc` 里 `RimeSelectSchema(g_session, "luna_pinyin_simp")`）。
+   custom 文件名必须逐字匹配 schema id，否则 rime 根本不会读它。
+2. **键路径错**：`speller/algebra/__append` 是无效写法。正确做法是**整段替换** `speller/algebra`，
+   用 `__patch:` 把 `pinyin.yaml` 里的模糊音片段拉进来：
+
+   ```yaml
+   patch:
+     speller/algebra:
+       __patch:
+         - pinyin:/zh_z_bufen      # 模糊音片段，必须排在简拼之前
+         - pinyin:/abbreviation
+         - pinyin:/spelling_correction
+         - pinyin:/key_correction
+   ```
+3. **没重启引擎**：librime 在 `RimeInitialize` 时才发现配置变新并 deploy。旧脚本改完文件就以为生效了。
+
+现在这套做成了 `tools\apply-fuzzy.ps1`（读 `rime-config\fuzzy.yaml` → 生成 custom.yaml →
+重启引擎 → 等 deploy → 用管道查 `zi` 验证）。**默认全关**：实测开 `zh_z` 后打 `zi`
+第一个候选从「子」变成「之」、`cang` 从「仓」变成「长」，对打字准的人是净损失。
+要开就把 `rime-config\fuzzy.yaml` 里对应项改成 `true` 再跑一次脚本。
 ### T5 状态盘点（2026-10-26 更新）
 
 **已完成**：
@@ -433,7 +459,8 @@ Obsidian 语料 + AI 兜底，默认关闭联网（符合项目铁律）。
 - 候选窗：收起 1×5 / 展开 5×5，**只给选中行标 1-5**，↑↓ 换行、←→ 换列、数字键选当前行
 - 分词符：`-`/`_` 留在组合串、查询前剥离（`xiang-mu` 显示为 `xiang-mu`）
 - **分段上屏**：选字后剩余拼音保留继续选（`pikeqiu` 选「皮」→ 串变 `keqiu`）；尾巴多打的字母按汉字数吃掉（`pikeqiux` 3 字 → 吃掉 8 个）
-- 21 个按键/切分逻辑单测（`cargo test --release`）
+- **模糊音**（2026-10-27）：`rime-config\fuzzy.yaml` 七组开关 + `tools\apply-fuzzy.ps1` 生成配置并重启引擎验证；默认全关（开了会污染候选）
+- 24 个按键/切分逻辑单测（`cargo test --release`）
 - 安装包 + 一键安装/卸载脚本（带完整日志 + 8 项自检）
 - 仓库清理：14.4 GB → 563 MB
 
@@ -442,12 +469,14 @@ Obsidian 语料 + AI 兜底，默认关闭联网（符合项目铁律）。
 | | 内容 | 备注 |
 |:---|:---|:---|
 | T5a | 用户词库学习 | **下一项就做**。产品核心卖点，协议 `type=2` 和 `ipc::select()` 已埋好，入口在 `rime-server/rime-server.cc` 的 `select_candidate()`。必须分三步（PLAN 见上），上次一次性全加崩过 |
+| 纠错 | 漏/多/错一个字母的编辑距离探针 | `zheg`/`zhge` 已靠 DP 修好；但 `jintian` 打成 `jintain`（换位）这类还不行。方案：DLL 侧生成变体再查（可单测） |
 | T5d | 拼音下划线 | 现在拼音像普通英文文字，是"最不像输入法"的地方 |
 | T5b | 音节分隔显示 | librime preedit 已有 `jian zou pian feng`，未接到候选窗 |
-| T5g | 模糊音 | `chuan`→`chuang`；三条路都试过失败，建议走服务端方案 |
 | T5c | 候选窗美化 | |
 | T5e | 个人云词库 | Obsidian 语料 + AI 兜底 |
 | T5f | librime 工程化 | 现在靠手工解 Weasel 包 |
+
+（T5g 模糊音已关闭：见上面「✅ 2026-10-27 已解决」）
 
 **测试能力现状**：
 

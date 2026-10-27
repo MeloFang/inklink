@@ -1,0 +1,23 @@
+# inklink 模糊音配置
+#
+# 模糊音 = 把「容易混的声母/韵母」当成同一个音。开了之后两种拼法都能出候选：
+# 打开 zh_z 后打 zi 和 zhi 都会出「知/只/字」的全部候选，再由语言模型排序。
+#
+# 改完执行（会重新生成引擎配置并重启引擎）：
+#   powershell -ExecutionPolicy Bypass -File tools\apply-fuzzy.ps1
+#
+# 语法：组名: true / false
+# true  = 启用
+# false = 关闭（必须打准）
+# 删掉某一行 = 按关闭处理（等于写了 false）
+
+# 组名        规则                                          说明
+# 默认全关：模糊音只对有口音的人有用，对打字准的人反而会污染候选
+# （实测开 zh_z 后打 zi 第一个变成「之」、打 cang 第一个变成「长」）
+zh_z: false   # zh/z  ch/c  sh/s                            湖南/两广等口音常混，最常见的一组
+en_eng: false # en/eng  in/ing                             南方口音常混，但开了会明显变噪
+n_l: false    # n/l                                         如 你 ni = li
+eng_ong: false # (b p m f) + eng/ong，如 meng = mong
+f_h: false    # fu/hu、fei/hui、fa/hua 等                    湖南/福建口音
+r_l: false    # r/l                                         如 人 ren = len
+r_y: false    # ren→yin、reng→ying 等                        部分方言

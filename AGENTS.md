@@ -43,10 +43,14 @@ inklink/
 │  └─ build.rs           把 VERSION 编进 DLL
 ├─ rime-server/          C++ 引擎服务（链 librime，x86）
 │  └─ rime-server.cc     协议 [u8 type] + 查询/选词
+├─ rime-config/          引擎侧配置源
+│  └─ fuzzy.yaml         模糊音七组开关（默认全关）
 ├─ installer/            安装/卸载脚本模板（版本号由打包脚本注入）
 ├─ tools/                构建部署与打包脚本 + 词库转换
 │  ├─ version.ps1        读写 VERSION
 │  ├─ deploy-local.ps1   构建 + 部署到本机
+│  ├─ apply-fuzzy.ps1    按 fuzzy.yaml 生成 rime custom.yaml 并重启引擎验证
+│  ├─ engine-pipe.ps1    命名管道客户端（诊断/验证，可 dot-source）
 │  └─ release.ps1        打 dist\inklink-<版本>.zip
 ├─ dist/                 发布产物（**不进 git**）
 ├─ docs/                 架构、ADR、阶段记录
@@ -99,6 +103,11 @@ cargo build --release --lib --target i686-pc-windows-msvc --target-dir target-st
 
 引擎是 C++（`rime-server/rime-server.cc`），编译命令写在文件头注释里，需要 32 位 MSVC 环境
 （`vcvars32.bat`）；日常改 DLL 不需要动它。
+
+引擎侧配置（模糊音）在 `rime-config\fuzzy.yaml`，用 `tools\apply-fuzzy.ps1` 生成到
+`C:\inklink-engine\rime\user\` 并重启引擎验证。**custom.yaml 的文件名必须逐字等于真正 deploy 的
+schema id**（我们是 `luna_pinyin_simp`，不是 `luna_pinyin`），且改完必须重启 `rime-server`
+——librime 只在 `RimeInitialize` 时重新 deploy。
 
 > 环境事实：rustup 默认 `stable-x86_64-pc-windows-msvc`（1.99.1）；VS 2022 Community + Windows SDK 10.0.26100 已装；Node 24 / Python 3.13 已装；**无 .NET**。
 

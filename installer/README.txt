@@ -104,6 +104,42 @@ inklink 输入法 __INKLINK_VERSION__  测试版
 
 GPL-3.0。词库衍生自 rime-ice（GPL-3.0），引擎为 librime（BSD-3-Clause）。
 
+
+模糊音（可选，默认关）
+----------------------
+
+普通话不分 zh/z、ch/c、sh/s，或者 in/ing、en/eng、n/l 分不清的，可以打开模糊音。
+默认是关的 —— 因为我们实测发现：开了之后打 zi 第一个候选会从「子」变成「之」，
+打 cang 会从「仓」变成「长」，对打字准的人反而是负担。
+
+打开方法：
+  1. 用记事本打开
+     C:\inklink-engine\rime\user\luna_pinyin_simp.custom.yaml
+     （没有这个文件就新建一个）
+  2. 找到 patch: 下面 speller/algebra: 的 __patch: 列表，
+     把想开的那组加进去，例如要开 zh/z 和 in/ing：
+         patch:
+           speller/algebra:
+             __patch:
+               - pinyin:/zh_z_bufen
+               - pinyin:/en_eng_bufen
+               - pinyin:/abbreviation
+               - pinyin:/spelling_correction
+               - pinyin:/key_correction
+     注意模糊音必须排在 pinyin:/abbreviation 前面。
+  3. 重启引擎：任务管理器里结束 rime-server.exe，
+     再双击 C:\inklink-engine\rime-server.exe
+
+七组可选：
+  zh_z      zh/z  ch/c  sh/s 不分
+  n_l       n/l 不分
+  r_l       r/l 不分
+  r_y       r/y 不分（人/银 这类）
+  f_h       f/h 不分
+  eng_ong   eng/ong 不分
+  en_eng    en/eng 和 in/ing 不分
+
+
 更新到新版本
 ------------
 

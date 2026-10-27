@@ -66,7 +66,11 @@ foreach ($f in 'installation.yaml', 'user.yaml') {
 Get-ChildItem $userDst -Recurse -File -Include *.userdb, *.lock -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
 Write-Host '  rime 数据 OK'
 
-# ── 4. 打包 ────────────────────────────────────────────────────
+# ── 4. 模糊音配置（和引擎配置同源，装机即生效，用户不用手跑脚本） ──
+& (Join-Path $PSScriptRoot 'apply-fuzzy.ps1') -Destination $userDst -NoRestart | Out-Null
+Write-Host '  模糊音配置 OK'
+
+# ── 5. 打包 ────────────────────────────────────────────────────
 if ($SkipZip) {
     Write-Host "已生成目录 $out（未打包）" -ForegroundColor Green
     return

@@ -240,6 +240,7 @@ C:\inklink-engine\
 | 标点 | `,` `。` `;` `/` `\` `[` `]` `-` `=` 全转中文，Shift 变体 `？：《》「」`；**Shift+1~0 出全角 `！＠＃￥％……＆＊（）`**；**引号按一下开、再按一下合，自动成对 `“”` `‘’`**（`DQUOTE_OPEN`/`SQUOTE_OPEN` 两个全局开关） |
 | 英文模式 | Shift 单击切（按下不动、松开才生效，期间按过别的键就不算单击）；CapsLock 开 = 大写英文；英文模式下不认领任何键（WPS/Excel 兼容） |
 | 32 位 | `inklink_tsf32.dll` 注册在 `WOW6432Node`，WPS 等可用 |
+| 模糊音 | 七组可选开关在 `rime-config\fuzzy.yaml`，跑 `tools\apply-fuzzy.ps1` 生成引擎配置并重启验证。**默认全关**（实测开 `zh_z` 会把 `zi` 的首选从「子」顶成「之」） |
 | 安装器 | 脚本模板在 `installer\`，打包成 `dist\inklink-<版本>.zip`；`install.cmd` 一键装，带完整日志 `C:\Users\Public\inklink-install.log`，结尾 8 项自检 |
 | 单测 | `cd tsf && cargo test --release` → 24 passed（按键认领、标点映射含引号交替、拼音切分、分段上屏消耗字母数） |
 
@@ -248,9 +249,9 @@ C:\inklink-engine\
 | # | 任务 | 为什么现在做 |
 |:---|:---|:---|
 | 1 | **M1 用户词库学习** | 产品核心卖点（"每人专属词库"）一条都还没有；协议 `type=2` 和 `ipc::select()` 都已埋好，服务端 `select_candidate()` 现在只写日志 |
-| 2 | T5d 拼音下划线 | 拼音现在像普通英文，"最不像输入法"的地方 |
-| 3 | T5b 音节分隔显示 | librime preedit 已有 `jian zou pian feng`，未接到候选窗 |
-| 4 | T5g 模糊音 | `chuan`→`chuang` 打不出「创建」；建议走服务端方案（PLAN.md T5g 路线 A） |
+| 2 | 纠错探针（漏/多/错/换位一个字母） | `jintain`→`jintian` 这类还不行；在 DLL 侧生成变体再查，可 `cargo test` |
+| 3 | T5d 拼音下划线 | 拼音现在像普通英文，"最不像输入法"的地方 |
+| 4 | T5b 音节分隔显示 | librime preedit 已有 `jian zou pian feng`，未接到候选窗 |
 | 5 | T5c 候选窗美化 | 圆角/间距/配色 |
 | 6 | T5e 个人云词库 + M3 AI | Obsidian 语料 + 翻译/续写，原始愿景，最后做 |
 
@@ -292,3 +293,9 @@ DLL 被加载后无法卸载：脚本每次用**新文件名 + 改注册表**，
   以前会在没光标的地方飘出候选窗。现在 `TextService_Impl::can_compose(pic)` 双向判定
   （`pic` 为空时再问 `ITfThreadMgr::GetFocus()` → `ITfDocumentMgr::GetTop()`），
   不成立就一个键都不认领；候选窗也去掉了 `(200, 200)` 坐标兜底——拿不到可信坐标直接不显示。
+- **rime 的 custom.yaml 文件名必须逐字等于真正 deploy 的 schema id**：我们跑的是 `luna_pinyin_simp`，
+  早先写的 `luna_pinyin.custom.yaml` 从来没被读过（这是模糊音"改了没效果"的真凶之一）。
+- **改 `speller/algebra` 要整段替换**：`speller/algebra/__append` 是无效写法，正确是
+  `patch: speller/algebra: __patch: [...]`，且模糊音片段必须排在 `pinyin:/abbreviation` 之前。
+- **改了 rime 配置必须重启 `rime-server`**：librime 只在 `RimeInitialize` 时发现配置变新并 deploy，
+  文件写进去不会立刻生效（`tools\apply-fuzzy.ps1` 会重启 + 等 deploy + 用管道验证）。
