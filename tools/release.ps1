@@ -6,7 +6,9 @@
 # 并且 C:\inklink-engine\ 里是完整的引擎 + rime 数据。
 
 param(
-    [switch]$SkipZip
+    [switch]$SkipZip,
+    # 打完包后保留几个历史版本（1 = 只留刚打出来的这个；想留上一个回滚就传 2）
+    [int]$KeepOld = 1
 )
 
 $ErrorActionPreference = 'Stop'
@@ -77,8 +79,13 @@ if ($SkipZip) {
     return
 }
 $zip = Join-Path $root "dist\inklink-$version.zip"
-if (Test-Path $zip) { Remove-Item $zip -Force }
-Compress-Archive -Path $out -DestinationPath $zip -CompressionLevel Optimal
+# 先压到临时目录，成功后再整体替换。
+# 教训：老写法是「先删旧 zip 再压」，一旦压缩被拒（Explorer 预览 / 杀软 / 网盘同步占着目标文件），
+# 旧包已经删了、新包也没生成，等于把发布包弄丢（2026-10-27 真踩过）。
+$zipTmp = Join-Path $env:TEMP "inklink-$version.zip"
+if (Test-Path $zipTmp) { Remove-Item $zipTmp -Force }
+Compress-Archive -Path $out -DestinationPath $zipTmp -CompressionLevel Optimal
+Move-Item $zipTmp $zip -Force
 $item = Get-Item $zip
 $hash = (Get-FileHash $zip -Algorithm SHA256).Hash
 
@@ -87,3 +94,30 @@ Write-Host "发布包：$zip" -ForegroundColor Green
 Write-Host ("  大小   : {0:N2} MB" -f ($item.Length / 1MB))
 Write-Host "  SHA256 : $hash"
 Write-Host "  解压后 : inklink-$version\install.cmd"
+
+# ── 6. 清理旧产物（dist 每次 60MB 目录 + 27MB zip，不清理会一直堆）──
+# 每个版本是「目录 + zip」一对，所以按版本分组删，不能按文件数删（否则会剩半个版本）。
+# 保留：刚打出来的这个（一定保留）+ 最近 $KeepOld 个历史版本（默认 1，方便回滚上一个）。
+# 排序按时间不按版本号字符串，因为 0.1.30 和 1.0.0 这类跨里程碑版本号不能直接比大小。
+$distRoot = Join-Path $root 'dist'
+$staleAll = Get-ChildItem $distRoot -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -like 'inklink-*' -and $_.FullName -ne $out -and $_.FullName -ne $zip }
+$stale = @()
+if ($staleAll) {
+    # 从名字里取版本号：inklink-1.0.0 / inklink-1.0.0.zip -> 1.0.0
+    $groups = $staleAll | Group-Object { ($_.Name -replace '^inklink-', '') -replace '\.zip$', '' } |
+        Sort-Object { ($_.Group | Measure-Object LastWriteTime -Maximum).Maximum } -Descending
+    $groups | Select-Object -Skip ([Math]::Max(0, $KeepOld)) | ForEach-Object { $stale += $_.Group }
+}
+if ($stale.Count -gt 0) {
+    $freed = 0
+    foreach ($s in $stale) {
+        if (-not $s.FullName.StartsWith($distRoot + '\', [StringComparison]::OrdinalIgnoreCase)) { continue }
+        $sz = if ($s.PSIsContainer) {
+            (Get-ChildItem $s.FullName -Recurse -File -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum
+        } else { $s.Length }
+        Remove-Item $s.FullName -Recurse -Force -ErrorAction SilentlyContinue
+        if (-not (Test-Path $s.FullName)) { $freed += $sz }
+    }
+    Write-Host ("  已清理旧产物 {0} 项，释放 {1:N1} MB（保留刚打出来的 + 最近 {2} 个历史版本）" -f $stale.Count, ($freed / 1MB), $KeepOld)
+}

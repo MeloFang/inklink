@@ -67,6 +67,31 @@ Copy-Item $dll32 $target32 -Force
 Set-ItemProperty "HKLM:\SOFTWARE\Classes\CLSID\$CLSID\InprocServer32" -Name '(default)' -Value $target64
 Set-ItemProperty "HKLM:\SOFTWARE\Classes\Wow6432Node\CLSID\$CLSID\InprocServer32" -Name '(default)' -Value $target32
 
+# ── 清理旧 DLL ─────────────────────────────────────────────────
+# DLL 被加载后不能热替换，所以每次部署都是新文件名 + 改注册表，旧文件会一直堆着。
+# 这里删掉注册表已经不再引用的 inklink_tsf*.dll（包括 v19 时代的旧命名）。
+# 被正在运行的程序占着的会删不掉 —— 跳过并提示，下次部署再收拾，不让它变成硬错误。
+$keep = @($target64, $target32) | ForEach-Object { (Split-Path $_ -Leaf).ToLowerInvariant() }
+$staleDlls = Get-ChildItem $PF -Filter 'inklink_tsf*.dll' -ErrorAction SilentlyContinue |
+    Where-Object { $keep -notcontains $_.Name.ToLowerInvariant() -and $_.DirectoryName -eq $PF }
+if ($staleDlls) {
+    $removed = 0
+    $locked  = @()
+    foreach ($d in $staleDlls) {
+        if (-not $d.FullName.StartsWith($PF + '\', [StringComparison]::OrdinalIgnoreCase)) { continue }
+        try {
+            Remove-Item $d.FullName -Force -ErrorAction Stop
+            $removed++
+        } catch {
+            $locked += $d.Name
+        }
+    }
+    if ($removed -gt 0) { Write-Host "  已清理旧 DLL $removed 个" -ForegroundColor DarkGray }
+    if ($locked.Count -gt 0) {
+        Write-Host ("  有 {0} 个旧 DLL 正被程序占用（重启那些程序后再跑一次 -NoBump 即可清掉）：{1}" -f $locked.Count, ($locked -join ', ')) -ForegroundColor Yellow
+    }
+}
+
 # ── 引擎 ───────────────────────────────────────────────────────
 if (-not (Get-Process rime-server -ErrorAction SilentlyContinue)) {
     if (Test-Path (Join-Path $ENG 'rime-server.exe')) {

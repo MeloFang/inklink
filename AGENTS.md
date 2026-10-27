@@ -88,6 +88,10 @@ powershell -ExecutionPolicy Bypass -File tools\release.ps1
 ```
 
 ⚠️ `-ExecutionPolicy Bypass` 必须带：本机 `CurrentUser` 策略是 `RemoteSigned`，未签名的本地脚本会被拒。
+**产物不会无限堆积**：`release.ps1` 打完包自动清理 `dist\` 里的旧版本，只留刚打出来的那个 +
+`-KeepOld` 指定个数的历史版本（默认 1）。`deploy-local.ps1` 部署后会删掉注册表已不再引用的旧
+`inklink_tsf*.dll`；正被程序占用的会跳过并提示名字，重启那些程序后再跑一次 `-NoBump` 就清掉了。
+打包先压到 `%TEMP%` 再整体 `Move-Item` 替换，避免"先删旧包、压缩又失败"把发布包弄丢。
 
 ## 构建与测试
 
