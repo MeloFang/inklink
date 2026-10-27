@@ -56,11 +56,22 @@ DLL 在引擎不在时会按这个路径自动拉起。
 - **NULL DACL**：输入法会被不同权限的应用调用，管道必须允许任何人连。
 - **候选靠 `RimeGetContext` + `{Page_Down}` 翻页收集**（`RimeCandidateList*` 在本版本返回空）。
 - **英文候选插在哪由 `is_pinyin_code()` 决定**：像拼音就把原始输入排最后（`zheg` → 这个 排第一），
-  不像拼音才排最前（`github` → github 排第一）。判定分三条：
+  不像拼音才排在纠错结果后面（`github` → github 排第一）。判定分三条：
   1. 整串能完整切成合法音节（`xiangmu`、`nice`）；
   2. 全是声母（`zg`、`npm`，简拼）；
   3. 长度 ≥3 且**允许一个音节只打一半**（`zheg` = zhe + g、`zhge` = zh + ge、`xiangm` = xiang + m）。
      有了第 3 条，打错/漏字母不会再被当成英文；`hello`/`test`/`world`/`code` 这类仍然是 0 或 2+ 个半音节，不受影响。
+- **纠错探针**（`query()` 里，2026-10-27）：多打/错打/换位一个字母时，在引擎侧生成变体再查一遍，
+  一次管道往返搞定，DLL 完全不用改。三层筛子保证正常输入零开销：
+  1. `is_full_pinyin(code)` 为真（`xiangmu`）→ 不探；
+  2. `ends_with_half_syllable(code)` 为真（`zheg`/`xiangm`，末尾音节打一半）→ 不探，
+     这类 librime 的前缀匹配处理得更好，插手会把「项目」换成「向」；
+  3. 其余（`niihao`/`zhemge`/`shanghhai`/`nihoa`）→ `edit_variants()` 生成变体：
+     ① 删相邻重复字母 ② 相邻换位 ③ 删任意一个字母，每个变体必须先 `is_full_pinyin()` 通过
+     才去查 rime（所以 `github`/`vscode` 一个变体都产不出来）。纠错结果排最前。
+- **`variant_score()`**：给合法变体排优先级的启发式，惩罚"需要单字母音节"的切分——
+  `nihoa` 的两个合法变体里 `nihao`（ni+hao，0 个单字母）排在 `nioha`（ni+o+ha，1 个）前面。
+  只按生成顺序会先出「你哦哈」这种垃圾。
 
 ## 首选项
 

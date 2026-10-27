@@ -205,6 +205,138 @@ static bool is_pinyin_code(const std::string& code) {
     return dp2[n][0][1] || dp2[n][1][1];
 }
 
+/// 整串能否切成**全部完整**的合法音节（不允许半个音节）。
+///
+/// 正确拼音（`nihao` / `pikeqiu`）为真；多打、打错、换位一个字母
+/// （`zhemge` / `niihao` / `jintain`）为假 —— 这就是"要不要纠错"的判据。
+static bool is_full_pinyin(const std::string& code) {
+    if (code.empty()) return false;
+    size_t n = code.size();
+    std::vector<char> dp(n + 1, 0);
+    dp[0] = 1;
+    for (size_t i = 1; i <= n; i++) {
+        size_t lo = (i > 6) ? i - 6 : 0;
+        for (size_t j = lo; j < i; j++) {
+            if (dp[j] && is_syllable(code.substr(j, i - j))) {
+                dp[i] = 1;
+                break;
+            }
+        }
+    }
+    return dp[n] != 0;
+}
+
+/// 末尾是不是"打了一半的音节"（`zheg` 的 `g`、`xiangm` 的 `m`）。
+///
+/// 这类输入 librime 的前缀匹配本来就处理得很好（`zheg` → 这个），
+/// 再去纠错反而会把「项目」换成「向」。所以要区分开。
+static bool ends_with_half_syllable(const std::string& code) {
+    size_t n = code.size();
+    size_t lo = (n > 6) ? n - 6 : 0;
+    for (size_t j = lo; j < n; j++) {
+        if (j > 0 && !is_full_pinyin(code.substr(0, j))) continue;
+        std::string tail = code.substr(j);
+        if (!is_syllable(tail) && is_syllable_prefix(tail)) return true;
+    }
+    return false;
+}
+
+/// 纯 ASCII（英文原文或拉丁字母候选）。
+static bool ascii_only(const std::string& s) {
+    for (unsigned char c : s) {
+        if (c >= 0x80) return false;
+    }
+    return true;
+}
+
+/// 给一个"能完整切成音节"的串打分，越小越像人真正想打的东西。
+///
+/// 两个维度：① 需要几个单字母音节（`o`/`e`/`a` 单独成音节很少是本意，
+/// `nioha` = ni+o+ha 就是这种垃圾切分）；② 音节个数（越少越紧）。
+/// 用它给变体排序，`nihoa` 的两个合法变体里 `nihao`（ni+hao）就排在
+/// `nioha`（ni+o+ha）前面。
+static long variant_score(const std::string& s) {
+    size_t n = s.size();
+    if (n == 0) return 1000000;
+    const long INF = 1000000;
+    std::vector<long> single(n + 1, INF), count(n + 1, INF);
+    single[0] = 0;
+    count[0] = 0;
+    for (size_t i = 1; i <= n; i++) {
+        for (size_t len = 1; len <= 6 && len <= i; len++) {
+            std::string part = s.substr(i - len, len);
+            if (!is_syllable(part)) continue;
+            long prev_single = single[i - len];
+            long prev_count = count[i - len];
+            if (prev_single >= INF) continue;
+            long cur_single = prev_single + (len == 1 ? 1 : 0);
+            long cur_count = prev_count + 1;
+            if (cur_single < single[i] || (cur_single == single[i] && cur_count < count[i])) {
+                single[i] = cur_single;
+                count[i] = cur_count;
+            }
+        }
+    }
+    if (single[n] >= INF) return INF;
+    return single[n] * 100 + count[n];
+}
+
+/// 生成"改一个字母就能变成合法拼音"的候选，按可能的先后排序：
+///   ① 删掉相邻重复字母（`niihao` → `nihao`、`shanghhai` → `shanghai`）
+///   ② 相邻两字母换位（`jintain` → `jintian`）
+///   ③ 删掉任意一个字母（`zhemge` → `zhege`）
+///
+/// 只有**能完整切成音节**的变体才留下，所以 `github`/`vscode` 这类英文词
+/// 一个变体都产不出来（后面的 rime 查询一次都不会发生）。
+/// 最后按 `variant_score` 稳定排序：同一族的变体里，切分更"像人打的"排前面。
+static std::vector<std::string> edit_variants(const std::string& code) {
+    std::vector<std::string> v;
+    auto add = [&](const std::string& s) {
+        if (s.empty() || s == code) return;
+        if (std::find(v.begin(), v.end(), s) != v.end()) return;
+        if (!is_full_pinyin(s)) return;
+        v.push_back(s);
+    };
+    for (size_t i = 1; i < code.size(); i++) {
+        if (code[i] == code[i - 1]) add(code.substr(0, i) + code.substr(i + 1));
+    }
+    for (size_t i = 0; i + 1 < code.size(); i++) {
+        std::string s = code;
+        std::swap(s[i], s[i + 1]);
+        add(s);
+    }
+    for (size_t i = 0; i < code.size(); i++) {
+        add(code.substr(0, i) + code.substr(i + 1));
+    }
+    std::stable_sort(v.begin(), v.end(), [](const std::string& a, const std::string& b) {
+        return variant_score(a) < variant_score(b);
+    });
+    return v;
+}
+
+/// 只查第一页、最多要 need 个候选（给纠错探针用，比主查询便宜）。
+static std::vector<std::string> collect_page0(const std::string& code, size_t need) {
+    std::vector<std::string> out;
+    g_clear(g_session);
+    if (!g_simulate(g_session, code.c_str())) {
+        g_clear(g_session);
+        return out;
+    }
+    RimeContext ctx;
+    std::memset(&ctx, 0, sizeof(ctx));
+    ctx.data_size = sizeof(RimeContext);
+    if (g_get_context(g_session, &ctx)) {
+        int n = ctx.menu.num_candidates;
+        for (int i = 0; i < n && out.size() < need; i++) {
+            if (ctx.menu.candidates[i].text && ctx.menu.candidates[i].text[0]) {
+                out.push_back(ctx.menu.candidates[i].text);
+            }
+        }
+        g_free_context(&ctx);
+    }
+    return out;
+}
+
 /// 把用户选过的词提到前面（同一拼音内按次数降序）。
 static void apply_user_boost(const std::string& code, std::vector<std::string>& cands) {
     auto it = g_user.find(code);
@@ -235,16 +367,38 @@ static std::vector<std::string> query(const std::string& code) {
     std::vector<std::string> out;
     if (code.empty()) return out;
 
+    bool looks_pinyin = is_pinyin_code(code);
+
+    // ── 纠错探针 ──
+    // 三种情况分开处理：
+    //  - 正常拼音（`xiangmu`）：整串切得开，一个探针都不发，不占同步路径预算；
+    //  - 末尾打了一半（`zheg`/`xiangm`）：librime 的前缀匹配本就处理得好，
+    //    插手反而会把「项目」换成「向」；
+    //  - 中间多/错/换位一个字母（`zhemge`/`niihao`/`jintain`）：rime 只能拿多余
+    //    字母硬切出一串怪词，这时候纠错结果才更可信。
+    std::vector<std::string> corrected;
+    if (code.size() >= 3 && !is_full_pinyin(code) && !ends_with_half_syllable(code)) {
+        std::vector<std::string> vars = edit_variants(code);
+        if (vars.size() > 8) vars.resize(8);
+        for (const std::string& v : vars) {
+            for (const std::string& w : collect_page0(v, 6)) {
+                if (ascii_only(w)) continue;
+                if (std::find(corrected.begin(), corrected.end(), w) != corrected.end()) continue;
+                corrected.push_back(w);
+                if (corrected.size() >= 8) break;
+            }
+            if (corrected.size() >= 8) break;
+        }
+        if (!corrected.empty()) logf("correct %s -> %zu words", code.c_str(), corrected.size());
+    }
+
     g_clear(g_session);
     if (!g_simulate(g_session, code.c_str())) {
         g_clear(g_session);
-        return out;
+        if (corrected.empty()) return out;
+        return corrected;   // 连 rime 都喂不进去，直接给纠错结果
     }
     g_last_code = code;
-
-    // 先取一次 preedit：rime 的音节切分会用空格/撇号分隔。
-    // 去掉分隔符后如果和输入一致，说明整串都是合法拼音；否则当成英文。
-    bool looks_pinyin = true;
 
     // 收集当前页 + 往后翻几页，凑够 MAX_CANDS 个候选
     for (int page = 0; page < 6 && (int)out.size() < MAX_CANDS; page++) {
@@ -265,8 +419,16 @@ static std::vector<std::string> query(const std::string& code) {
         if (!g_simulate(g_session, "{Page_Down}")) break;
     }
 
-    // 翻回第一页，这样后续"选词上报"按数字键时下标才对得上。
-    // 注意：这里**不能**清组合，否则紧接着的选词就没候选可选了。
+    // 合并纠错结果：探针只在"原串根本切不干净"时才跑，此时 rime 那串候选是拿多余
+    // 字母硬切出来的（`zhemge` → 这么个 / 这么高 / 这么干…），纠错结果更可信，放最前。
+    if (!corrected.empty()) {
+        std::vector<std::string> merged = corrected;
+        for (const std::string& w : out) {
+            if (std::find(merged.begin(), merged.end(), w) == merged.end()) merged.push_back(w);
+        }
+        out.swap(merged);
+    }
+
     // 英文候选：把原始输入作为一个候选追加（github、vscode 这类英文词）。
     // librime 只认拼音，纯英文会被切成 给/过/跟，用户就没法直接上屏英文了。
     if (code.size() >= 2) {
@@ -274,15 +436,20 @@ static std::vector<std::string> query(const std::string& code) {
         for (char c : code) {
             if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'))) { is_pure_alpha = false; break; }
         }
-        // 用音节校验判断：xiang 是拼音，github 不是
-        looks_pinyin = is_pinyin_code(code);
-
         if (is_pure_alpha && out.size() < (size_t)MAX_CANDS) {
             auto it = std::find(out.begin(), out.end(), code);
             if (it == out.end()) {
-                // 不像拼音的（github/vscode）排最前；像拼音的（wang）排最后当兜底
-                if (!looks_pinyin) out.insert(out.begin(), code);
-                else out.push_back(code);
+                // 不像拼音时英文原样要留在第一屏：没有纠错结果（github/vscode）排最前；
+                // 有纠错结果说明可能是打错的拼音（niihao → 你好），让纠错占第一，
+                // 原样紧跟其后（`update` 这种"恰好差一个字母就是合法拼音"的英文词
+                // 因此仍然一眼能看到）。像拼音的（`code`）原样排最后，一直如此。
+                if (!looks_pinyin) {
+                    size_t pos = corrected.empty() ? 0 : 1;
+                    if (pos > out.size()) pos = out.size();
+                    out.insert(out.begin() + pos, code);
+                } else {
+                    out.push_back(code);
+                }
             }
         }
     }

@@ -24,6 +24,11 @@ inklink 输入法 __INKLINK_VERSION__  测试版
 
   拼音输入        xiangmu          -> 项目
   长句输入        wolaishuoshuo    -> 我来说说
+  打错一点也能纠  niihao           -> 你好（多打一个字母）
+                  jintain          -> 今天（两个字母打反了）
+                  zhemge           -> 这个（多打一个字母）
+                  shanghhai        -> 上海（多打一个字母）
+                  末尾少打一个音    zheg / xiangm    -> 这个 / 项目
   分段上屏        pikeqiu          选「皮」之后剩下的 keqiu 留在候选窗里，
                                    可以接着选「克」「球」；多打的字母自动丢掉
   空格            上屏当前高亮的候选

@@ -236,24 +236,23 @@ C:\inklink-engine\
 | 翻页 | `-`/`=`（收起态 `-` 是分词符，展开态才是翻页）、PgUp/PgDn |
 | 分词符 | `-`/`_` 留在组合串里、查询前剥离；`xiang-mu` 显示为 `xiang-mu` |
 | 容错 | 拼音打一半也出候选：`zheg`、`zhge`、`xiangm`、`jig`、`shiq` 都能出「这个/项目/几个/事情」（引擎侧 `is_pinyin_code` 允许**一个**音节只打一半）；真英文词（`hello`/`github`/`world`）仍然英文候选排第一 |
+| 纠错 | 多打/换位一个字母也能纠：`niihao`→你好、`xiangmuu`→项目、`zhemge`→这个、`shanghhai`→上海、`nihoa`→你好、`jintain`→今天。引擎侧 `edit_variants()` 生成变体（删重复/换位/删一个），`variant_score()` 排掉"单字母音节"那种垃圾切分；末尾半音节（`zheg`/`xiangm`）交给 librime 前缀匹配、不插手 |
 | 分段上屏 | 选了一个字后**剩下的拼音保留**继续选（`pikeqiu` 选「皮」→ 串变 `keqiu`）；尾巴上多打的字母按汉字数吃掉 |
 | 标点 | `,` `。` `;` `/` `\` `[` `]` `-` `=` 全转中文，Shift 变体 `？：《》「」`；**Shift+1~0 出全角 `！＠＃￥％……＆＊（）`**；**引号按一下开、再按一下合，自动成对 `“”` `‘’`**（`DQUOTE_OPEN`/`SQUOTE_OPEN` 两个全局开关） |
 | 英文模式 | Shift 单击切（按下不动、松开才生效，期间按过别的键就不算单击）；CapsLock 开 = 大写英文；英文模式下不认领任何键（WPS/Excel 兼容） |
 | 32 位 | `inklink_tsf32.dll` 注册在 `WOW6432Node`，WPS 等可用 |
 | 模糊音 | 七组可选开关在 `rime-config\fuzzy.yaml`，跑 `tools\apply-fuzzy.ps1` 生成引擎配置并重启验证。**默认全关**（实测开 `zh_z` 会把 `zi` 的首选从「子」顶成「之」） |
 | 安装器 | 脚本模板在 `installer\`，打包成 `dist\inklink-<版本>.zip`；`install.cmd` 一键装，带完整日志 `C:\Users\Public\inklink-install.log`，结尾 8 项自检 |
-| 单测 | `cd tsf && cargo test --release` → 24 passed（按键认领、标点映射含引号交替、拼音切分、分段上屏消耗字母数） |
+| 单测 | `cd tsf && cargo test --release` → 25 passed（按键认领、标点映射含引号交替、拼音切分、分段上屏消耗字母数） |
 
 ### 还没做的（按建议优先级）
 
 | # | 任务 | 为什么现在做 |
 |:---|:---|:---|
 | 1 | **M1 用户词库学习** | 产品核心卖点（"每人专属词库"）一条都还没有；协议 `type=2` 和 `ipc::select()` 都已埋好，服务端 `select_candidate()` 现在只写日志 |
-| 2 | 纠错探针（漏/多/错/换位一个字母） | `jintain`→`jintian` 这类还不行；在 DLL 侧生成变体再查，可 `cargo test` |
-| 3 | T5d 拼音下划线 | 拼音现在像普通英文，"最不像输入法"的地方 |
-| 4 | T5b 音节分隔显示 | librime preedit 已有 `jian zou pian feng`，未接到候选窗 |
-| 5 | T5c 候选窗美化 | 圆角/间距/配色 |
-| 6 | T5e 个人云词库 + M3 AI | Obsidian 语料 + 翻译/续写，原始愿景，最后做 |
+| 2 | T5d 拼音下划线 | 拼音现在像普通英文，"最不像输入法"的地方 |
+| 3 | T5c 候选窗美化 | 圆角/间距/配色 |
+| 4 | T5e 个人云词库 + M3 AI | Obsidian 语料 + 翻译/续写，原始愿景，最后做 |
 
 ### M1 必须分三步（上次一次性全加导致查询崩溃）
 
