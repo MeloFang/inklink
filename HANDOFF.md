@@ -238,12 +238,12 @@ C:\inklink-engine\
 | 容错 | 拼音打一半也出候选：`zheg`、`zhge`、`xiangm`、`jig`、`shiq` 都能出「这个/项目/几个/事情」（引擎侧 `is_pinyin_code` 允许**一个**音节只打一半）；真英文词（`hello`/`github`/`world`）仍然英文候选排第一 |
 | 纠错 | 多打/换位一个字母也能纠：`niihao`→你好、`xiangmuu`→项目、`zhemge`→这个、`shanghhai`→上海、`nihoa`→你好、`jintain`→今天。引擎侧 `edit_variants()` 生成变体（删重复/换位/删一个），`variant_score()` 排掉"单字母音节"那种垃圾切分；末尾半音节（`zheg`/`xiangm`）交给 librime 前缀匹配、不插手 |
 | 分段上屏 | 选了一个字后**剩下的拼音保留**继续选（`pikeqiu` 选「皮」→ 串变 `keqiu`）；尾巴上多打的字母按汉字数吃掉 |
-| 标点 | `,` `。` `;` `/` `\` `[` `]` `-` `=` 全转中文，Shift 变体 `？：《》「」`；**Shift+1~0 出全角 `！＠＃￥％……＆＊（）`**；**引号按一下开、再按一下合，自动成对 `“”` `‘’`**（`DQUOTE_OPEN`/`SQUOTE_OPEN` 两个全局开关） |
+| 标点 | `,` `。` `;` `/` `\` `[` `]` 全转中文，Shift 变体 `？：《》「」`；**Shift+1~0 出全角 `！＠＃￥％……＆＊（）`**；**引号按一下开、再按一下合，自动成对 `“”` `‘’`**（`DQUOTE_OPEN`/`SQUOTE_OPEN` 两个全局开关）；**`-` `=` `_` `+` 永远半角不转换**（`halfwidth_symbol()`，Excel 公式 `=A1-B1` 要原样字符），空闲时干脆不认领这两个键 |
 | 英文模式 | Shift 单击切（按下不动、松开才生效，期间按过别的键就不算单击）；CapsLock 开 = 大写英文；英文模式下不认领任何键（WPS/Excel 兼容） |
 | 32 位 | `inklink_tsf32.dll` 注册在 `WOW6432Node`，WPS 等可用 |
 | 模糊音 | 七组可选开关在 `rime-config\fuzzy.yaml`，跑 `tools\apply-fuzzy.ps1` 生成引擎配置并重启验证。**默认全关**（实测开 `zh_z` 会把 `zi` 的首选从「子」顶成「之」） |
 | 安装器 | 脚本模板在 `installer\`，打包成 `dist\inklink-<版本>.zip`；`install.cmd` 一键装，带完整日志 `C:\Users\Public\inklink-install.log`，结尾 8 项自检 |
-| 单测 | `cd tsf && cargo test --release` → 25 passed（按键认领、标点映射含引号交替、拼音切分、分段上屏消耗字母数） |
+| 单测 | `cd tsf && cargo test --release` → 27 passed（按键认领、标点映射含引号交替、拼音切分、分段上屏消耗字母数） |
 
 ### 还没做的（按建议优先级）
 

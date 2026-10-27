@@ -796,9 +796,14 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
             let shift = shift_held();
             let is_paging = (vk == VK_OEM_MINUS || vk == VK_OEM_PLUS) && !shift;
             if !is_paging {
-                if let Some(base) = cn_punct(vk, shift) {
-                    // 引号要成对交替，其余原样
-                    let ch = resolve_punct(base);
+                // `-` `=` `_` `+` 四个键**永远出半角**（Excel 公式、代码、算式要原样字符，
+                // 全角的 `－＝＋` 会让 `=A1-B1` 这类公式直接失效），其余走中文标点表。
+                // 两者共用下面"先上屏候选再插符号"的流程。
+                let punct: Option<String> = match halfwidth_symbol(vk, shift) {
+                    Some(half) => Some(half.to_string()),
+                    None => cn_punct(vk, shift).map(resolve_punct),
+                };
+                if let Some(ch) = punct {
                     if composing_now {
                         // 先上屏候选，再跟上标点
                         let mut buffer = self.inner.buffer.lock().unwrap_or_else(|p| p.into_inner());
@@ -1580,6 +1585,24 @@ fn shift_held() -> bool {
 /// 只在"中文模式且 CapsLock 没开"时调用；`\` → `、` 就是顿号。
 /// 引号这里只给**左引号**，开合交替在 `resolve_punct` 里做。
 /// 返回 `None` 表示不是标点键，交给应用。
+/// `-` `=` `_` `+` 四个键永远出**半角**原字符，不做中文标点转换。
+///
+/// 理由：这四个是公式/代码/算式里的运算符，全角版本（`－＝＋`）和半角在应用眼里
+/// 是两个完全不同的字符 —— Excel 里打 `=` 变小写全角 `＝`，整个公式就不会被识别
+/// （用户实测："在 excel 里面 - = 这两个打不出来"）。
+///
+/// 拼写中仍然要经过这里（`先上屏候选再插符号`），所以这个函数既服务于
+/// 空闲时的直通，也服务于拼写中的收尾。
+fn halfwidth_symbol(vk: u32, shift: bool) -> Option<&'static str> {
+    Some(match (vk, shift) {
+        (VK_OEM_MINUS, false) => "-",
+        (VK_OEM_PLUS, false) => "=",
+        (VK_OEM_MINUS, true) => "_",
+        (VK_OEM_PLUS, true) => "+",
+        _ => return None,
+    })
+}
+
 fn cn_punct(vk: u32, shift: bool) -> Option<&'static str> {
     Some(match (vk, shift) {
         // 不按 Shift
@@ -1595,8 +1618,9 @@ fn cn_punct(vk: u32, shift: bool) -> Option<&'static str> {
         (VK_OEM_6, false) => "】",
         // 单引号/双引号给的是**左引号**，实际输出由 `resolve_quote` 按开合状态交替。
         (VK_OEM_7, false) => "‘",
-        (VK_OEM_MINUS, false) => "－",
-        (VK_OEM_PLUS, false) => "＝",
+        // 注意：`-` `=` `_` `+` 不在这张表里，它们由 `halfwidth_symbol()` 处理成半角。
+        // 这里返回 None 还有第二个作用：空闲时 `should_claim` 不认领这两个键，
+        // Excel 里打 `=A1-B1` 才能原样进单元格（认领了就会被转成全角）。
         // 按住 Shift：问号、叹号、冒号这些都要 Shift 才打得出来，
         // 所以 Shift 只影响字母大小写，不影响标点转换。
         (VK_OEM_COMMA, true) => "《",
@@ -1608,8 +1632,6 @@ fn cn_punct(vk: u32, shift: bool) -> Option<&'static str> {
         (VK_OEM_5, true) => "｜",
         (VK_OEM_6, true) => "」",
         (VK_OEM_7, true) => "“", // 左双引号，实际输出见 `resolve_quote`
-        (VK_OEM_MINUS, true) => "_", // 下划线：写代码/标识符常用，比破折号实用
-        (VK_OEM_PLUS, true) => "＋",
         // Shift + 数字：全角符号（对齐搜狗/微软拼音的习惯）。
         // 括号是用户反馈最直接的缺口——原来 `(` `)` 直接漏给应用，打出来是半角。
         (VK_1, true) => "！",
@@ -2084,7 +2106,30 @@ mod tests {
         assert_eq!(cn_punct(VK_OEM_2, false), Some("、"), "斜杠也出顿号");
         assert_eq!(cn_punct(VK_OEM_4, false), Some("【"));
         assert_eq!(cn_punct(VK_OEM_6, false), Some("】"));
-        assert_eq!(cn_punct(VK_OEM_MINUS, false), Some("－"));
+        // 减号/等号不在标点表里，见 `减号等号永远是半角`
+        assert_eq!(cn_punct(VK_OEM_MINUS, false), None);
+        assert_eq!(cn_punct(VK_OEM_PLUS, false), None);
+    }
+
+    #[test]
+    fn 减号等号永远是半角() {
+        // Excel 里 `=A1-B1` 必须是半角，全角 `＝－` 公式就不成立了（用户实测打不出来）
+        assert_eq!(halfwidth_symbol(VK_OEM_MINUS, false), Some("-"));
+        assert_eq!(halfwidth_symbol(VK_OEM_PLUS, false), Some("="));
+        assert_eq!(halfwidth_symbol(VK_OEM_MINUS, true), Some("_"));
+        assert_eq!(halfwidth_symbol(VK_OEM_PLUS, true), Some("+"));
+        assert_eq!(halfwidth_symbol(VK_OEM_COMMA, false), None);
+    }
+
+    #[test]
+    fn 空闲时不认领减号等号() {
+        // 不认领 → 应用自己处理 → Excel 的公式、代码里的 `-` `=` 原样进去
+        assert!(!should_claim(VK_OEM_MINUS, false, false, false, false));
+        assert!(!should_claim(VK_OEM_PLUS, false, false, false, false));
+        assert!(!should_claim(VK_OEM_MINUS, false, true, false, false));
+        // 但拼写中还是要认领（`-` 是分词符，展开态是翻页）
+        assert!(should_claim(VK_OEM_MINUS, true, false, false, false));
+        assert!(should_claim(VK_OEM_PLUS, true, false, false, false));
     }
 
     #[test]
