@@ -289,6 +289,9 @@ DLL 被加载后无法卸载：脚本每次用**新文件名 + 改注册表**，
 - `.ps1` 必须 UTF-8 **带 BOM**；`.cmd` 必须**纯 ASCII + CRLF**（cmd.exe 按 OEM 代码页读，`goto` 在 LF-only 文件里会失效）。
 - `net session` 判管理员不可靠（Server 服务被禁就恒失败）→ 用 `fltmc`。
 - 拼写中按 `-` 的语义取决于是否展开：展开=翻页，收起=分词符。判定前必须先把 `expanded` 的 MutexGuard 放到块里释放，否则再 lock 会死锁。
+- **引号开合状态要用 `fetch_xor(true)` 翻转，不能用 `swap(false)`**：后者每次都写成 false，
+  于是第一下左、之后永远右，引号再也开不回来（0.1.27 的 bug）。单测当时只断言了"两下一开一合"，
+  正好覆盖不到第三下 —— 状态机测试至少跑三个周期。
 - **焦点不在可编辑区域时 TSF 照样把按键送进来**（我们是 `fForeground=TRUE` 的接收器），
   以前会在没光标的地方飘出候选窗。现在 `TextService_Impl::can_compose(pic)` 双向判定
   （`pic` 为空时再问 `ITfThreadMgr::GetFocus()` → `ITfDocumentMgr::GetTop()`），

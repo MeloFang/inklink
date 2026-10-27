@@ -1629,7 +1629,6 @@ fn cn_punct(vk: u32, shift: bool) -> Option<&'static str> {
 /// 中文引号的开合状态：`true` = 下一个该打左引号。
 ///
 /// 主流输入法的引号是「按一下开、再按一下合」的交替行为，没有别的上下文可依据。
-/// 用 `swap(false)` 读并翻转：返回旧值，供本次输出决定用左还是右。
 static DQUOTE_OPEN: AtomicBool = AtomicBool::new(true);
 static SQUOTE_OPEN: AtomicBool = AtomicBool::new(true);
 
@@ -1645,11 +1644,19 @@ fn pick_quote(left: &'static str, open: bool) -> &'static str {
     }
 }
 
+/// 读并**翻转**引号状态：返回"本次该打左引号吗"。
+///
+/// 必须用 `fetch_xor(true)` 而不是 `swap(false)`——后者每次都把状态写成 false，
+/// 于是第一次左、之后永远是右，引号再也开不回来（0.1.27 的 bug）。
+fn flip_quote(flag: &AtomicBool) -> bool {
+    flag.fetch_xor(true, Ordering::SeqCst)
+}
+
 /// 把 `cn_punct` 给出的标点解析成最终要上屏的字符串（引号会交替成对）。
 fn resolve_punct(ch: &'static str) -> String {
     match ch {
-        "“" => pick_quote("“", DQUOTE_OPEN.swap(false, Ordering::SeqCst)).to_string(),
-        "‘" => pick_quote("‘", SQUOTE_OPEN.swap(false, Ordering::SeqCst)).to_string(),
+        "“" => pick_quote("“", flip_quote(&DQUOTE_OPEN)).to_string(),
+        "‘" => pick_quote("‘", flip_quote(&SQUOTE_OPEN)).to_string(),
         other => other.to_string(),
     }
 }
@@ -2132,6 +2139,17 @@ mod tests {
 
         // 非引号不受状态影响
         assert_eq!(resolve_punct("，"), "，");
+    }
+
+    #[test]
+    fn 引号按三下是开合开() {
+        // 0.1.27 的 bug：`swap(false)` 每次都把状态写成 false，
+        // 于是第一下左、之后永远右。这里用独立状态连按三次验证真能翻回来。
+        let flag = AtomicBool::new(true);
+        assert!(flip_quote(&flag), "第 1 下该是左引号");
+        assert!(!flip_quote(&flag), "第 2 下该是右引号");
+        assert!(flip_quote(&flag), "第 3 下必须翻回左引号");
+        assert!(!flip_quote(&flag), "第 4 下又该是右引号");
     }
 }
 #[cfg(test)]
