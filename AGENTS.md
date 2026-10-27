@@ -109,6 +109,10 @@ cargo build --release --lib --target i686-pc-windows-msvc --target-dir target-st
 schema id**（我们是 `luna_pinyin_simp`，不是 `luna_pinyin`），且改完必须重启 `rime-server`
 ——librime 只在 `RimeInitialize` 时重新 deploy。
 
+配置分两层，脚本按序解析：`-ConfigPath` 显式指定 → `rime-config\fuzzy.local.yaml`（本机个人偏好，
+**不进 git**）→ `rime-config\fuzzy.yaml`（出厂默认，全关）。`tools\release.ps1` 显式传出厂默认那
+一份，所以发布包里永远是全关，不会把开发机的个人偏好打进去。
+
 > 环境事实：rustup 默认 `stable-x86_64-pc-windows-msvc`（1.99.1）；VS 2022 Community + Windows SDK 10.0.26100 已装；Node 24 / Python 3.13 已装；**无 .NET**。
 
 > ⚠️ **在 DSH 会话里验证 GUI**：本会话是提权进程（High Mandatory Level），WebView2 的 Chromium 沙箱会失败，报

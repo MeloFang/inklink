@@ -67,7 +67,8 @@ Get-ChildItem $userDst -Recurse -File -Include *.userdb, *.lock -ErrorAction Sil
 Write-Host '  rime 数据 OK'
 
 # ── 4. 模糊音配置（和引擎配置同源，装机即生效，用户不用手跑脚本） ──
-& (Join-Path $PSScriptRoot 'apply-fuzzy.ps1') -Destination $userDst -NoRestart | Out-Null
+$fuzzyDefault = Join-Path $root 'rime-config\fuzzy.yaml'
+    & (Join-Path $PSScriptRoot 'apply-fuzzy.ps1') -Destination $userDst -ConfigPath $fuzzyDefault -NoRestart | Out-Null
 Write-Host '  模糊音配置 OK'
 
 # ── 5. 打包 ────────────────────────────────────────────────────

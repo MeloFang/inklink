@@ -64,3 +64,6 @@ Thumbs.db
 
 # 临时提交信息文件（git commit -F 用）
 msg.txt
+
+# 本机个人模糊音配置（不进 git，出厂默认在 rime-config/fuzzy.yaml）
+/rime-config/fuzzy.local.yaml

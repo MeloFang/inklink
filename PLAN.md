@@ -445,7 +445,17 @@ Obsidian 语料 + AI 兜底，默认关闭联网（符合项目铁律）。
 现在这套做成了 `tools\apply-fuzzy.ps1`（读 `rime-config\fuzzy.yaml` → 生成 custom.yaml →
 重启引擎 → 等 deploy → 用管道查 `zi` 验证）。**默认全关**：实测开 `zh_z` 后打 `zi`
 第一个候选从「子」变成「之」、`cang` 从「仓」变成「长」，对打字准的人是净损失。
-要开就把 `rime-config\fuzzy.yaml` 里对应项改成 `true` 再跑一次脚本。
+
+要开就把配置里对应项改成 `true` 再跑一次脚本。配置分两层：
+
+| 文件 | 归谁 | 进 git |
+|:---|:---|:---|
+| `rime-config\fuzzy.yaml` | 出厂默认（全关），装给所有人 | ✅ |
+| `rime-config\fuzzy.local.yaml` | 本机个人偏好，脚本优先读它 | ❌ 已 ignore |
+
+`tools\release.ps1` 打包时显式传 `-ConfigPath` 指出厂默认，保证发布包里永远是全关，
+不会把开发机的个人偏好打进安装包。
+
 ### T5 状态盘点（2026-10-26 更新）
 
 **已完成**：

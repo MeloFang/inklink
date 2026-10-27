@@ -15,6 +15,7 @@
 [CmdletBinding()]
 param(
     [string]$Destination = 'C:\inklink-engine\rime\user',
+    [string]$ConfigPath,
     [switch]$NoRestart,
     [switch]$Force
 )
@@ -24,7 +25,20 @@ $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'engine-pipe.ps1')
 
 $repoRoot = Get-InklinkRepoRoot
-$configPath = Join-Path $repoRoot 'rime-config\fuzzy.yaml'
+
+# 配置文件解析顺序：
+#   1. -Config 显式指定（打包脚本用这个，保证包里永远是出厂默认）
+#   2. rime-config\fuzzy.local.yaml —— 本机个人偏好，不进 git
+#   3. rime-config\fuzzy.yaml —— 出厂默认，进 git
+$defaultConfig = Join-Path $repoRoot 'rime-config\fuzzy.yaml'
+$localConfig = Join-Path $repoRoot 'rime-config\fuzzy.local.yaml'
+if ($ConfigPath) {
+    $configPath = $ConfigPath
+} elseif (Test-Path $localConfig) {
+    $configPath = $localConfig
+} else {
+    $configPath = $defaultConfig
+}
 $engineExe = 'C:\inklink-engine\rime-server.exe'
 
 # 组名 → pinyin.yaml 里的片段名。顺序即生成顺序（决定候选混排的细节）。
@@ -95,7 +109,12 @@ function Restart-InklinkEngine {
     if (-not (Test-Path $engineExe)) { throw "找不到引擎：$engineExe" }
     Get-Process -Name 'rime-server' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
     Start-Sleep -Milliseconds 400
-    Start-Process -FilePath $engineExe -WorkingDirectory (Split-Path $engineExe -Parent) -WindowStyle Hidden
+    # 输出重定向到文件，别让引擎继承调用者的控制台/管道句柄：
+    # 继承的话，任何用管道调本脚本的调用方都要等引擎退出才收到 EOF，看着像卡死。
+    $engineDir = Split-Path $engineExe -Parent
+    Start-Process -FilePath $engineExe -WorkingDirectory $engineDir -WindowStyle Hidden `
+        -RedirectStandardOutput (Join-Path $engineDir 'rime-server.stdout.log') `
+        -RedirectStandardError (Join-Path $engineDir 'rime-server.stderr.log')
 }
 
 function Test-FuzzyEffective {
@@ -115,6 +134,7 @@ function Test-FuzzyEffective {
 }
 
 # ---- 主流程 ----
+Write-Host "配置来源：$configPath" -ForegroundColor DarkGray
 $config = Read-FuzzyConfig -Path $configPath
 $text = New-AlgebraPatchText -Config $config
 $target = Join-Path $Destination 'luna_pinyin_simp.custom.yaml'
