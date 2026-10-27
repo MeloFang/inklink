@@ -379,7 +379,15 @@ type=2 选词： [u8 2][u32 index][u32 code_len][code utf8][u16 word_len][word u
 
 原计划只发 `index`，靠引擎记住"上次查询的码"——多应用并发（微信 + VSCode 同时打字）时会串，
 而且下标脱离"当时查的是什么"没有意义。现在 DLL 把 `code` 和选中的 `word` 一起发过去。
-兼容性：引擎读不到 `code` 时打 `select %u (no code: old protocol)` 并照常回响应，不断连接。
+
+**兼容性的教训（2026-10-27，微信被系统杀掉那次）**：原来的兼容分支写成"`read_exact` 失败就打
+`select %u (no code: old protocol)`，照常回响应"。但 `ReadFile` 在对方没数据时**不失败、只阻塞**，
+所以还在跑旧 DLL 的进程（只发 5 字节就去等响应）会让两边互等 —— 应用 UI 线程永久挂起，
+Windows 判定"未响应"直接关闭（`Application Hang`，Event 1002）。71 秒后才轮到兼容分支，
+因为那时客户端被杀了、管道断开。
+现在引擎读可选字段前先 `wait_readable()`（`PeekNamedPipe` 轮询 100ms），没有后续字节立刻走兼容路径；
+DLL 侧所有管道读也改成带超时的 `read_exact_timeout()`（`QUERY_TIMEOUT_MS = 150`、`SELECT_TIMEOUT_MS = 100`）。
+回归探针：`tools\probe-legacy-select.ps1`。
 
 **学到哪个码**：由**选中字数**决定，不是整串。`learn_key(raw_code, word)` 用贪心音节切分
 （与 `tsf/src/pinyin.rs` 同规则）取前 N 个音节：

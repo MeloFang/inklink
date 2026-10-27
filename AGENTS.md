@@ -51,6 +51,7 @@ inklink/
 │  ├─ deploy-local.ps1   构建 + 部署到本机
 │  ├─ apply-fuzzy.ps1    按 fuzzy.yaml 生成 rime custom.yaml 并重启引擎验证
 │  ├─ engine-pipe.ps1    命名管道客户端（诊断/验证，可 dot-source）
+│  ├─ probe-legacy-select.ps1  回归探针：老协议选词不会让引擎死锁
 │  └─ release.ps1        打 dist\inklink-<版本>.zip
 ├─ dist/                 发布产物（**不进 git**）
 ├─ docs/                 架构、ADR、阶段记录
@@ -135,6 +136,10 @@ schema id**（我们是 `luna_pinyin_simp`，不是 `luna_pinyin`），且改完
 - **Python**：保持现有风格（4 空格、类型标注可选）；不引入新依赖除非在 PLAN 里写明。
 - **提交**：Conventional Commits，如 `feat(engine): 拼音切分支持简拼`、`fix(panel): 修复焦点未归还`。
 - **词条格式**：TSV `词 \t 拼音(空格分音节) \t 词频`，UTF-8 无 BOM。
+- **管道协议**：`[u8 type]` 开头，改字段必须**向后兼容**且兼容分支立刻生效——引擎读可选字段前先
+  `PeekNamedPipe` 探测（`wait_readable()`），不许在 `read_exact` 上死等（老客户端不发的字段永远等不到，
+  会把应用的 UI 线程挂死）。DLL 侧所有管道读都带超时（`read_exact_timeout`）。改协议后跑
+  `tools\probe-legacy-select.ps1`。
 
 ## 测试策略
 

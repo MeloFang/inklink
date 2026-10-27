@@ -4,14 +4,99 @@
 
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
+use std::time::{Duration, Instant};
 
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, ERROR_FILE_NOT_FOUND, GetLastError, HANDLE, INVALID_HANDLE_VALUE,
+};
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_READ, FILE_SHARE_WRITE,
     OPEN_EXISTING, ReadFile, WriteFile,
 };
+use windows_sys::Win32::System::Pipes::{PeekNamedPipe, WaitNamedPipeW};
 
 pub const PIPE_NAME: &str = r"\\.\pipe\inklink-engine";
+
+/// 查询的超时预算（毫秒）。正常情况下引擎 1–30ms 就回；这个数只是保险丝。
+///
+/// 为什么必须有：以前这里是裸 `ReadFile`，没有任何超时。一旦引擎和 DLL 的
+/// 协议对不上（或者引擎卡住），**调用方应用的 UI 线程就永久挂起**——
+/// 2026-10-27 微信就是这么被系统当"未响应"关掉的。
+const QUERY_TIMEOUT_MS: u32 = 150;
+/// 选词上报的超时预算：它只是"记账"，丢了也只影响下次排序，绝不能拖住用户。
+const SELECT_TIMEOUT_MS: u32 = 100;
+
+/// 连上引擎；`timeout_ms` 内没有可用实例就返回 `None`。
+///
+/// 只有"管道根本不存在"（引擎没跑）才顺手拉起引擎；实例都忙属于正常现象，
+/// 直接放弃本次请求，不要阻塞。
+unsafe fn open_pipe(timeout_ms: u32) -> Option<HANDLE> {
+    let name = wide(PIPE_NAME);
+    // SAFETY: 纯查询，name 以 0 结尾
+    if unsafe { WaitNamedPipeW(name.as_ptr(), timeout_ms) } == 0 {
+        let err = unsafe { GetLastError() };
+        if err == ERROR_FILE_NOT_FOUND {
+            ensure_engine();
+        }
+        return None;
+    }
+    // SAFETY: 句柄由调用方配对关闭
+    let pipe = unsafe {
+        CreateFileW(
+            name.as_ptr(),
+            FILE_GENERIC_READ | FILE_GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            0,
+            std::ptr::null_mut(),
+        )
+    };
+    if pipe == INVALID_HANDLE_VALUE {
+        return None;
+    }
+    Some(pipe)
+}
+
+/// 带超时的读满：数据没到就返回 `false`，绝不无限等。
+///
+/// 用 `PeekNamedPipe` 先看有没有字节，有才 `ReadFile`（此时不会阻塞）。
+unsafe fn read_exact_timeout(pipe: HANDLE, buf: &mut [u8], timeout_ms: u32) -> bool {
+    let mut got = 0usize;
+    let start = Instant::now();
+    while got < buf.len() {
+        let mut avail: u32 = 0;
+        // SAFETY: pipe 有效；只查可用字节数
+        let ok = unsafe { PeekNamedPipe(pipe, std::ptr::null_mut(), 0, std::ptr::null_mut(), &mut avail, std::ptr::null_mut()) };
+        if ok == 0 {
+            return false;
+        }
+        if avail > 0 {
+            let want = ((buf.len() - got) as u32).min(avail);
+            let mut read: u32 = 0;
+            // SAFETY: 上面已确认至少有 want 字节可读
+            let ok = unsafe {
+                ReadFile(
+                    pipe,
+                    buf[got..].as_mut_ptr(),
+                    want,
+                    &mut read,
+                    std::ptr::null_mut(),
+                )
+            };
+            if ok == 0 || read == 0 {
+                return false;
+            }
+            got += read as usize;
+            continue;
+        }
+        if start.elapsed() >= Duration::from_millis(timeout_ms as u64) {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    true
+}
 
 /// 取当前光标（插入点）的屏幕坐标：返回 (x, 光标底边 y)。
 ///
@@ -91,7 +176,6 @@ unsafe fn caret_via_get_caret_pos() -> Option<(i32, i32)> {
 
 /// 引擎进程是否在跑（管道是否有可用实例）。
 pub fn engine_alive() -> bool {
-    use windows_sys::Win32::System::Pipes::WaitNamedPipeW;
     let name = wide(PIPE_NAME);
     // 0 毫秒 = 立刻返回：有实例就 TRUE，没管道就 FALSE
     // SAFETY: 纯查询
@@ -183,28 +267,16 @@ fn start_process(exe: &str) {
     }
 }
 
-/// 向引擎查询候选。连不上就返回空（输入法不能让应用卡住）。
+/// 向引擎查询候选。连不上 / 超时都返回空（输入法绝不能让应用卡住）。
 pub fn query(code: &str) -> Vec<String> {
     if code.is_empty() {
         return Vec::new();
     }
-    // SAFETY: 句柄在本函数内配对关闭；缓冲区长度与传入长度一致
+    // SAFETY: 句柄在本函数内配对关闭；读操作全部带超时
     unsafe {
-        let name = wide(PIPE_NAME);
-        let pipe: HANDLE = CreateFileW(
-            name.as_ptr(),
-            FILE_GENERIC_READ | FILE_GENERIC_WRITE,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
-            std::ptr::null(),
-            OPEN_EXISTING,
-            0,
-            std::ptr::null_mut(),
-        );
-        if pipe == INVALID_HANDLE_VALUE {
-            // 连不上：顺手拉一下引擎（自愈），本次查询先返回空
-            ensure_engine();
+        let Some(pipe) = open_pipe(QUERY_TIMEOUT_MS) else {
             return Vec::new();
-        }
+        };
 
         let bytes = code.as_bytes();
         // 协议 v2：首字节是消息类型，1 = 查询
@@ -215,7 +287,7 @@ pub fn query(code: &str) -> Vec<String> {
         write_all(pipe, &req);
 
         let mut len_buf = [0u8; 4];
-        if !read_exact(pipe, &mut len_buf) {
+        if !read_exact_timeout(pipe, &mut len_buf, QUERY_TIMEOUT_MS) {
             let _ = CloseHandle(pipe);
             return Vec::new();
         }
@@ -223,12 +295,12 @@ pub fn query(code: &str) -> Vec<String> {
         let mut out = Vec::with_capacity(count.min(64));
         for _ in 0..count {
             let mut l2 = [0u8; 2];
-            if !read_exact(pipe, &mut l2) {
+            if !read_exact_timeout(pipe, &mut l2, QUERY_TIMEOUT_MS) {
                 break;
             }
             let len = u16::from_le_bytes(l2) as usize;
             let mut buf = vec![0u8; len];
-            if !read_exact(pipe, &mut buf) {
+            if !read_exact_timeout(pipe, &mut buf, QUERY_TIMEOUT_MS) {
                 break;
             }
             if let Ok(s) = String::from_utf8(buf) {
@@ -251,21 +323,11 @@ pub fn select(index: usize, code: &str, word: &str) {
     if word.is_empty() {
         return;
     }
-    // SAFETY: 句柄在本函数内配对关闭
+    // SAFETY: 句柄在本函数内配对关闭；读操作带超时
     unsafe {
-        let name = wide(PIPE_NAME);
-        let pipe: HANDLE = CreateFileW(
-            name.as_ptr(),
-            FILE_GENERIC_READ | FILE_GENERIC_WRITE,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
-            std::ptr::null(),
-            OPEN_EXISTING,
-            0,
-            std::ptr::null_mut(),
-        );
-        if pipe == INVALID_HANDLE_VALUE {
+        let Some(pipe) = open_pipe(SELECT_TIMEOUT_MS) else {
             return;
-        }
+        };
         // 协议 v3：类型 2 = 选词
         //   [u8 type][u32 index][u32 code_len][code][u16 word_len][word]
         let code_bytes = code.as_bytes();
@@ -280,7 +342,7 @@ pub fn select(index: usize, code: &str, word: &str) {
         write_all(pipe, &req);
         // 读掉响应（count=0），避免服务端阻塞在 flush
         let mut len_buf = [0u8; 4];
-        let _ = read_exact(pipe, &mut len_buf);
+        let _ = read_exact_timeout(pipe, &mut len_buf, SELECT_TIMEOUT_MS);
         let _ = CloseHandle(pipe);
     }
 }
@@ -346,21 +408,6 @@ pub fn send_text(text: &str) -> bool {
 
 fn wide(s: &str) -> Vec<u16> {
     OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
-}
-
-unsafe fn read_exact(pipe: HANDLE, buf: &mut [u8]) -> bool {
-    let mut read = 0u32;
-    // SAFETY: 调用方保证 pipe 有效，buf 长度与实际可写区域一致
-    let ok = unsafe {
-        ReadFile(
-            pipe,
-            buf.as_mut_ptr(),
-            buf.len() as u32,
-            &mut read,
-            std::ptr::null_mut(),
-        )
-    };
-    ok != 0 && read as usize == buf.len()
 }
 
 unsafe fn write_all(pipe: HANDLE, buf: &[u8]) {

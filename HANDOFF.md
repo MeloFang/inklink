@@ -324,3 +324,12 @@ DLL 被加载后无法卸载：脚本每次用**新文件名 + 改注册表**，
   `std::min<size_t>(...)` 带模板参数所以没事，`std::max(a, b)` 会被吃掉 → 用三元表达式，或加括号 `(std::max)(a, b)`。
 - **诊断工具的输出用纯 ASCII**：控制台代码页和管道编码不可靠，`--selftest` 打中文在默认 GBK 控制台里
   会变成乱码（虽然断言本身是通过的），排障时反而让人怀疑是 bug。
+- **改管道协议必须向后兼容，而且兼容分支要"立刻"生效**（2026-10-27 微信被系统杀掉的根因）：
+  v3 选词报文多了 code/word，引擎在 `read_exact(&clen, 4)` 上死等，而还在跑旧 DLL 的进程只发
+  `[type][index]` 五字节就等响应 —— **两边互等，应用的 UI 线程永久挂起**，Windows 判定"未响应"
+  直接关掉它（`Application Hang`，Event 1002）。引擎的旧报文兼容分支原来放在 `read_exact` 失败之后，
+  而 `ReadFile` 在没有数据时不会失败、只会阻塞，所以那个分支在正常使用中永远触发不到，
+  只有客户端主动断开才轮到它。修法：**先用 `PeekNamedPipe` 探测有没有后续字节**（引擎侧 `wait_readable()`，
+  等 100ms 没有就走老协议），DLL 侧所有管道读也改成 `read_exact_timeout()`（`QUERY_TIMEOUT_MS = 150`、
+  `SELECT_TIMEOUT_MS = 100`），任何情况下都不许无限阻塞 UI 线程。
+  回归探针：`tools\probe-legacy-select.ps1`（写 5 字节老报文，期望 100ms 内收到响应）。

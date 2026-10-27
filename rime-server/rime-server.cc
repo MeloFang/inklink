@@ -646,6 +646,24 @@ static bool read_exact(HANDLE p, void* buf, DWORD n) {
     return true;
 }
 
+/// 有没有后续数据可读（最多等 `ms` 毫秒），**不阻塞**。
+///
+/// 为什么需要它：协议 v3 的选词报文比 v2 多了 code/word 三个字段。老 DLL
+/// （< 1.0.0）只发 `[type][index]` 五个字节就等响应，而引擎如果在
+/// `read_exact(&clen, 4)` 上死等，两边就互相等 —— 老应用选中候选的瞬间整个
+/// UI 线程挂住（2026-10-27 微信被系统当"未响应"杀掉那次的根因）。
+/// 所以先看有没有后续字节，没有就按老协议立即回应。
+static bool wait_readable(HANDLE p, DWORD ms) {
+    DWORD start = GetTickCount();
+    for (;;) {
+        DWORD avail = 0;
+        if (!PeekNamedPipe(p, nullptr, 0, nullptr, &avail, nullptr)) return false;
+        if (avail > 0) return true;
+        if (GetTickCount() - start >= ms) return false;
+        Sleep(5);
+    }
+}
+
 static bool write_all(HANDLE p, const void* buf, DWORD n) {
     DWORD written = 0;
     const BYTE* p8 = static_cast<const BYTE*>(buf);
@@ -685,7 +703,9 @@ static void serve_client(HANDLE p) {
         uint32_t index = 0;
         if (!read_exact(p, &index, 4)) return;
         uint32_t clen = 0;
-        if (!read_exact(p, &clen, 4)) {
+        // 老 DLL（< 1.0.0）只发 `[type][index]` 就等响应，后续字段永远不来。
+        // 这里必须先探测再读，否则两边互等，调用方 UI 线程直接挂死。
+        if (!wait_readable(p, 100) || !read_exact(p, &clen, 4)) {
             logf("select %u (no code: old protocol)", index);
             write_response(p, {});
             return;
@@ -697,7 +717,7 @@ static void serve_client(HANDLE p) {
         std::string code(clen, '\0');
         if (clen > 0 && !read_exact(p, &code[0], clen)) return;
         uint16_t wlen = 0;
-        if (!read_exact(p, &wlen, 2)) {
+        if (!wait_readable(p, 100) || !read_exact(p, &wlen, 2)) {
             write_response(p, {});
             return;
         }
