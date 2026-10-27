@@ -818,6 +818,7 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                         let idx = *page * page_size(*expanded) + *sel;
                         let head = cands.get(idx).cloned().unwrap_or_default();
                         let text = format!("{head}{ch}");
+                        let code = buffer.clone();
                         buffer.clear();
                         cands.clear();
                         *matched_len = 0;
@@ -827,7 +828,9 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                         *sel = 0;
                         candwin::hide();
                         log_line(&format!("punct-in-compose vk={vk:#x} -> {text}"));
-                        ipc::select(idx);
+                        if !head.is_empty() {
+                            ipc::select(idx, &code, &head);
+                        }
                         self.request_edit(EditAction::Commit(text));
                     } else {
                         log_line(&format!("punct vk={vk:#x} -> {ch}"));
@@ -1477,8 +1480,10 @@ fn apply_pick(
     pos: Option<(i32, i32)>,
 ) -> Option<EditAction> {
     let pick = cands.get(pick_idx)?.clone();
-    // 上报选词，让引擎记录用户偏好（失败不影响上屏）
-    ipc::select(pick_idx);
+    // 上报选词，让引擎记进个人词库（失败不影响上屏）。
+    // 带上 buffer（当时的完整拼音）和 pick（选中的词）：引擎按选中的字数
+    // 反推该记在哪个拼音串下，分段上屏时才不会把 `皮` 记成 `pikeqiu`。
+    ipc::select(pick_idx, buffer, &pick);
 
     let stripped = strip_separators(buffer);
     let chars = pick.chars().count();

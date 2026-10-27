@@ -347,7 +347,7 @@ Failed to setup app: 拒绝访问。(os error 5)
 > 当前状态：TSF 输入法 + librime 引擎已在用户本机日常使用。
 > 自研 Ranker 已退役（代码保留在 `app/src-tauri/src/engine/`，未删）。
 
-### T5a 用户词库学习（下次专门处理）
+### T5a 用户词库学习 —— ✅ 2026-10-27 已实现（M1）
 
 **背景**：librime 自带用户词库（`rime\user\luna_pinyin.userdb`），但实测这个版本学不到东西：
 
@@ -358,19 +358,51 @@ Failed to setup app: 拒绝访问。(os error 5)
 | 模拟数字键 `RimeSimulateKeySequence("5")` | 同上 |
 | 恢复 `RimeGetContext` 刷新菜单后再选 | 同上 |
 
-**结论**：不依赖 librime 的学习，自建记忆层（`code -> 词 -> 次数`）。
+**结论**：不依赖 librime 的学习，自建记忆层（`code -> 词 -> 次数`）。**已按下面三步做完。**
 
-**教训**：曾一次性把「记录 + 落盘 + 排序提升」全加上，结果**查询路径崩溃**（原因未定位，
-崩溃在 `query()` 内部，连 `q=...` 日志都没写出来）。下次必须分三步，每步验证：
+**教训（仍然适用）**：曾一次性把「记录 + 落盘 + 排序提升」全加上，结果**查询路径崩溃**
+（原因未定位，崩溃在 `query()` 内部，连 `q=...` 日志都没写出来）。这次严格分三步、每步都验证。
 
-1. **只记录到内存 + 日志**，不动排序 —— 确认连续查询不崩
-2. 加落盘（`user.tsv`，`code\ttext\tcount`）
-3. 才接排序提升（同拼音内按次数降序，`std::stable_sort`）
+#### 实现（2026-10-27，`rime-server/rime-server.cc`）
 
-**已埋好的伏笔**（下次不用改 DLL）：
-- 协议 v2 已保留 `type=2` 选词消息：`[u8 2][u32 index]`
-- DLL 侧 `ipc::select(index)` 已实现，空格/数字键提交时调用
-- 服务端 `select_candidate()` 目前只记日志，**在这里接学习逻辑即可**
+| # | 步骤 | 验证方式 |
+|:---|:---|:---|
+| 1 | 记录到内存 `g_user` + 日志 `learn key=... word=... count=...` | 连续查询不崩 |
+| 2 | 落盘 `%LOCALAPPDATA%\inklink\user-words.tsv`（写 `.tmp` → `MoveFileExA` 原子替换） | 杀进程重启后仍生效 |
+| 3 | `query()` 返回前 `apply_user_boost()` 按次数 `std::stable_sort` | 选一次「橡木」→ 下次 `xiangmu` 首选变「橡木」 |
+
+**协议 v3**（比原计划的 v2 多两个字段，理由写在下面）：
+
+```
+type=2 选词： [u8 2][u32 index][u32 code_len][code utf8][u16 word_len][word utf8]
+```
+
+原计划只发 `index`，靠引擎记住"上次查询的码"——多应用并发（微信 + VSCode 同时打字）时会串，
+而且下标脱离"当时查的是什么"没有意义。现在 DLL 把 `code` 和选中的 `word` 一起发过去。
+兼容性：引擎读不到 `code` 时打 `select %u (no code: old protocol)` 并照常回响应，不断连接。
+
+**学到哪个码**：由**选中字数**决定，不是整串。`learn_key(raw_code, word)` 用贪心音节切分
+（与 `tsf/src/pinyin.rs` 同规则）取前 N 个音节：
+
+| 输入 | 选中 | 记到哪个码 |
+|:---|:---|:---|
+| `pikeqiu` | 皮 | `pi` |
+| `pikeqiu` | 皮克 | `pike` |
+| `xiangmu` | 项目 | `xiangmu` |
+| `github`（切不动） | — | 整串 |
+
+这条让「分段上屏」和「学习」对得上：用户选完「皮」继续选「克」，第二次打 `pike` 就能先看到「皮克」。
+
+**其它规则**：
+- 打英文不算：`word == strip_separators(code)` 时跳过（否则选英文候选会污染词库）。
+- 计数上限 999；串数上限 `USER_MAX_CODES = 4000`，超了先丢"最高次数≤1"的（用过一次就再没选过的）。
+- `std::mutex g_user_mutex`：每连接一线程，学习与查询并发。
+- 存储位置**不能**在 `C:\inklink-engine\`（普通用户无写权限），也不混进 rime 的 `user_dir`。
+- `rime-server.exe --selftest`：15 项纯 ASCII 断言（`utf8_char_count` / `strip_separators` /
+  `split_lengths` / `learn_key`），不初始化 librime、不碰管道。
+
+**还没做的**：整句上屏不学（只学单词候选）、"选错了想撤销"没有入口（只能手改 tsv）、
+跨设备/跨应用权重没有区分。
 
 ### T5b 拼音音节分隔显示
 
@@ -479,14 +511,14 @@ Obsidian 语料 + AI 兜底，默认关闭联网（符合项目铁律）。
 
 | | 内容 | 备注 |
 |:---|:---|:---|
-| T5a | 用户词库学习 | **下一项就做**。产品核心卖点，协议 `type=2` 和 `ipc::select()` 已埋好，入口在 `rime-server/rime-server.cc` 的 `select_candidate()`。必须分三步（PLAN 见上），上次一次性全加崩过 |
 | T5d | 拼音下划线 | 现在拼音像普通英文文字，是"最不像输入法"的地方 |
 | T5b | 音节分隔显示 | librime preedit 已有 `jian zou pian feng`，未接到候选窗 |
 | T5c | 候选窗美化 | |
 | T5e | 个人云词库 | Obsidian 语料 + AI 兜底 |
 | T5f | librime 工程化 | 现在靠手工解 Weasel 包 |
+| M1 续 | 长句学习 / 撤销 | 整句上屏不学；选错了想改回来只能手改 tsv |
 
-（T5g 模糊音已关闭：见上面「✅ 2026-10-27 已解决」）
+（T5a 用户词库学习已 ✅ 2026-10-27 实现，见上面同名小节；T5g 模糊音见「✅ 2026-10-27 已解决」）
 
 ### 纠错探针怎么工作（2026-10-27）
 
@@ -513,10 +545,12 @@ Obsidian 语料 + AI 兜底，默认关闭联网（符合项目铁律）。
 
 **测试能力现状**：
 
-- 有：`cargo test` 25 个单测（按键认领、标点映射与引号交替、拼音切分、分段上屏消耗字母数）
+- 有：`cargo test` 27 个单测（按键认领、标点映射与引号交替、半角符号不转换、拼音切分、分段上屏消耗字母数）
+- 有：`rime-server.exe --selftest` 15 项引擎侧断言（`utf8_char_count` / `strip_separators` /
+  `split_lengths` / `learn_key`），纯 ASCII，不初始化 librime
 - 有：`tsf/test/test-harness.cc` GUI 自动化测试台（需要交互式桌面，agent 抢不到焦点）
-- 有：`tools/engine-pipe.ps1`（`Invoke-InklinkQuery`）直连引擎管道，纠错/模糊音都靠它回归
-- 缺：端到端验证（TSF 是否真把字符插进应用）只能人工测
+- 有：`tools/engine-pipe.ps1`（`Invoke-InklinkQuery`）直连引擎管道，纠错/模糊音/学习都靠它回归
+- 缺：端到端验证（TSF 是否真把字符插进应用）只能人工测；个人词库的学习效果目前靠管道手工上报验证
 
 **一个教训**：`/` 当初映射成全角 `／`，技术上对（微软拼音如此），但视觉上和 `/` 无法区分，
 用户以为没转换。这类"看不出差别"的映射应优先选用户能感知的，而不是照搬某个实现。

@@ -240,10 +240,17 @@ pub fn query(code: &str) -> Vec<String> {
     }
 }
 
-/// 选词上报：告诉引擎"用户选了第 index 个候选"，让它写进用户词库。
+/// 选词上报：告诉引擎"用户在 `code` 这个拼音下选了 `word`"，让它记进用户词库。
+///
+/// 为什么把 code 和 word 都传过去：引擎那头没法知道用户选的是哪个词 ——
+/// 下标只有配上"当时查询的是什么"才有意义，而管道每个请求一个连接，
+/// 引擎跨连接记"上一次查询"在多应用并发时会串味。
 ///
 /// 失败无所谓（不影响上屏），所以不返回错误。
-pub fn select(index: usize) {
+pub fn select(index: usize, code: &str, word: &str) {
+    if word.is_empty() {
+        return;
+    }
     // SAFETY: 句柄在本函数内配对关闭
     unsafe {
         let name = wide(PIPE_NAME);
@@ -259,10 +266,17 @@ pub fn select(index: usize) {
         if pipe == INVALID_HANDLE_VALUE {
             return;
         }
-        // 协议 v2：类型 2 = 选词，后跟 u32 下标
-        let mut req = [0u8; 5];
-        req[0] = 2;
-        req[1..5].copy_from_slice(&(index as u32).to_le_bytes());
+        // 协议 v3：类型 2 = 选词
+        //   [u8 type][u32 index][u32 code_len][code][u16 word_len][word]
+        let code_bytes = code.as_bytes();
+        let word_bytes = word.as_bytes();
+        let mut req = Vec::with_capacity(11 + code_bytes.len() + word_bytes.len());
+        req.push(2u8);
+        req.extend_from_slice(&(index as u32).to_le_bytes());
+        req.extend_from_slice(&(code_bytes.len() as u32).to_le_bytes());
+        req.extend_from_slice(code_bytes);
+        req.extend_from_slice(&(word_bytes.len() as u16).to_le_bytes());
+        req.extend_from_slice(word_bytes);
         write_all(pipe, &req);
         // 读掉响应（count=0），避免服务端阻塞在 flush
         let mut len_buf = [0u8; 4];

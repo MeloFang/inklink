@@ -86,13 +86,16 @@ function New-AlgebraPatchText {
         $desc = (($GroupFragments.Keys | Where-Object { $Config[$_] }) | ForEach-Object { $GroupFragments[$_].Desc }) -join ' / '
     }
 
+    # 头部注释里的配置名要写实际读到的那份：本机有 fuzzy.local.yaml 时不能还写 fuzzy.yaml，
+    # 否则用户看到本机开了六组、注释却说"根据 fuzzy.yaml（全关）生成"，会以为脚本串了。
+    $configName = Split-Path -Leaf $configPath
     $lines = @(
-        '# 由 tools\apply-fuzzy.ps1 根据 rime-config\fuzzy.yaml 生成，请勿手改。'
+        "# 由 tools\apply-fuzzy.ps1 根据 rime-config\$configName 生成，请勿手改。"
         '#'
         "# 生成时间：$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
         "# 启用的模糊音：$desc"
         '#'
-        '# 想改模糊音：编辑 rime-config\fuzzy.yaml，再执行 tools\apply-fuzzy.ps1'
+        "# 想改模糊音：编辑 rime-config\$configName，再执行 tools\apply-fuzzy.ps1"
         'patch:'
         '  speller/algebra:'
         '    __patch:'

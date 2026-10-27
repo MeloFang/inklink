@@ -242,6 +242,7 @@ C:\inklink-engine\
 | 英文模式 | Shift 单击切（按下不动、松开才生效，期间按过别的键就不算单击）；CapsLock 开 = 大写英文；英文模式下不认领任何键（WPS/Excel 兼容） |
 | 32 位 | `inklink_tsf32.dll` 注册在 `WOW6432Node`，WPS 等可用 |
 | 模糊音 | 七组可选开关在 `rime-config\fuzzy.yaml`，跑 `tools\apply-fuzzy.ps1` 生成引擎配置并重启验证。**默认全关**（实测开 `zh_z` 会把 `zi` 的首选从「子」顶成「之」） |
+| **个人词库（M1）** | 你选过的词会被记住并顶到候选前面：`xiangmu` 选一次「橡木」→ 以后 `橡木` 排第一。存在 `%LOCALAPPDATA%\inklink\user-words.tsv`（`码\t词\t次数`，UTF-8），重启不丢，最多 4000 组码自动剪枝。分段上屏按**选中字数**反推学到哪个码（`pikeqiu` 选「皮」记在 `pi` 下，不是 `pikeqiu`） |
 | 安装器 | 脚本模板在 `installer\`，打包成 `dist\inklink-<版本>.zip`；`install.cmd` 一键装，带完整日志 `C:\Users\Public\inklink-install.log`，结尾 8 项自检 |
 | 单测 | `cd tsf && cargo test --release` → 27 passed（按键认领、标点映射含引号交替、拼音切分、分段上屏消耗字母数） |
 
@@ -249,18 +250,36 @@ C:\inklink-engine\
 
 | # | 任务 | 为什么现在做 |
 |:---|:---|:---|
-| 1 | **M1 用户词库学习** | 产品核心卖点（"每人专属词库"）一条都还没有；协议 `type=2` 和 `ipc::select()` 都已埋好，服务端 `select_candidate()` 现在只写日志 |
+| 1 | M1 续：长句学习 + 撤销 | 现在只学"选中的那个词"，整句上屏和"选错了想改回来"还没接 |
 | 2 | T5d 拼音下划线 | 拼音现在像普通英文，"最不像输入法"的地方 |
 | 3 | T5c 候选窗美化 | 圆角/间距/配色 |
 | 4 | T5e 个人云词库 + M3 AI | Obsidian 语料 + 翻译/续写，原始愿景，最后做 |
 
-### M1 必须分三步（上次一次性全加导致查询崩溃）
+### M1 个人词库学习（已实现，2026-10-27）
 
-1. 只记录到内存 + 日志，不动排序 —— 确认连续查询不崩
-2. 加落盘（`user.tsv`，`code\ttext\tcount`）
-3. 才接排序提升（同拼音内按次数降序，`std::stable_sort`）
+学的是**用户最终选了哪个词**，不是"出现过什么"。三步都做了，并且是按顺序验证过的
+（上次一次性全加导致查询崩溃，这次每步都单测 + 端到端验证）：
 
-入口就在 `C:\dsh\work\inklink\rime-server\rime-server.cc` 的 `select_candidate()`。
+1. 记录到内存 + 日志 —— 连续查询不崩
+2. 落盘 `%LOCALAPPDATA%\inklink\user-words.tsv`（`码\t词\t次数`，写 `.tmp` 再 `MoveFileExA` 原子替换）
+3. 接排序提升：`query()` 返回前 `apply_user_boost()` 按次数 `std::stable_sort`
+
+关键设计：
+
+- **协议 v3**：选词上报要带 `code` 和 `word`（`[u8 2][u32 index][u32 code_len][code][u16 word_len][word]`）。
+  原来只发下标 —— 引擎跨连接记"上次查询"在多应用并发时会串，下标脱离"当时查的是什么"没有意义。
+  旧 DLL 只发 5 字节时引擎打 `select %u (no code: old protocol)` 照常回响应，不断连接。
+- **学到哪个码**由选中字数决定（`learn_key()` 用贪心音节切分）：`pikeqiu`+「皮」→ `pi`，
+  `pikeqiu`+「皮克」→ `pike`，`xiangmu`+「项目」→ `xiangmu`；英文那种切不动的记整串。
+- **打英文不算选中文候选**：`word == strip_separators(code)` 时跳过。
+- **存储位置不能在 `C:\inklink-engine\`**（普通用户没有写权限），也不该混进 rime 的 `user_dir`
+  —— 那是引擎的配置区，用户词库是我们的产品数据。
+- 剪枝：`USER_MAX_CODES = 4000`，超了先丢"最高次数≤1"的（用过一次就再没选过的）。
+- `std::mutex g_user_mutex`：每连接一个线程，学习和查询会并发。
+- `rime-server.exe --selftest` 有 15 项纯 ASCII 断言（`utf8_char_count` / `strip_separators` /
+  `split_lengths` / `learn_key`），不初始化 librime、不碰管道，CI 或排障时直接跑。
+
+入口：`C:\dsh\work\inklink\rime-server\rime-server.cc` 的 `select_candidate()` → `learn()`。
 
 ### 版本号与构建 / 部署 / 打包
 
@@ -301,3 +320,7 @@ DLL 被加载后无法卸载：脚本每次用**新文件名 + 改注册表**，
   `patch: speller/algebra: __patch: [...]`，且模糊音片段必须排在 `pinyin:/abbreviation` 之前。
 - **改了 rime 配置必须重启 `rime-server`**：librime 只在 `RimeInitialize` 时发现配置变新并 deploy，
   文件写进去不会立刻生效（`tools\apply-fuzzy.ps1` 会重启 + 等 deploy + 用管道验证）。
+- **`windows.h` 的 `max`/`min` 宏会把 `std::max(` 展开成语法错误**（`error C2589: '(': illegal token`）。
+  `std::min<size_t>(...)` 带模板参数所以没事，`std::max(a, b)` 会被吃掉 → 用三元表达式，或加括号 `(std::max)(a, b)`。
+- **诊断工具的输出用纯 ASCII**：控制台代码页和管道编码不可靠，`--selftest` 打中文在默认 GBK 控制台里
+  会变成乱码（虽然断言本身是通过的），排障时反而让人怀疑是 bug。

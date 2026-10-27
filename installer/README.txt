@@ -31,6 +31,8 @@ inklink 输入法 __INKLINK_VERSION__  测试版
                   末尾少打一个音    zheg / xiangm    -> 这个 / 项目
   分段上屏        pikeqiu          选「皮」之后剩下的 keqiu 留在候选窗里，
                                    可以接着选「克」「球」；多打的字母自动丢掉
+  记住你的选择    xiangmu          第一次「项目」在前，你选了「橡木」之后
+                                   「橡木」就排到前面去了（详见下面「个人词库」）
   空格            上屏当前高亮的候选
   数字键 1-5      选「当前那一行」的第 N 个候选
   ↓ 或 =          候选窗展开成 5x5
@@ -78,8 +80,15 @@ inklink 输入法 __INKLINK_VERSION__  测试版
       rime-server.exe      引擎（用 librime）
       rime.dll             librime 本体
       rime\data\           词库与配置
-      rime\user\           用户词库与构建产物
+      rime\user\           引擎配置（模糊音等）与构建产物
       rime-server.log      引擎日志（出问题时看这个）
+
+  个人词库（你选过的词）
+      %LOCALAPPDATA%\inklink\user-words.tsv
+      记的是「你选了哪个词」，用它把常用的词顶到候选前面。
+      纯本地、不联网、不上传。想从头再来就直接删掉这个文件
+      （路径在文件资源管理器地址栏输入 %LOCALAPPDATA%\inklink 回车就能打开）。
+      格式是「词码 <Tab> 词 <Tab> 次数」，一行一条，可以用记事本看和改。
 
 
 遇到问题

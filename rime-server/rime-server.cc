@@ -83,19 +83,60 @@ static FnFreeCommit g_free_commit;
 
 static RimeSessionId g_session = 0;
 static std::mutex g_rime_mutex;
-static std::string g_last_code;
-static std::vector<std::string> g_last_cands;
 
 // ───────── 自建用户记忆层 ─────────
 // librime 这版 RimeSelectCandidate 不产生 commit，用户词库学不到东西。
 // 自己记：code -> (词 -> 次数)，下次同一拼音优先出你选过的。
+//
+// 存哪儿：`%LOCALAPPDATA%\inklink\user-words.tsv`。
+// 不能放 `C:\inklink-engine\`（安装目录，普通用户没有写权限），也不该放 rime 的
+// user_dir（那里是 rime 自己 deploy 的地盘，混进去容易被误删）。
 static std::map<std::string, std::map<std::string, int>> g_user;
 static std::string g_user_path;
+static bool g_user_dirty = false;
+/// 每个连接一个线程，学习与查询可能并发 → 用户词库要自己上锁。
+static std::mutex g_user_mutex;
+
+/// 单条记录最多记到多少次（再往上没有排序意义，防止数值膨胀）。
+static const int USER_COUNT_CAP = 999;
+/// 最多记多少个"拼音串"（每个串下词数不限）。超了就丢最弱的。
+static const size_t USER_MAX_CODES = 4000;
+
+/// UTF-8 字符数（汉字算 1 个）。候选词长度要用它判断"选了几个字"。
+static size_t utf8_char_count(const std::string& s) {
+    size_t n = 0;
+    for (size_t i = 0; i < s.size();) {
+        unsigned char c = (unsigned char)s[i];
+        if (c < 0x80) i += 1;
+        else if ((c >> 5) == 0x6) i += 2;
+        else if ((c >> 4) == 0xE) i += 3;
+        else if ((c >> 3) == 0x1E) i += 4;
+        else i += 1;
+        n++;
+    }
+    return n;
+}
+
+/// 去掉分词符（`xiang-mu` → `xiangmu`）。
+static std::string strip_separators(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    for (char c : s) {
+        if (c == '-' || c == '_') continue;
+        out.push_back(c);
+    }
+    return out;
+}
+
 
 static void load_user() {
     FILE* f = fopen(g_user_path.c_str(), "rb");
-    if (!f) return;
+    if (!f) {
+        logf("user dict: %s not found (first run)", g_user_path.c_str());
+        return;
+    }
     char line[1024];
+    size_t total = 0;
     while (fgets(line, sizeof(line), f)) {
         std::string s(line);
         while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) s.pop_back();
@@ -106,21 +147,62 @@ static void load_user() {
         std::string code = s.substr(0, a);
         std::string text = s.substr(a + 1, b - a - 1);
         int count = atoi(s.c_str() + b + 1);
-        if (!code.empty() && !text.empty() && count > 0) g_user[code][text] = count;
-    }
-    fclose(f);
-}
-
-static void save_user() {
-    FILE* f = fopen(g_user_path.c_str(), "wb");
-    if (!f) return;
-    for (const auto& kv : g_user) {
-        for (const auto& t : kv.second) {
-            fprintf(f, "%s\t%s\t%d\n", kv.first.c_str(), t.first.c_str(), t.second);
+        if (!code.empty() && !text.empty() && count > 0) {
+            g_user[code][text] = count;
+            total++;
         }
     }
     fclose(f);
+    logf("user dict: loaded %zu entries from %s", total, g_user_path.c_str());
 }
+
+/// 落盘。先写 `.tmp` 再改名 —— 半截写坏的文件比没有更糟（会把整本词库读成空）。
+static void save_user() {
+    if (!g_user_dirty) return;
+    std::string tmp = g_user_path + ".tmp";
+    FILE* f = fopen(tmp.c_str(), "wb");
+    if (!f) {
+        logf("user dict: cannot write %s", tmp.c_str());
+        return;
+    }
+    size_t total = 0;
+    for (const auto& kv : g_user) {
+        for (const auto& t : kv.second) {
+            fprintf(f, "%s\t%s\t%d\n", kv.first.c_str(), t.first.c_str(), t.second);
+            total++;
+        }
+    }
+    fclose(f);
+    if (!MoveFileExA(tmp.c_str(), g_user_path.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+        logf("user dict: rename failed %lu", GetLastError());
+        return;
+    }
+    g_user_dirty = false;
+    logf("user dict: saved %zu entries to %s", total, g_user_path.c_str());
+}
+
+/// 剪枝：串数超过上限时，丢掉"最高次数只有 1"的那些串（用过一次就再没选过的）。
+/// 都在 1 次以上的话就丢串本身最小的，保证文件不会无限长。
+static void prune_user() {
+    while (g_user.size() > USER_MAX_CODES) {
+        bool dropped = false;
+        for (auto it = g_user.begin(); it != g_user.end();) {
+            int best = 0;
+            // 注意：windows.h 有 max 宏，`std::max(` 会被宏展开成语法错误，
+            // 三元写最稳（本文件其它地方用 `std::min<size_t>(...)`，带模板参数所以没事）。
+            for (const auto& t : it->second) best = best > t.second ? best : t.second;
+            if (best <= 1) {
+                it = g_user.erase(it);
+                dropped = true;
+                break;
+            }
+            ++it;
+        }
+        if (!dropped) g_user.erase(g_user.begin());
+        g_user_dirty = true;
+    }
+}
+
 
 /// 单个音节是否合法。
 static bool is_syllable(const std::string& s) {
@@ -339,6 +421,7 @@ static std::vector<std::string> collect_page0(const std::string& code, size_t ne
 
 /// 把用户选过的词提到前面（同一拼音内按次数降序）。
 static void apply_user_boost(const std::string& code, std::vector<std::string>& cands) {
+    std::lock_guard<std::mutex> lock(g_user_mutex);
     auto it = g_user.find(code);
     if (it == g_user.end() || it->second.empty()) return;
     std::stable_sort(cands.begin(), cands.end(), [&](const std::string& a, const std::string& b) {
@@ -351,6 +434,65 @@ static void apply_user_boost(const std::string& code, std::vector<std::string>& 
     });
 }
 
+// ───────────────────────── 用户词库：学习 ─────────────────────────
+/// 贪心最长匹配把拼音切成音节（和 DLL 里 `pinyin.rs` 的 `split_lengths` 同一套规则）。
+/// 切不动就停，返回已切出的部分。
+static std::vector<size_t> split_lengths(const std::string& code) {
+    std::vector<size_t> lens;
+    size_t i = 0;
+    while (i < code.size()) {
+        size_t take = 0;
+        for (size_t len = std::min<size_t>(6, code.size() - i); len >= 1; len--) {
+            if (is_syllable(code.substr(i, len))) {
+                take = len;
+                break;
+            }
+        }
+        if (take == 0) break;
+        lens.push_back(take);
+        i += take;
+    }
+    return lens;
+}
+
+/// 算出"这次选择该记在哪个拼音串下"。
+///
+/// 分段上屏时用户只选了一个字/一个词（`pikeqiu` 里选「皮」），此时学到
+/// `pikeqiu → 皮` 是错的 —— 下次打 pikeqiu 首选的应该是「皮克球」。
+/// 所以按**选中的字数**取拼音串的前 N 个音节：
+///   pikeqiu + 皮   (1 字) → 学 `pi`    → 皮
+///   pikeqiu + 皮克 (2 字) → 学 `pike`  → 皮克
+///   xiangmu + 项目 (2 字) → 学 `xiangmu` → 项目
+/// 字数 ≥ 音节数时按整串记（多打的尾巴字母一起吃掉，反正下次是同一个串）。
+static std::string learn_key(const std::string& raw_code, const std::string& word) {
+    std::string code = strip_separators(raw_code);
+    if (code.empty() || word.empty()) return std::string();
+    size_t chars = utf8_char_count(word);
+    if (chars == 0) return std::string();
+    std::vector<size_t> lens = split_lengths(code);
+    if (lens.empty()) return code;              // 不像拼音（纯英文），整串学
+    if (chars >= lens.size()) return code;      // 整串都吃掉了
+    size_t used = 0;
+    for (size_t i = 0; i < chars && i < lens.size(); i++) used += lens[i];
+    if (used == 0 || used > code.size()) return code;
+    return code.substr(0, used);
+}
+
+/// 记一次"用户在这个拼音下选了这个词"。
+static void learn(const std::string& raw_code, const std::string& word) {
+    std::string key = learn_key(raw_code, word);
+    if (key.empty() || word.empty()) return;
+    // 纯英文上屏（码本身就是词）不学：那是"打英文"，不是选中文候选。
+    if (word == strip_separators(raw_code)) return;
+    std::lock_guard<std::mutex> lock(g_user_mutex);
+    int& c = g_user[key][word];
+    if (c < USER_COUNT_CAP) c++;
+    g_user_dirty = true;
+    prune_user();
+    logf("learn key=%s word=%s count=%d", key.c_str(), word.c_str(), c);
+    save_user();
+}
+
 // ───────────────────────── 路径 ─────────────────────────
 static std::string exe_dir() {
     char buf[MAX_PATH];
@@ -359,6 +501,20 @@ static std::string exe_dir() {
     size_t pos = p.find_last_of("\\/");
     return pos == std::string::npos ? "." : p.substr(0, pos);
 }
+
+/// 用户词库路径：`%LOCALAPPDATA%\inklink\user-words.tsv`
+/// 拿不到 LOCALAPPDATA 就退回安装目录（少数精简系统）。
+static std::string user_dict_path() {
+    char buf[MAX_PATH];
+    DWORD n = GetEnvironmentVariableA("LOCALAPPDATA", buf, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) {
+        return exe_dir() + "\\user-words.tsv";
+    }
+    std::string dir = std::string(buf, n) + "\\inklink";
+    CreateDirectoryA(dir.c_str(), nullptr);   // 已存在会失败，无所谓
+    return dir + "\\user-words.tsv";
+}
+
 
 // ───────────────────────── 查询 ─────────────────────────
 static const int MAX_CANDS = 50;
@@ -398,7 +554,6 @@ static std::vector<std::string> query(const std::string& code) {
         if (corrected.empty()) return out;
         return corrected;   // 连 rime 都喂不进去，直接给纠错结果
     }
-    g_last_code = code;
 
     // 收集当前页 + 往后翻几页，凑够 MAX_CANDS 个候选
     for (int page = 0; page < 6 && (int)out.size() < MAX_CANDS; page++) {
@@ -453,6 +608,10 @@ static std::vector<std::string> query(const std::string& code) {
             }
         }
     }
+    // 用户词库：这个拼音下用户选过的词提前（次数多的更前）。
+    // 放在纠错/英文兜底之后、返回之前 —— 用户的手动选择优先级最高。
+    apply_user_boost(strip_separators(code), out);
+
     // 组合留着，下次查询开头会清
     return out;
 }
@@ -464,10 +623,14 @@ static std::vector<std::string> query(const std::string& code) {
 ///
 /// 不走 librime 的 RimeSelectCandidate——那个在这版库里返回成功但不产生
 /// commit，用户词库学不到东西。自己记一份，下次同拼音把它提前。
-static bool select_candidate(uint32_t index) {
-    // TODO: 用户词库学习（librime 这版 RimeSelectCandidate 不产生 commit，
-    // 自建记忆层待单独实现）。当前只记日志，不影响上屏。
-    logf("select %u (learning disabled)", index);
+///
+/// DLL 会带上 `code`（用户当时打的拼音串）和 `word`（选中的词）：
+///   引擎不用跨连接记住"上一次查询是什么"（多应用并发时会串），
+///   也不用猜用户到底选了第几个（下标在应用之间没有意义）。
+static bool select_candidate(uint32_t index, const std::string& code, const std::string& word) {
+    logf("select %u code=%s word=%s", index, code.c_str(), word.c_str());
+    if (word.empty()) return true;
+    learn(code, word);
     return true;
 }
 
@@ -516,10 +679,31 @@ static void serve_client(HANDLE p) {
     if (!read_exact(p, &type, 1)) return;
 
     if (type == 2) {
+        // 选词（协议 v3）：[u32 index][u32 code_len][code][u16 word_len][word]
+        // v2 只有 index；旧 DLL + 新引擎时后面的字段读不到，就当"没学到东西"，
+        // 不能因此断开连接（否则老版本会表现为选词卡住）。
         uint32_t index = 0;
         if (!read_exact(p, &index, 4)) return;
-        std::lock_guard<std::mutex> lock(g_rime_mutex);
-        select_candidate(index);
+        uint32_t clen = 0;
+        if (!read_exact(p, &clen, 4)) {
+            logf("select %u (no code: old protocol)", index);
+            write_response(p, {});
+            return;
+        }
+        if (clen > 4096) {
+            write_response(p, {});
+            return;
+        }
+        std::string code(clen, '\0');
+        if (clen > 0 && !read_exact(p, &code[0], clen)) return;
+        uint16_t wlen = 0;
+        if (!read_exact(p, &wlen, 2)) {
+            write_response(p, {});
+            return;
+        }
+        std::string word(wlen, '\0');
+        if (wlen > 0 && !read_exact(p, &word[0], wlen)) return;
+        select_candidate(index, code, word);
         write_response(p, {});
         return;
     }
@@ -551,10 +735,64 @@ static void serve_client(HANDLE p) {
 
     write_response(p, cands);
 }
-int main() {
+// ───────────────────────── 自检 ─────────────────────────
+// 引擎是 C++、没有测试框架，但纯函数（音节切分、学习键推导）值得单测。
+// 跑 `rime-server.exe --selftest`，不初始化 librime、不碰管道，只验算逻辑。
+static int run_selftest() {
+    int fails = 0;
+    auto check = [&](bool cond, const char* what) {
+        printf("%s %s\n", cond ? "ok  " : "FAIL", what);
+        if (!cond) fails++;
+    };
+    int total = 0;
+    auto ck = [&](bool cond, const char* what) {
+        total++;
+        check(cond, what);
+    };
+
+    ck(utf8_char_count("项目") == 2, "utf8_char_count: 2 hanzi");
+    ck(utf8_char_count("皮") == 1, "utf8_char_count: single hanzi");
+    ck(utf8_char_count("github") == 6, "utf8_char_count: ascii per char");
+    ck(strip_separators("xiang-mu") == "xiangmu", "strip_separators: drop dash");
+    ck(strip_separators("xiang_mu") == "xiangmu", "strip_separators: drop underscore");
+
+    std::vector<size_t> l1 = split_lengths("pikeqiu");
+    ck(l1.size() == 3 && l1[0] == 2 && l1[1] == 2 && l1[2] == 3,
+       "split_lengths: pikeqiu -> pi|ke|qiu");
+    std::vector<size_t> l2 = split_lengths("xiangmu");
+    ck(l2.size() == 2 && l2[0] == 5 && l2[1] == 2, "split_lengths: xiangmu -> xiang|mu");
+    ck(split_lengths("xian").size() == 1, "split_lengths: xian is one syllable");
+    ck(split_lengths("github").empty(), "split_lengths: github unsplittable");
+
+    ck(learn_key("pikeqiu", "皮") == "pi", "learn_key: 1 char -> first 1 syllable");
+    ck(learn_key("pikeqiu", "皮克") == "pike", "learn_key: 2 chars -> first 2 syllables");
+    ck(learn_key("xiangmu", "项目") == "xiangmu", "learn_key: whole code");
+    ck(learn_key("xiang-mu", "项目") == "xiangmu", "learn_key: separators stripped");
+    ck(learn_key("zhemge", "这个") == "zhemge", "learn_key: mistyped code kept as-is");
+    ck(learn_key("x", "西") == "x", "learn_key: single letter");
+
+    if (fails == 0) {
+        printf("\nall %d checks passed\n", total);
+    } else {
+        printf("\n%d of %d checks FAILED\n", fails, total);
+    }
+    return fails == 0 ? 0 : 1;
+}
+
+int main(int argc, char** argv) {
+    for (int i = 1; i < argc; i++) {
+        if (std::strcmp(argv[i], "--selftest") == 0) {
+            return run_selftest();
+        }
+    }
+
     std::string dir = exe_dir();
     std::string log_path = dir + "\\rime-server.log";
     g_log = fopen(log_path.c_str(), "a");
+
+    // 用户词库（个人词库）：启动就加载，第一次查询就能用上历史选择
+    g_user_path = user_dict_path();
+    load_user();
 
 
     // 单例：和 Rust 版引擎同名互斥量，避免两个引擎抢同一个管道
