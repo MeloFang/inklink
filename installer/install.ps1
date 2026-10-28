@@ -65,6 +65,8 @@ New-Item -ItemType Directory -Force $PF  | Out-Null
 New-Item -ItemType Directory -Force $ENG | Out-Null
 $dll64 = Install-File "$SRC\inklink_tsf.dll"   "$PF\inklink_tsf.dll"
 $dll32 = Install-File "$SRC\inklink_tsf32.dll" "$PF\inklink_tsf32.dll"
+# 语言列表里那一行的图标：DllRegisterServer 按 DLL 同目录的 inklink.ico 找它
+if (Test-Path "$SRC\inklink.ico") { Install-File "$SRC\inklink.ico" "$PF\inklink.ico" | Out-Null }
 Install-File "$SRC\rime-server.exe" "$ENG\rime-server.exe" | Out-Null
 Install-File "$SRC\rime.dll"        "$ENG\rime.dll"        | Out-Null
 if (Test-Path "$SRC\rime\data") { Copy-Item "$SRC\rime\data" "$ENG\rime\" -Recurse -Force }

@@ -51,6 +51,7 @@ Write-Host '  安装脚本 OK'
 # ── 2. 二进制 ──────────────────────────────────────────────────
 Copy-Item $dll64 (Join-Path $files 'inklink_tsf.dll')   -Force
 Copy-Item $dll32 (Join-Path $files 'inklink_tsf32.dll') -Force
+Copy-Item (Join-Path $root 'installer\inklink.ico') (Join-Path $files 'inklink.ico') -Force
 Copy-Item "$ENG\rime-server.exe" $files -Force
 Copy-Item "$ENG\rime.dll"        $files -Force
 Write-Host '  DLL + 引擎 OK'

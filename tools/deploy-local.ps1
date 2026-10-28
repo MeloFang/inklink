@@ -64,6 +64,10 @@ New-Item -ItemType Directory -Force $PF | Out-Null
 Copy-Item $dll64 $target64 -Force
 Copy-Item $dll32 $target32 -Force
 
+# 语言列表里那一行的图标（DllRegisterServer 会按 DLL 同目录的 inklink.ico 找它）
+$ico = Join-Path $root 'installer\inklink.ico'
+if (Test-Path $ico) { Copy-Item $ico (Join-Path $PF 'inklink.ico') -Force }
+
 Set-ItemProperty "HKLM:\SOFTWARE\Classes\CLSID\$CLSID\InprocServer32" -Name '(default)' -Value $target64
 Set-ItemProperty "HKLM:\SOFTWARE\Classes\Wow6432Node\CLSID\$CLSID\InprocServer32" -Name '(default)' -Value $target32
 

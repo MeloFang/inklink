@@ -2663,6 +2663,21 @@ mod registry {
         Ok(())
     }
 
+    /// 语言列表里我们那一行用哪个文件当图标。
+    ///
+    /// 优先用安装目录里的 `inklink.ico`（安装器会拷过去），没有就退回 DLL 自身
+    /// （DLL 里也编了一份图标资源，索引 0）。开发机上没跑安装器时走的就是退回分支。
+    pub(super) fn icon_path_for(dll_path: &str) -> String {
+        let path = std::path::Path::new(dll_path);
+        if let Some(dir) = path.parent() {
+            let ico = dir.join("inklink.ico");
+            if ico.exists() {
+                return ico.to_string_lossy().into_owned();
+            }
+        }
+        dll_path.to_string()
+    }
+
     /// 走 TSF 官方接口登记：`Register` + `AddLanguageProfile` + `EnableLanguageProfile`。
     ///
     /// 注意两点，都是踩过的坑：
@@ -2711,8 +2726,13 @@ mod registry {
                 ))?;
                 drop(catmgr);
 
-                let desc: Vec<u16> = DLL_DESC.encode_utf16().collect();
-                let icon: Vec<u16> = dll_path.encode_utf16().collect();
+                let mut desc: Vec<u16> = DLL_DESC.encode_utf16().collect();
+                // 必须补 NUL：AddLanguageProfile 按 C 字符串读，不补会读到缓冲区后面的垃圾
+                // （表现是语言列表里我们的图标路径变成一串乱码、名字也显示不出来）。
+                desc.push(0);
+
+                let mut icon: Vec<u16> = icon_path_for(dll_path).encode_utf16().collect();
+                icon.push(0);
                 crate::ignore_s_false(profiles.AddLanguageProfile(
                     &CLSID_INKLINK_TSF,
                     LANG_ZH_CN,
@@ -3184,5 +3204,22 @@ mod punct_claim_tests {
             Some((std::time::Instant::now() - std::time::Duration::from_secs(5), 3));
         assert!(!injected_backspace_pending());
         assert!(!take_injected_backspace());
+    }
+
+    #[test]
+    fn 图标缺失时退回_dll_自身() {
+        // 安装目录里有 inklink.ico 就用它；没有（开发机、或安装器还没跑）就退回 DLL，
+        // 保证 AddLanguageProfile 拿到的永远是一个真实存在的路径 —— 传空指针会直接崩。
+        let missing = r"C:\no-such-dir-inklink\inklink_tsf.dll";
+        assert_eq!(super::registry::icon_path_for(missing), missing);
+
+        let dll = r"C:\dsh\work\inklink\tsf\target-static\release\inklink_tsf.dll";
+        let expected = std::path::Path::new(dll)
+            .parent()
+            .map(|d| d.join("inklink.ico"))
+            .filter(|p| p.exists())
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| dll.to_string());
+        assert_eq!(super::registry::icon_path_for(dll), expected);
     }
 }

@@ -67,3 +67,6 @@ msg.txt
 
 # 本机个人模糊音配置（不进 git，出厂默认在 rime-config/fuzzy.yaml）
 /rime-config/fuzzy.local.yaml
+
+# 图标生成的中间预览图
+/installer/preview-*.png

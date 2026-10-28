@@ -420,6 +420,10 @@ DLL 被加载后无法卸载：脚本每次用**新文件名 + 改注册表**，
   **同一个 CLSID** 上（TSF 会自己 QI），注册只是多加一个 `GUID_TFCAT_DISPLAYATTRIBUTEPROVIDER` 分类。
   属性没有 `Clear`，清样式要写 `VT_EMPTY`，而且**上屏前必须清**，否则打出去的字一直带虚线。
   Electron 系（VS Code）不支持 `GUID_PROP_ATTRIBUTE`，那边拼音没有下划线属正常。
+- **`AddLanguageProfile` 的字符串参数要自己补 NUL**：Rust 的 `encode_utf16().collect::<Vec<u16>>()`
+  没有结尾 0，TSF 按 C 字符串读会越界 —— 表现是语言列表里我们的**图标路径变成一串乱码**
+  （`…inklink_tsf_1.0.15.dll῅′ℹ…`）、名字也显示不出来。要 `desc.push(0)` / `icon.push(0)`，
+  并且给一个真实存在的 `.ico`（`C:\Program Files\inklink\inklink.ico`，没有就退回 DLL 自身）。
 - `.ps1` 必须 UTF-8 **带 BOM**；`.cmd` 必须**纯 ASCII + CRLF**（cmd.exe 按 OEM 代码页读，`goto` 在 LF-only 文件里会失效）。
 - `net session` 判管理员不可靠（Server 服务被禁就恒失败）→ 用 `fltmc`。
 - 拼写中按 `-` 的语义取决于是否展开：展开=翻页，收起=分词符。判定前必须先把 `expanded` 的 MutexGuard 放到块里释放，否则再 lock 会死锁。
