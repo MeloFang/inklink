@@ -103,7 +103,7 @@ powershell -ExecutionPolicy Bypass -File tools\release.ps1
 $env:PATH = "$env:USERPROFILE\.cargo\bin;$env:PATH"
 
 cd C:\dsh\work\inklink\tsf
-cargo test --release                       # 50 个单测（按键认领 / 标点 / 引号 / 拼音切分 / 音节分隔显示 / 分词边界 / 分段上屏 / 误选撤回 / 整句上报 / 候选窗摆放与点击 / 注入退格抑制 / 显示属性）
+cargo test --release                       # 54 个单测（按键认领 / 标点 / 引号 / 拼音切分 / 音节分隔显示 / 分词边界 / 分段上屏 / 误选撤回 / 整句上报 / 候选窗摆放与点击 / 注入退格抑制 / 显示属性 / 全局状态缺省值）
 cargo build --release --lib --target-dir target-static
 cargo build --release --lib --target i686-pc-windows-msvc --target-dir target-static
 ```

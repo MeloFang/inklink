@@ -26,6 +26,7 @@ use windows::Win32::UI::TextServices::{
 mod ipc;
 mod candwin;
 mod display;
+mod state;
 mod pinyin;
 use windows::core::{GUID, HRESULT, Interface, Ref, implement};
 use windows::core::IUnknownImpl;
@@ -139,8 +140,6 @@ struct TextServiceInner {
     self_terminating: AtomicBool,
     /// 最近一次 GetTextExt 拿到的组合串屏幕位置（左下起 `(x, 顶边, 底边)`）
     last_pos: Mutex<Option<CaretPos>>,
-    /// 英文模式：Shift 单击切换，开启后所有键原样交给应用
-    english_mode: AtomicBool,
     /// 本次按下 Shift 期间是否打过字（用于区分"单击"和"按住"）
     shift_used: AtomicBool,
     /// 刚上屏的词（用于识别"选错了、马上删掉"）
@@ -184,7 +183,6 @@ impl TextService {
                 pending: Mutex::new(None),
                 self_terminating: AtomicBool::new(false),
                 last_pos: Mutex::new(None),
-                english_mode: AtomicBool::new(false),
                 shift_used: AtomicBool::new(false),
                 commit_mark: Mutex::new(None),
                 sentence: Mutex::new(None),
@@ -578,10 +576,13 @@ impl TextService_Impl {
         // 把自己作为按键 sink 挂上去（传引用，而不是把 owned 接口交给 Param）
         let sink: ITfKeyEventSink = self.to_interface();
         let r = unsafe { keystroke_mgr.AdviseKeyEventSink(tid, &sink, true) };
+        let (chinese, punct) = state::snapshot();
         log_line(&format!(
-            "activate tid={tid} advise={} version={}",
+            "activate tid={tid} advise={} version={} chinese={} punct={}",
             if r.is_ok() { "ok" } else { "FAILED" },
-            env!("INKLINK_VERSION")
+            env!("INKLINK_VERSION"),
+            chinese,
+            punct
         ));
         r?;
         *advised = true;
@@ -1191,8 +1192,14 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
         let composing = !self.inner.buffer.lock().unwrap_or_else(|p| p.into_inner()).is_empty();
         // 刚上屏、可能被撤回的词，要先把退格抢过来数一下
         let undo = !composing && self.undo_pending();
+        // 全局状态（注册表）：中英模式 + 中文标点开关，所有应用一致。
+        let (chinese_mode, punct_mode) = state::snapshot();
+        // 标点开关关掉时，空闲态干脆不认领标点键：应用自己出半角标点。
+        // 这比"认领下来再转回半角"干净得多 —— 后者要猜键盘布局，还要自己 SetText。
+        let punct_passthrough = !punct_mode && !composing;
         let claim = self.can_compose(pic.as_ref())
-            && (should_claim(vk, composing, shift_held(), caps_on(), self.inner.english_mode.load(Ordering::SeqCst))
+            && ((should_claim(vk, composing, shift_held(), caps_on(), !chinese_mode)
+                && !(punct_passthrough && is_punct_key(vk, shift_held())))
                 || (undo && vk == VK_BACK));
         log_line(&format!("test vk={vk} claim={claim} composing={composing}"));
         Ok(BOOL(if claim { 1 } else { 0 }))
@@ -1297,8 +1304,9 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
             self.inner.shift_used.store(true, Ordering::SeqCst);
         }
 
-        // 英文模式：所有键原样交给应用（Shift 除外，用 Shift 单击切回中文）
-        if self.inner.english_mode.load(Ordering::SeqCst) {
+        // 英文模式：所有键原样交给应用（Shift 除外，用 Shift 单击切回中文）。
+        // 状态是全局的（注册表），所有应用看到的是同一个中英模式 —— 见 state.rs。
+        if !state::chinese() {
             const VK_SHIFT_KEY: u32 = 0x10;
             if vk == VK_SHIFT_KEY {
                 // 让 OnKeyUp 去处理切换
@@ -1387,6 +1395,12 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                     None => cn_punct(vk, shift).map(resolve_punct),
                 };
                 if let Some(ch) = punct {
+                    // 中文标点关掉、而且当前没有在拼写：放行给应用自己出半角标点。
+                    // 拼写中仍然照旧（那一刻你在选中文词，标点跟着中文走才连贯）。
+                    if !composing_now && !state::punctuation() {
+                        log_line(&format!("punct vk={vk:#x} passthrough (punct off)"));
+                        return Ok(BOOL(0));
+                    }
                     if composing_now {
                         // 先上屏候选，再跟上标点
                         let mut buffer = self.inner.buffer.lock().unwrap_or_else(|p| p.into_inner());
@@ -1863,14 +1877,16 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                     *self.inner.page.lock().unwrap_or_else(|p| p.into_inner()) = 0;
                     *self.inner.expanded.lock().unwrap_or_else(|p| p.into_inner()) = false;
                     candwin::hide();
-                    self.inner.english_mode.store(true, Ordering::SeqCst);
+                    // 打了一串不像拼音的东西、用 Shift 把它原样上屏：这时候意图就是打英文，
+                    // 顺手把全局模式切成英文（搜狗也是这个行为）。
+                    state::set_chinese(false);
                     self.sentence_clear();
                     log_line(&format!("commit-raw(shift-up) {raw}"));
                     self.request_edit(EditAction::Commit(raw));
                 } else {
-                    let cur = self.inner.english_mode.load(Ordering::SeqCst);
-                    self.inner.english_mode.store(!cur, Ordering::SeqCst);
-                    log_line(&format!("english_mode -> {}", !cur));
+                    let cur = state::chinese();
+                    state::set_chinese(!cur);
+                    log_line(&format!("chinese -> {}", !cur));
                 }
             }
             self.inner.shift_used.store(false, Ordering::SeqCst);
@@ -1885,6 +1901,13 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
     ) -> windows::core::Result<BOOL> {
         Ok(BOOL(0))
     }
+}
+
+/// 这个键是不是"中文标点转换"覆盖的键（关掉中文标点后这些键就该放行给应用）。
+///
+/// 只用来做放行判断，不关心转成什么 —— 所以 `-` `=`（永远是半角）不算在内。
+fn is_punct_key(vk: u32, shift: bool) -> bool {
+    cn_punct(vk, shift).is_some() || digit_pair(vk, shift).is_some()
 }
 
 /// 这个键该不该由输入法认领（TSF 按键状态机）。

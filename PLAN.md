@@ -493,6 +493,31 @@ DLL 侧所有管道读也改成带超时的 `read_exact_timeout()`（`QUERY_TIME
 
 **还没做的**：组合串按音节显示分隔符（`sha'sh'h'` 那样，属于显示层）。
 
+#### 全局状态：中英模式 + 中文标点开关（2026-10-28，产品化第 1 步）
+
+**要解决的问题**：`english_mode` 原来是 `TextServiceInner` 的字段 —— 每个宿主进程各一份，
+在微信切到英文、切到记事本还是中文，而用户看不到任何全局指示。另外没有"关掉中文标点"的开关，
+打代码时全角 `，。` 很烦。
+
+**做法**（ADR-0007）：状态搬进注册表，DLL 每次按键现读，**不缓存、不起线程**。
+
+| 位置 | 值 | 含义 | 默认 |
+|:---|:---|:---|:---|
+| `HKCU\Software\inklink\State` | `Chinese` (DWORD) | 1 中文 / 0 英文 | 1 |
+| 同上 | `Punctuation` (DWORD) | 1 中文标点 / 0 半角 | 1 |
+
+- `tsf\src\state.rs`：`snapshot()` / `chinese()` / `punctuation()` / `set_chinese()` / `set_punctuation()`；
+  `flag_from_value()` 是纯函数（`None` 和脏数据都按"开"，只有明确写 0 才算关），可单测。
+- 为什么读者不缓存：`RegQueryValueExW` 微秒级，一次按键两次完全够；缓存会出现
+  "点了浮条按钮，另一个窗口 200ms 后才生效"。
+- 为什么不起线程：`RegNotifyChangeKeyValue` 要常驻线程，违反 `AGENTS.md` 铁律 1（薄壳）。
+- 标点开关**只影响空闲态**：关掉后标点键不认领 → 应用自己出半角标点（比"认领下来再转半角"干净，
+  后者得猜键盘布局还要自己 SetText）。拼写中仍按中文标点走，因为那一刻在选中文词。
+- Shift 单击切全局模式；拼写中按 Shift 上屏原文时顺手切英文（和搜狗一致）。CapsLock 仍是临时的。
+
+**验收**：`cargo test --release` 54 passed；窗口 A 里 Shift 切英文，窗口 B 立刻也是英文；
+`Punctuation=0` 时空闲打 `,` 出半角。
+
 #### 误选撤回 + 词库巡检（2026 10 27 补，M1 续）
 
 **要解决的问题**：词库只加不减。实测 70 条里混进了 `wojude  > 我局的`、`jnude  > 峻德`、
@@ -687,7 +712,7 @@ Obsidian 语料 + AI 兜底，默认关闭联网（符合项目铁律）。
 
 **测试能力现状**：
 
-  有：`cargo test` 50 个单测（按键认领、标点映射与引号交替、半角符号不转换、数字后半角标点、Shift 组合键不误判单击切换、拼音切分、分词边界归一、分段上屏消耗字母数、误选撤回与整句撤回的记账、整句上报门槛、候选窗上下翻与贴边、候选窗点击命中格、注入退格按次数放行与过期）
+  有：`cargo test` 54 个单测（按键认领、标点映射与引号交替、半角符号不转换、数字后半角标点、Shift 组合键不误判单击切换、拼音切分、分词边界归一、分段上屏消耗字母数、误选撤回与整句撤回的记账、整句上报门槛、候选窗上下翻与贴边、候选窗点击命中格、注入退格按次数放行与过期）
   有：`rime server.exe   selftest` 32 项引擎侧断言（`utf8_char_count` / `strip_separators` /
   `normalize_boundaries` / `split_lengths` / `learn_key` / `should_learn` / `boost_score`），纯 ASCII，不初始化 librime
   有：`tsf/test/test harness.cc` GUI 自动化测试台（需要交互式桌面，agent 抢不到焦点）
