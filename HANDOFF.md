@@ -35,7 +35,7 @@
 | M1 续 | 组合串按音节显示分隔符（`xian` → `xi'an`） | ⬜ |
 | M2 | Obsidian 语料（用户笔记进词库） | ⬜ 未开始 |
 | M3 | AI（离线词库体检、润色/续写/翻译） | ⬜ 未开始 |
-| T5d | 拼音下划线（`ITfDisplayAttributeProvider`） | ⬜ |
+| T5d | 拼音下划线（`ITfDisplayAttributeProvider`） | ✅ |
 
 ### 已完成的细节（实测验证）
 
@@ -234,7 +234,7 @@ C:\inklink-engine\
 | 能力 | 说明 |
 |:---|:---|
 | 中文输入 | librime 引擎（`C:\inklink-engine\rime-server.exe`，x86 链 `rime.dll`），整句/词组/简拼 |
-| 组合串 | 拼音显示在光标处，**音节之间带 `'` 分隔**（`xiangmu` → `xiang'mu`、`jintiantianqi` → `jin'tian'tian'qi`、`zheg` → `zhe'g`，和搜狗一致；见 `pinyin::compose_view`），←→ 在串内移动，Backspace/Delete 在光标处删 |
+| 组合串 | 拼音显示在光标处，**音节之间带 `'` 分隔**（`xiangmu` → `xiang'mu`、`jintiantianqi` → `jin'tian'tian'qi`、`zheg` → `zhe'g`，和搜狗一致；见 `pinyin::compose_view`），←→ 在串内移动，Backspace/Delete 在光标处删；**拼音下面有一条橙色点状下划线**（`display.rs`：`ITfDisplayAttributeProvider` + `GUID_PROP_ATTRIBUTE`，上屏前清掉） |
 | 候选窗 | 拼音行 + 5 列网格；收起 1×5，展开 5×5（25 个）；**只给选中行标 1-5**，↑↓ 换行、←→ 换列、数字键选当前行；**鼠标左键点哪格选哪个**（窗口自己处理 `WM_LBUTTONDOWN`，`hit_index()` 算格子，回调把下标交给 `lib.rs` 的 `handle_cand_click`）；**靠近屏幕底部自动翻到光标上方**，右侧放不下自动左移（`candwin::place`，按显示器可用区算，已扣任务栏） |
 | 翻页 | `-`/`=`（收起态 `-` 是分词符，展开态才是翻页）、PgUp/PgDn |
 | 分词符 | `-`/`_` 留在组合串里、查询前剥离；**显示时按音节插 `'`**（`xi-an` → `xi'an`，用户给的边界优先保留） |
@@ -247,17 +247,16 @@ C:\inklink-engine\
 | 模糊音 | 七组可选开关在 `rime-config\fuzzy.yaml`，跑 `tools\apply-fuzzy.ps1` 生成引擎配置并重启验证。**默认全关**（实测开 `zh_z` 会把 `zi` 的首选从「子」顶成「之」） |
 | **个人词库（M1）** | 你选过的词会被记住并顶到候选前面：`xiangmu` 选一次「橡木」→ 以后 `橡木` 排第一。存在 `%LOCALAPPDATA%\inklink\user-words.tsv`（`码\t词\t次数`，UTF-8），重启不丢，最多 4000 组码自动剪枝。分段上屏按**选中字数**反推学到哪个码（`pikeqiu` 选「皮」记在 `pi` 下，不是 `pikeqiu`）。**选错了就把字删掉**：上屏后 2 秒内把刚上屏的几个字全删光，这次学习自动撤回；单字不学；`--review-dict` / `--prune-single` / `--forget` 可以巡检和清理。**整句也学**：分段选完一句话（≥2 次选择、≥4 字）会按整段全拼再记一条，下次打同样的全拼整句候选往前排；**删掉整句也会撤回**（逐词和整句是两条独立的账）。**按应用分开记账**：同一个拼音在微信里和 VSCode 里可以各记各的（`boost_score = 全局 + 本应用×2`），词库文件第四列是应用名。**分词边界也是信息**：打 `xi'an` 选「西安」只记在 `xi'an` 下（`-` 会自动换成 `'`），下次打 `xi'an`/`xi-an` 西安排第一，打 `xian` 仍然是「先」 |
 | 安装器 | 脚本模板在 `installer\`，打包成 `dist\inklink-<版本>.zip`；`install.cmd` 一键装，带完整日志 `C:\Users\Public\inklink-install.log`，结尾 8 项自检 |
-| 单测 | `cd tsf && cargo test --release` → 27 passed（按键认领、标点映射含引号交替、拼音切分、分段上屏消耗字母数） |
+| 单测 | `cd tsf && cargo test --release` → 50 passed（按键认领、标点与引号交替、半角符号、数字后半角、Shift 组合键、拼音切分、音节分隔显示、分词边界、分段上屏、误选撤回、整句上报、候选窗摆放与点击、注入退格、显示属性） |
 
 ### 还没做的（按建议优先级）
 
 | # | 任务 | 为什么现在做 |
 |:---|:---|:---|
-| 1 | T5d 拼音下划线 | 拼音现在像普通英文，"最不像输入法"的地方 |
-| 2 | T5c 候选窗美化 | 圆角/间距/配色 |
-| 3 | 用户词库管理界面 | 现在只有命令行 `--review-dict`，桌面上没法看/删 |
-| 4 | M2 Obsidian 语料 | 读用户笔记补专有名词（`extractor/` 有 v1 管线可复用） |
-| 5 | M3 AI（离线）/ T5e 个人云 | 词库体检、润色/续写/翻译，原始愿景，最后做 |
+| 1 | T5c 候选窗美化 | 圆角/间距/配色 |
+| 2 | 用户词库管理界面 | 现在只有命令行 `--review-dict`，桌面上没法看/删 |
+| 3 | M2 Obsidian 语料 | 读用户笔记补专有名词（`extractor/` 有 v1 管线可复用） |
+| 4 | M3 AI（离线）/ T5e 个人云 | 词库体检、润色/续写/翻译，原始愿景，最后做 |
 
 ### M1 个人词库学习（已实现，2026-10-27）
 
@@ -415,6 +414,12 @@ DLL 被加载后无法卸载：脚本每次用**新文件名 + 改注册表**，
   `S_OK` 但给 `(0,0)`，`ITfRange::ShiftStart` 返回 `S_OK` 但 `shifted == 0`。两处都信返回值，
   结果就是"日志写 ok、界面一个字没少"。删字现在三级级联、每级都验证；最后一级是注入原生
   `VK_BACK` 让宿主自己删，注入前记抑制次数，否则自己的注入键会再被认领一次。
+- **给组合串加下划线没有 `ITfRange::SetDisplayAttribute` 这种接口**（msctf.idl 里都没有，网上抄的
+  代码片段容易把人带沟里）。要走：`RegisterGUID` 拿 atom → `ITfDisplayAttributeProvider` 提供
+  `TF_DISPLAYATTRIBUTE` → `ITfProperty(GUID_PROP_ATTRIBUTE).SetValue(VT_I4(atom))`。provider 可以挂在
+  **同一个 CLSID** 上（TSF 会自己 QI），注册只是多加一个 `GUID_TFCAT_DISPLAYATTRIBUTEPROVIDER` 分类。
+  属性没有 `Clear`，清样式要写 `VT_EMPTY`，而且**上屏前必须清**，否则打出去的字一直带虚线。
+  Electron 系（VS Code）不支持 `GUID_PROP_ATTRIBUTE`，那边拼音没有下划线属正常。
 - `.ps1` 必须 UTF-8 **带 BOM**；`.cmd` 必须**纯 ASCII + CRLF**（cmd.exe 按 OEM 代码页读，`goto` 在 LF-only 文件里会失效）。
 - `net session` 判管理员不可靠（Server 服务被禁就恒失败）→ 用 `fltmc`。
 - 拼写中按 `-` 的语义取决于是否展开：展开=翻页，收起=分词符。判定前必须先把 `expanded` 的 MutexGuard 放到块里释放，否则再 lock 会死锁。

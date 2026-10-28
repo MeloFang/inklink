@@ -1,6 +1,6 @@
 [package]
 name = "inklink-tsf"
-version = "1.0.14"
+version = "1.0.15"
 edition = "2024"
 description = "inklink 的 TSF 文本服务（薄壳）"
 
@@ -12,7 +12,9 @@ windows = { version = "0.61", features = [
   "Win32_Foundation",
   "Win32_System_Com",
   "Win32_System_LibraryLoader",
+  "Win32_System_Ole",
   "Win32_System_Registry",
+  "Win32_System_Variant",
   "Win32_Security",
   "Win32_UI_TextServices",
  ] }

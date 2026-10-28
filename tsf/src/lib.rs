@@ -16,15 +16,16 @@ use windows::Win32::Foundation::{
 use windows::core::BOOL;
 use windows::Win32::System::Com::{IClassFactory, IClassFactory_Impl};
 use windows::Win32::UI::TextServices::{
-    ITfComposition, ITfCompositionSink, ITfCompositionSink_Impl, ITfContext, ITfContextComposition,
-    ITfEditSession, ITfEditSession_Impl, ITfKeyEventSink, ITfKeyEventSink_Impl, ITfKeystrokeMgr,
-    ITfRange, ITfRangeACP, ITfTextInputProcessorEx, ITfTextInputProcessorEx_Impl,
-    ITfTextInputProcessor_Impl,
-    ITfThreadMgr, TF_ANCHOR_END, TF_ANCHOR_START, TF_DEFAULT_SELECTION, TF_ES_ASYNC,
-    TF_ES_READWRITE, TF_SELECTION,
+    IEnumTfDisplayAttributeInfo, ITfComposition, ITfCompositionSink, ITfCompositionSink_Impl,
+    ITfContext, ITfContextComposition, ITfDisplayAttributeInfo, ITfDisplayAttributeProvider,
+    ITfDisplayAttributeProvider_Impl, ITfEditSession, ITfEditSession_Impl, ITfKeyEventSink,
+    ITfKeyEventSink_Impl, ITfKeystrokeMgr, ITfRange, ITfRangeACP, ITfTextInputProcessorEx,
+    ITfTextInputProcessorEx_Impl, ITfTextInputProcessor_Impl, ITfThreadMgr, TF_ANCHOR_END,
+    TF_ANCHOR_START, TF_DEFAULT_SELECTION, TF_ES_ASYNC, TF_ES_READWRITE, TF_SELECTION,
 };
 mod ipc;
 mod candwin;
+mod display;
 mod pinyin;
 use windows::core::{GUID, HRESULT, Interface, Ref, implement};
 use windows::core::IUnknownImpl;
@@ -152,7 +153,13 @@ struct TextServiceInner {
     pending_backspace: Mutex<usize>,
 }
 
-#[implement(ITfTextInputProcessorEx, ITfKeyEventSink, ITfEditSession, ITfCompositionSink)]
+#[implement(
+    ITfTextInputProcessorEx,
+    ITfKeyEventSink,
+    ITfEditSession,
+    ITfCompositionSink,
+    ITfDisplayAttributeProvider
+)]
 struct TextService {
     inner: TextServiceInner,
 }
@@ -502,6 +509,23 @@ impl ITfTextInputProcessorEx_Impl for TextService_Impl {
     }
 }
 
+/// 组合串的显示属性（下划线）。
+///
+/// TSF 会用**我们的 CLSID** 直接 `CoCreateInstance` 再 QI 这个接口，
+/// 所以它必须和文本服务实现在同一个类上——具体样式在 `display.rs`。
+impl ITfDisplayAttributeProvider_Impl for TextService_Impl {
+    fn EnumDisplayAttributeInfo(&self) -> windows::core::Result<IEnumTfDisplayAttributeInfo> {
+        display::enum_info()
+    }
+
+    fn GetDisplayAttributeInfo(
+        &self,
+        pguid: *const GUID,
+    ) -> windows::core::Result<ITfDisplayAttributeInfo> {
+        display::info_for(pguid)
+    }
+}
+
 /// 候选窗鼠标点击的跳板：`candwin` 的窗口过程在 UI 线程里直接调进来。
 ///
 /// # Safety
@@ -542,6 +566,10 @@ impl TextService_Impl {
 
         // 激活时顺手确保引擎在跑——引擎崩了下次切输入法就自动复活
         ipc::ensure_engine();
+
+        // 组合串下划线要的 atom（显示属性）。失败不影响打字，只是拼音没有虚线。
+        let atom = display::ensure_atom();
+        log_line(&format!("display-attr atom={atom}"));
 
         // 候选窗点鼠标选词：回调跳板带上自己，窗口过程只要把下标送回来。
         // 只在激活期间有效（`unadvise_keys` 里拆掉）。
@@ -792,6 +820,11 @@ impl ITfEditSession_Impl for TextService_Impl {
                 if let Some(c) = comp {
                     let range = unsafe { c.GetRange()? };
                     unsafe { range.SetText(ec, 0, &utf16)? };
+                    // 给组合串打上"输入中"的样式（应用据此画虚线，见 display.rs）
+                    match display::mark(&ctx, ec, &range) {
+                        "ok" | "no atom" => {}
+                        why => log_line(&format!("display-attr {why}")),
+                    }
                     self.place_caret(&ctx, ec, &range, cursor)?;
                     // 用 TSF 的 GetTextExt 问应用"我这段在屏幕哪"（和搜狗同款）
                     let pos = text_ext_pos(&ctx, ec, &range);
@@ -821,6 +854,8 @@ impl ITfEditSession_Impl for TextService_Impl {
                 let utf16: Vec<u16> = text.encode_utf16().collect();
                 if let Some(c) = comp {
                     let range = unsafe { c.GetRange()? };
+                    // 上屏的字不能留虚线：样式要在定格前清掉
+                    display::clear(&ctx, ec, &range);
                     unsafe { range.SetText(ec, 0, &utf16)? };
                     self.inner.self_terminating.store(true, Ordering::SeqCst);
                     let end_res = unsafe { c.EndComposition(ec) };
@@ -848,6 +883,8 @@ impl ITfEditSession_Impl for TextService_Impl {
                 if let Some(c) = comp {
                     let pick16: Vec<u16> = picked.encode_utf16().collect();
                     let range = unsafe { c.GetRange()? };
+                    // 定格的这几个字不要虚线（剩下的拼音会在新组合串里重新打上）
+                    display::clear(&ctx, ec, &range);
                     unsafe { range.SetText(ec, 0, &pick16)? };
                     self.inner.self_terminating.store(true, Ordering::SeqCst);
                     let end_res = unsafe { c.EndComposition(ec) };
@@ -885,6 +922,7 @@ impl ITfEditSession_Impl for TextService_Impl {
                 let (rest_view, rest_cursor) = pinyin::compose_view(&rest, rest.len());
                 let rest16: Vec<u16> = rest_view.encode_utf16().collect();
                 unsafe { range.SetText(ec, 0, &rest16)? };
+                display::mark(&ctx, ec, &range);
                 self.place_caret(&ctx, ec, &range, rest_cursor)?;
                 let pos = text_ext_pos(&ctx, ec, &range);
                 *self.inner.last_pos.lock().unwrap_or_else(|p| p.into_inner()) = pos;
@@ -2636,8 +2674,8 @@ mod registry {
             CoUninitialize,
         };
         use windows::Win32::UI::TextServices::{
-            CLSID_TF_CategoryMgr, CLSID_TF_InputProcessorProfiles, GUID_TFCAT_TIP_KEYBOARD,
-            ITfCategoryMgr, ITfInputProcessorProfiles,
+            CLSID_TF_CategoryMgr, CLSID_TF_InputProcessorProfiles, GUID_TFCAT_DISPLAYATTRIBUTEPROVIDER,
+            GUID_TFCAT_TIP_KEYBOARD, ITfCategoryMgr, ITfInputProcessorProfiles,
         };
 
         const LANG_ZH_CN: u16 = 0x0804;
@@ -2660,6 +2698,15 @@ mod registry {
                 crate::ignore_s_false(catmgr.RegisterCategory(
                     &CLSID_INKLINK_TSF,
                     &GUID_TFCAT_TIP_KEYBOARD,
+                    &CLSID_INKLINK_TSF,
+                ))?;
+
+                // 组合串下划线：把自己登记成「显示属性提供者」。
+                // 应用渲染组合串时就会用我们的 CLSID 去要样式（见 display.rs）。
+                // 这是纯加性的分类注册，不影响键盘 TIP 那条。
+                crate::ignore_s_false(catmgr.RegisterCategory(
+                    &CLSID_INKLINK_TSF,
+                    &GUID_TFCAT_DISPLAYATTRIBUTEPROVIDER,
                     &CLSID_INKLINK_TSF,
                 ))?;
                 drop(catmgr);
