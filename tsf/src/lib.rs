@@ -132,6 +132,8 @@ struct TextServiceInner {
     commit_mark: Mutex<Option<CommitMark>>,
     /// 正在逐词选择的这一句（用于整句学习）
     sentence: Mutex<Option<SentenceAcc>>,
+    /// 刚上屏的那一句（用于整句的撤回）
+    sentence_mark: Mutex<Option<CommitMark>>,
 }
 
 #[implement(ITfTextInputProcessorEx, ITfKeyEventSink, ITfEditSession, ITfCompositionSink)]
@@ -163,6 +165,7 @@ impl TextService {
                 shift_used: AtomicBool::new(false),
                 commit_mark: Mutex::new(None),
                 sentence: Mutex::new(None),
+                sentence_mark: Mutex::new(None),
             },
         }
     }
@@ -177,49 +180,77 @@ impl TextService {
         *g = CommitMark::new(code.to_string(), word.to_string());
     }
 
-    /// 忘掉刚才那个上屏记录（用户又打别的字了）。
+    /// 记下"刚上屏的整句"，好判断用户是不是把整句删光了。
+    ///
+    /// 整句的撤回和逐词的是两条独立的账：删掉最后那个词只撤回那个词；
+    /// 一直删到整句都没了，整句那条也要撤回（见 `count_backspace`）。
+    fn mark_sentence(&self, code: &str, text: &str) {
+        let mut g = self
+            .inner
+            .sentence_mark
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        *g = CommitMark::new(code.to_string(), text.to_string());
+    }
+
+    /// 忘掉刚才那些上屏记录（用户又打别的字了）。
     fn clear_commit_mark(&self) {
-        let mut g = self
+        *self
             .inner
             .commit_mark
             .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        *g = None;
+            .unwrap_or_else(|p| p.into_inner()) = None;
+        *self
+            .inner
+            .sentence_mark
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = None;
     }
 
-    /// 有没有"刚上屏、还可能被撤回"的词。
+    /// 有没有"刚上屏、还可能被撤回"的词或整句。
     fn undo_pending(&self) -> bool {
-        let g = self
+        let word = self
             .inner
             .commit_mark
             .lock()
             .unwrap_or_else(|p| p.into_inner());
-        g.as_ref().map(|m| !m.expired()).unwrap_or(false)
-    }
-
-    /// 记一次退格。返回 `Some((code, word))` 表示刚上屏的词已被删光，
-    /// 该把那次学习撤回。
-    fn count_backspace(&self) -> Option<(String, String)> {
-        let mut g = self
+        if word.as_ref().map(|m| !m.expired()).unwrap_or(false) {
+            return true;
+        }
+        let sent = self
             .inner
-            .commit_mark
+            .sentence_mark
             .lock()
             .unwrap_or_else(|p| p.into_inner());
-        let mut done = None;
-        let mut expired = false;
-        if let Some(mark) = g.as_mut() {
-            if mark.expired() {
-                expired = true;
-            } else {
-                done = mark.on_backspace();
-            }
-        }
-        if done.is_some() || expired {
-            *g = None;
-        }
-        done
+        sent.as_ref().map(|m| !m.expired()).unwrap_or(false)
     }
 
+    /// 记一次退格。返回需要撤回学习的 `(码, 词)` 列表 —— 删掉最后一个词时
+    /// 一条，接着把整句也删光时两条（逐词的 + 整句的）。
+    fn count_backspace(&self) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        let word = step_mark(
+            &mut self
+                .inner
+                .commit_mark
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()),
+        );
+        if let Some(pair) = word {
+            out.push(pair);
+        }
+        let sent = step_mark(
+            &mut self
+                .inner
+                .sentence_mark
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()),
+        );
+        if let Some(pair) = sent {
+            out.push(pair);
+        }
+        out
+    }
 
     /// 记一次候选选择，供整句学习用。
     ///
@@ -321,6 +352,29 @@ impl CommitMark {
     fn expired(&self) -> bool {
         std::time::Instant::now() > self.deadline
     }
+}
+
+/// 记一次退格到某个槽位上。
+///
+/// 删光了返回 `(code, word)` 并把槽位清空；过期了也清空（不再算误选）；
+/// 否则只是递减。提出来是为了能直接单测，不用造一个 COM 对象。
+fn step_mark(slot: &mut Option<CommitMark>) -> Option<(String, String)> {
+    let mut done = None;
+    let mut drop_it = false;
+    if let Some(mark) = slot.as_mut() {
+        if mark.expired() {
+            drop_it = true;
+        } else {
+            done = mark.on_backspace();
+            if done.is_some() {
+                drop_it = true;
+            }
+        }
+    }
+    if drop_it {
+        *slot = None;
+    }
+    done
 }
 
 /// 正在逐词选择的这一句。
@@ -445,6 +499,9 @@ impl TextService_Impl {
         if let Some((code, text)) = self.note_pick_for_sentence(code_before, &action) {
             log_line(&format!("learn-sentence code={code} text={text}"));
             ipc::select(0, &code, &text);
+            // 整句也记一条"可能被撤回"的账：删掉最后那个词只撤回那个词，
+            // 一直删到整句都没了，这一条才触发。
+            self.mark_sentence(&code, &text);
         }
         self.request_edit(action);
         BOOL(1)
@@ -907,7 +964,7 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
         if vk == VK_BACK {
             let composing = !self.inner.buffer.lock().unwrap_or_else(|p| p.into_inner()).is_empty();
             if !composing {
-                if let Some((code, word)) = self.count_backspace() {
+                for (code, word) in self.count_backspace() {
                     log_line(&format!("unlearn code={code} word={word}"));
                     ipc::unlearn(&code, &word);
                 }
@@ -2314,6 +2371,48 @@ mod tests {
         assert!(!should_report_sentence(2, 2), "两个字不算整句");
         assert!(!should_report_sentence(3, 3), "三个字仍然太短");
         assert!(should_report_sentence(3, 5));
+    }
+
+    #[test]
+    fn 删掉最后一个词只撤回那个词() {
+        // 打 jintiantianqi 选「今天」再选「天气」：整句标记 4 个字，词的标记 2 个字。
+        let mut word = CommitMark::new("tianqi".to_string(), "天气".to_string());
+        let mut sent = CommitMark::new("jintiantianqi".to_string(), "今天天气".to_string());
+        // 连按两次退格：词删光了，整句还剩两个字。
+        assert!(step_mark(&mut word).is_none());
+        assert_eq!(
+            step_mark(&mut word),
+            Some(("tianqi".to_string(), "天气".to_string())),
+            "最后一个词被删光，撤回这个词"
+        );
+        assert!(step_mark(&mut sent).is_none(), "整句还没删光");
+        assert!(step_mark(&mut sent).is_none(), "整句还剩一个字");
+        assert!(word.is_none(), "词已经撤回过，不该再来一次");
+    }
+
+    #[test]
+    fn 一直删到整句没了整句也撤回() {
+        let mut sent = CommitMark::new("jintiantianqi".to_string(), "今天天气".to_string());
+        assert!(step_mark(&mut sent).is_none());
+        assert!(step_mark(&mut sent).is_none());
+        assert!(step_mark(&mut sent).is_none());
+        assert_eq!(
+            step_mark(&mut sent),
+            Some(("jintiantianqi".to_string(), "今天天气".to_string())),
+            "第四下把整句删光，撤回整句那条学习"
+        );
+        assert!(sent.is_none(), "撤回过就清空，不会重复撤回");
+    }
+
+    #[test]
+    fn 过期的标记不再算误选() {
+        let mut mark = CommitMark::new("nihao".to_string(), "你好".to_string());
+        // 手动把截止时间推到过去，模拟用户 2 秒后才按退格。
+        if let Some(m) = mark.as_mut() {
+            m.deadline = std::time::Instant::now() - std::time::Duration::from_millis(1);
+        }
+        assert!(step_mark(&mut mark).is_none(), "过期就不算误选");
+        assert!(mark.is_none(), "过期后槽位要清空");
     }
 
     #[test]
