@@ -461,6 +461,8 @@ DLL 侧所有管道读也改成带超时的 `read_exact_timeout()`（`QUERY_TIME
 
 **退格由输入法自己执行**（2026-10-28 修）：`OnTestKeyDown` 认领过退格之后，有的应用就再也收不到这个键了 —— 实际体验是"按两下没反应，第三下才删掉一个字"。所以撤回窗口内不再依赖"认领 + `OnKeyDown` 返 FALSE 让应用自己删"，改成在编辑会话里 `EditAction::DeleteBack` 自己删：`GetSelection` → 有选中就删选中、没有就 `Collapse(TF_ANCHOR_START)` + `ShiftStart(-n)` → `SetText(empty)` → 光标落回删除点，`OnKeyDown` 返 `BOOL(1)` 把键吃掉。连按次数攒在 `pending_backspace`（异步会话只有一个 `pending` 槽，否则第二下会覆盖第一下）。
 
+**删字的三级级联**（2026-10-28 修）：WPS 的正文控件里 `ITfRangeACP::GetExtent` 返回 `S_OK` 但给 `(0,0)`，`ShiftStart` 又原地不动，于是 `SetText(empty)` 作用在空区间上 —— 日志写 `ok`、界面一个字没少，用户看到的是"按两下才删掉"。所以改成三级依次试、**每级都要确认真删掉了**：① ACP `SetExtent(from, len)` + `SetText`（`anchor == 0 && cch == 0` 视为宿主不认 ACP，跳到下一级）；② `Collapse(TF_ANCHOR_START)` + `ShiftStart(-n)`，**必须 `shifted != 0`**；③ `ipc::press_backspace(n)` 注入原生 `VK_BACK`，让宿主按自己的逻辑删。注入前 `mark_injected_backspace(n)` 记次数，`OnTestKeyDown`/`OnKeyDown` 见到就返 `BOOL(0)` 放行，否则会把自己的注入键再认领一次（越删越多）；标记 1 秒过期，防止宿主吞键后把用户真正的退格一直当注入键放行。
+
 **打错的拼音不再让原始字母抢第一屏**（2026-10-28 修）：`is_pinyin_code` 判"不像拼音"只说明它不能整串切成音节，不代表用户想打英文。再加一条判据：前缀能连着切出 ≥2 个完整音节就是拼音（`shashahs` → `sha|sha|…`），此时原始字母排到候选最后；`github`/`hello`/`test`/`world`/`thanks` 前缀凑不出两个音节，仍然排第一（保留"打英文一眼可见"的老行为）。实测 `shashahs` → 傻傻还是 傻傻 莎莎 沙沙…，英文词全部不回归。
 
 **还没做的**：长句分词边界学习。
@@ -635,7 +637,7 @@ Obsidian 语料 + AI 兜底，默认关闭联网（符合项目铁律）。
 
 **测试能力现状**：
 
-- 有：`cargo test` 39 个单测（按键认领、标点映射与引号交替、半角符号不转换、拼音切分、分段上屏消耗字母数、误选撤回与整句撤回的记账、整句上报门槛、候选窗上下翻与贴边）
+- 有：`cargo test` 41 个单测（按键认领、标点映射与引号交替、半角符号不转换、拼音切分、分段上屏消耗字母数、误选撤回与整句撤回的记账、整句上报门槛、候选窗上下翻与贴边、注入退格按次数放行与过期）
 - 有：`rime-server.exe --selftest` 24 项引擎侧断言（`utf8_char_count` / `strip_separators` /
   `split_lengths` / `learn_key`），纯 ASCII，不初始化 librime
 - 有：`tsf/test/test-harness.cc` GUI 自动化测试台（需要交互式桌面，agent 抢不到焦点）

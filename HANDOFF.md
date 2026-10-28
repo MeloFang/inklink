@@ -312,6 +312,11 @@ C:\inklink-engine\
 - 引擎侧 `unlearn()`（协议 v4 `type=3`）：计数 >1 就减 1，否则删条目。
 - 不用 `ITfTextEditSink` 的理由：要新增编辑观察者 + 跟踪 range，出错就是挂死（见 1.0.1 选词死锁）。
 - 单字不学（`USER_MIN_CHARS = 2`）：单字由语言模型排序，学一遍只会跟模型打架。
+- **删字的三级级联**（`EditAction::DeleteBack`）：认领了退格就得自己把字删掉，但"怎么删"没有一条路对所有宿主都管用，所以三级依次试、**每级都要确认真的删掉了**：
+  1. `ITfRangeACP::GetExtent/SetExtent` —— 最干净，给锚点和长度，没有歧义。
+  2. `Collapse + ShiftStart` —— 有些宿主返回 S_OK 却一步没动，必须检查 `shifted != 0`。
+  3. 注入原生 `VK_BACK`（`ipc::press_backspace`）—— WPS 正文控件在 ① 里 `GetExtent` 给 `(0,0)`、在 ② 里原地不动，只剩这条路。注入前用 `mark_injected_backspace(n)` 记次数，`OnTestKeyDown`/`OnKeyDown` 见到就把键放行给应用，否则会把自己的注入键再认领一次。
+  注入标记有 1 秒超时：宿主如果把注入键吞掉，不能让标记一直挂着把用户真正的退格当注入键放行。
 
 #### 整句学习（2026-10-28 补）
 
@@ -378,6 +383,10 @@ DLL 被加载后无法卸载：脚本每次用**新文件名 + 改注册表**，
   要么认领了就自己把副作用做完（`EditAction::DeleteBack` 自己删字并返回 `BOOL(1)`）。
   异步编辑会话只有一个 `pending` 槽，连按两下会互相覆盖 → 次数要攒在计数器里
   （`pending_backspace`），会话一次删完。
+- **"API 返回 S_OK"不等于"事情做成了"**：`ITfRangeACP::GetExtent` 在 WPS 正文控件里返回
+  `S_OK` 但给 `(0,0)`，`ITfRange::ShiftStart` 返回 `S_OK` 但 `shifted == 0`。两处都信返回值，
+  结果就是"日志写 ok、界面一个字没少"。删字现在三级级联、每级都验证；最后一级是注入原生
+  `VK_BACK` 让宿主自己删，注入前记抑制次数，否则自己的注入键会再被认领一次。
 - `.ps1` 必须 UTF-8 **带 BOM**；`.cmd` 必须**纯 ASCII + CRLF**（cmd.exe 按 OEM 代码页读，`goto` 在 LF-only 文件里会失效）。
 - `net session` 判管理员不可靠（Server 服务被禁就恒失败）→ 用 `fltmc`。
 - 拼写中按 `-` 的语义取决于是否展开：展开=翻页，收起=分词符。判定前必须先把 `expanded` 的 MutexGuard 放到块里释放，否则再 lock 会死锁。

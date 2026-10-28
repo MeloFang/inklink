@@ -480,6 +480,61 @@ pub fn send_text(text: &str) -> bool {
     sent_all
 }
 
+/// 注入 `times` 次原生退格键，让**应用自己**删字。
+///
+/// 为什么需要这条路径：少数宿主的编辑框（WPS 的正文控件、部分 UWP 控件）
+/// 里 `ITfRangeACP::GetExtent` 返回 S_OK 却给出 (0,0)，我们算不出该删哪几个字；
+/// 退回去用 `ITfRange::ShiftStart` 又原地不动。这时只能把"退格"这个动作
+/// 还给宿主 —— 发一个真的 `VK_BACK`，宿主按它自己的逻辑删字。
+///
+/// 注意：注入的键会再次经过 TSF，也就是会回到我们自己的 `OnKeyDown`。
+/// 所以调用方必须先把抑制次数记下来（`lib.rs` 的 `mark_injected_backspace`），
+/// 否则我们会把注入的键再认领一次，越删越多。
+pub fn press_backspace(times: usize) {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, SendInput,
+    };
+    const VK_BACK: u16 = 0x08;
+    if times == 0 {
+        return;
+    }
+    let mut inputs: Vec<INPUT> = Vec::with_capacity(times * 2);
+    for _ in 0..times {
+        inputs.push(INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: VK_BACK,
+                    wScan: 0,
+                    dwFlags: 0,
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        });
+        inputs.push(INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: VK_BACK,
+                    wScan: 0,
+                    dwFlags: KEYEVENTF_KEYUP,
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        });
+    }
+    // SAFETY: inputs 的布局与 SendInput 期望的一致
+    unsafe {
+        SendInput(
+            inputs.len() as u32,
+            inputs.as_ptr(),
+            std::mem::size_of::<INPUT>() as i32,
+        );
+    }
+}
+
 fn wide(s: &str) -> Vec<u16> {
     OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
 }

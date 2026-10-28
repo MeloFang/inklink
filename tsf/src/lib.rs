@@ -417,6 +417,52 @@ fn should_report_sentence(picks: usize, chars: usize) -> bool {
     picks >= 2 && chars >= SENTENCE_MIN_CHARS
 }
 
+/// 我们自己注入的退格还剩几个没被自己的 sink 吃掉。
+///
+/// 少数宿主（WPS 正文控件等）既不给 ACP 区间、`ShiftStart` 也不动，只能注入
+/// 原生 `VK_BACK` 让宿主自己删字。注入的键会再走一遍 TSF 回到我们这里，
+/// 所以注入前记数、收到时放行（返回 FALSE），否则会把注入的键再认领一次。
+static INJECTED_BACK: Mutex<Option<(std::time::Instant, usize)>> = Mutex::new(None);
+
+/// 记住"接下来有 n 个退格是我们自己发的"。
+fn mark_injected_backspace(n: usize) {
+    let mut g = INJECTED_BACK.lock().unwrap_or_else(|p| p.into_inner());
+    *g = if n == 0 {
+        None
+    } else {
+        Some((std::time::Instant::now(), n))
+    };
+}
+
+/// 还有没有自己注入、尚未放行的退格（只读，`OnTestKeyDown` 用）。
+fn injected_backspace_pending() -> bool {
+    let g = INJECTED_BACK.lock().unwrap_or_else(|p| p.into_inner());
+    match *g {
+        // 1 秒还没消化掉就当作丢了，免得把用户真正的退格一直放行
+        Some((at, n)) => n > 0 && at.elapsed() < std::time::Duration::from_millis(1000),
+        None => false,
+    }
+}
+
+/// 消化掉一个注入的退格（`OnKeyDown` 用）：返回 true 表示这次按键是我们自己发的。
+fn take_injected_backspace() -> bool {
+    if !injected_backspace_pending() {
+        *INJECTED_BACK.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        return false;
+    }
+    let mut g = INJECTED_BACK.lock().unwrap_or_else(|p| p.into_inner());
+    match *g {
+        Some((at, n)) if n > 1 => {
+            *g = Some((at, n - 1));
+            true
+        }
+        _ => {
+            *g = None;
+            true
+        }
+    }
+}
+
 impl ITfTextInputProcessor_Impl for TextService_Impl {
     fn Activate(&self, ptim: Ref<ITfThreadMgr>, tid: u32) -> windows::core::Result<()> {
         self.advise_keys(ptim, tid)
@@ -869,17 +915,28 @@ impl ITfEditSession_Impl for TextService_Impl {
                         Ok(()) => match sel[0].range.as_ref() {
                             None => why = "no range",
                             Some(range) => {
-                                // 首选 ACP 精确指定要删的区间。
+                                // 三级级联，每级都要**确认真的删掉了**才收手：
                                 //
-                                // 为什么不用 Collapse + ShiftStart（1.0.5/1.0.6 用的就是这个）：
-                                // 在某些宿主上 `ShiftStart` 返回 S_OK 却一步都没移动，
-                                // 于是 `SetText(&[])` 作用在一个空区间上 —— 日志写 `ok`、
-                                // 界面上一个字都没少，用户看到的是"按四下才删掉一个字"。
-                                // `ITfRangeACP::GetExtent/SetExtent` 直接给锚点和长度，没有歧义。
+                                // ① `ITfRangeACP` 精确指定区间（最干净）。
+                                // ② `Collapse + ShiftStart`（1.0.5/1.0.6 用的就是它）——
+                                //    在某些宿主上返回 S_OK 却一步都没移动，所以必须
+                                //    检查 `shifted`，不然 `SetText(&[])` 作用在空区间上，
+                                //    日志写 ok、界面一个字都没少。
+                                // ③ 注入原生 `VK_BACK`，让宿主编按自己的逻辑删。
+                                //    WPS 的正文控件在 ① 里 `GetExtent` 给 (0,0)、
+                                //    在 ② 里原地不动，只剩这条路 —— 代价是这个键会
+                                //    再回到我们的 `OnKeyDown`，所以要记抑制次数。
+                                let mut done = false;
                                 if let Ok(acp) = range.cast::<ITfRangeACP>() {
                                     let (mut anchor, mut cch) = (0i32, 0i32);
                                     if acp.GetExtent(&mut anchor, &mut cch).is_err() {
                                         why = "GetExtent failed";
+                                    } else if anchor == 0 && cch == 0 {
+                                        // 分不清"宿主不认 ACP"和"光标真在文档开头"，
+                                        // 但光标在开头的情况我们本来就没什么可删，
+                                        // 让后面两级去试，代价可以接受。
+                                        log_line("delete-back acp extent=0 (host ignores ACP)");
+                                        why = "acp-extent-zero";
                                     } else {
                                         // 有选中内容就删选中；只有一个光标就往前吃 want 个字。
                                         let (from, len) = if cch > 0 {
@@ -898,26 +955,43 @@ impl ITfEditSession_Impl for TextService_Impl {
                                             ));
                                             if range.SetText(ec, 0, &[]).is_err() {
                                                 why = "SetText failed";
+                                            } else {
+                                                done = true;
+                                                why = "ok";
                                             }
                                         }
                                     }
                                 } else {
-                                    // 宿主不认 ITfRangeACP：退回 ShiftStart，并把实际移动量记进日志
+                                    why = "no acp";
+                                }
+                                if !done {
+                                    // ② ShiftStart，必须真的移动了才算数
                                     let mut shifted = 0i32;
-                                    if range.Collapse(ec, TF_ANCHOR_START).is_err() {
-                                        why = "Collapse failed";
-                                    } else if range
-                                        .ShiftStart(ec, -want, &mut shifted, std::ptr::null())
-                                        .is_err()
-                                    {
-                                        why = "ShiftStart failed";
-                                    } else if shifted == 0 {
-                                        why = "ShiftStart no-op";
-                                    } else if range.SetText(ec, 0, &[]).is_err() {
-                                        why = "SetText failed";
+                                    let moved = range.Collapse(ec, TF_ANCHOR_START).is_ok()
+                                        && range
+                                            .ShiftStart(ec, -want, &mut shifted, std::ptr::null())
+                                            .is_ok()
+                                        && shifted != 0;
+                                    if moved && range.SetText(ec, 0, &[]).is_ok() {
+                                        log_line(&format!("delete-back shiftstart shifted={shifted}"));
+                                        done = true;
+                                        why = "ok (shiftstart)";
+                                    } else {
+                                        log_line(&format!(
+                                            "delete-back shiftstart failed shifted={shifted}"
+                                        ));
                                     }
                                 }
-                                if why == "ok" {
+                                if !done {
+                                    // ③ 交给宿主：注入原生退格
+                                    log_line(&format!(
+                                        "delete-back inject native want={want} (why={why})"
+                                    ));
+                                    mark_injected_backspace(want as usize);
+                                    crate::ipc::press_backspace(want as usize);
+                                    why = "injected native backspace";
+                                }
+                                if done {
                                     let _ = range.Collapse(ec, TF_ANCHOR_END);
                                     let caret = [TF_SELECTION {
                                         range: std::mem::ManuallyDrop::new(Some(range.clone())),
@@ -1016,6 +1090,12 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
     ) -> windows::core::Result<BOOL> {
         let vk = wparam.0 as u32;
         const VK_BACK: u32 = 0x08;
+        // 这个退格是我们自己注入的（见 EditAction::DeleteBack 的第三级）：
+        // 不认领，让应用收下它去删字。
+        if vk == VK_BACK && injected_backspace_pending() {
+            log_line("test vk=8 claim=false (injected)");
+            return Ok(BOOL(0));
+        }
         let composing = !self.inner.buffer.lock().unwrap_or_else(|p| p.into_inner()).is_empty();
         // 刚上屏、可能被撤回的词，要先把退格抢过来数一下
         let undo = !composing && self.undo_pending();
@@ -1057,6 +1137,12 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
         const VK_NEXT: u32 = 0x22;
 
         let vk = wparam.0 as u32;
+
+        // 自己注入的退格：放行给应用（见 EditAction::DeleteBack 的第三级）
+        if vk == VK_BACK && take_injected_backspace() {
+            log_line("keydown vk=8 pass-through (injected)");
+            return Ok(BOOL(0));
+        }
 
         // 光标不在可编辑区域时一个键都不认领，否则会在没有光标的地方冒出候选窗
         let composable = self.can_compose(pic.as_ref());
@@ -2765,4 +2851,31 @@ mod punct_claim_tests {
     const VK_TAB_KEY: u32 = 0x09;
     const VK_SHIFT_KEY: u32 = 0x10;
     const VK_SPACE_KEY: u32 = 0x20;
+
+    #[test]
+    fn 注入的退格按次数放行() {
+        // 有些宿主删不掉字，我们注入原生退格让宿主自己删；
+        // 注入的键会再回到自己这里，必须按次数逐一放行，不能永久放行。
+        mark_injected_backspace(0);
+        assert!(!injected_backspace_pending());
+        assert!(!take_injected_backspace());
+
+        mark_injected_backspace(2);
+        assert!(injected_backspace_pending());
+        assert!(take_injected_backspace(), "第一个注入键");
+        assert!(injected_backspace_pending(), "还剩一个");
+        assert!(take_injected_backspace(), "第二个注入键");
+        assert!(!injected_backspace_pending(), "放行完了");
+        assert!(!take_injected_backspace(), "之后不再放行");
+    }
+
+    #[test]
+    fn 注入标记过期后不再放行用户自己的退格() {
+        // 万一注入的键没被送到（宿主吞了），不能让标记一直挂着把用户真正的
+        // 退格当成注入键放行 —— 那样误选就永远撤不回来了。
+        *INJECTED_BACK.lock().unwrap_or_else(|p| p.into_inner()) =
+            Some((std::time::Instant::now() - std::time::Duration::from_secs(5), 3));
+        assert!(!injected_backspace_pending());
+        assert!(!take_injected_backspace());
+    }
 }
