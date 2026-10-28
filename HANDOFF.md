@@ -239,7 +239,7 @@ C:\inklink-engine\
 | 纠错 | 多打/换位一个字母也能纠：`niihao`→你好、`xiangmuu`→项目、`zhemge`→这个、`shanghhai`→上海、`nihoa`→你好、`jintain`→今天。引擎侧 `edit_variants()` 生成变体（删重复/换位/删一个），`variant_score()` 排掉"单字母音节"那种垃圾切分；末尾半音节（`zheg`/`xiangm`）交给 librime 前缀匹配、不插手 |
 | 分段上屏 | 选了一个字后**剩下的拼音保留**继续选（`pikeqiu` 选「皮」→ 串变 `keqiu`）；尾巴上多打的字母按汉字数吃掉 |
 | 标点 | `,` `。` `;` `/` `\` `[` `]` 全转中文，Shift 变体 `？：《》「」`；**Shift+1~0 出全角 `！＠＃￥％……＆＊（）`**；**引号按一下开、再按一下合，自动成对 `“”` `‘’`**（`DQUOTE_OPEN`/`SQUOTE_OPEN` 两个全局开关）；**`-` `=` `_` `+` 永远半角不转换**（`halfwidth_symbol()`，Excel 公式 `=A1-B1` 要原样字符），空闲时干脆不认领这两个键 |
-| 英文模式 | Shift 单击切（按下不动、松开才生效，期间按过别的键就不算单击）；CapsLock 开 = 大写英文；英文模式下不认领任何键（WPS/Excel 兼容） |
+| 英文模式 | Shift 单击切（按下不动、松开才生效，期间按过别的键就不算单击）；CapsLock 开 = 大写英文；英文模式下不认领任何键（WPS/Excel 兼容）。**"按过别的键"要在 `OnTestKeyDown` 里记**，因为 `Shift+=`、`Shift+-` 这类我们根本不认领的键没有 `OnKeyDown` |
 | 32 位 | `inklink_tsf32.dll` 注册在 `WOW6432Node`，WPS 等可用 |
 | 模糊音 | 七组可选开关在 `rime-config\fuzzy.yaml`，跑 `tools\apply-fuzzy.ps1` 生成引擎配置并重启验证。**默认全关**（实测开 `zh_z` 会把 `zi` 的首选从「子」顶成「之」） |
 | **个人词库（M1）** | 你选过的词会被记住并顶到候选前面：`xiangmu` 选一次「橡木」→ 以后 `橡木` 排第一。存在 `%LOCALAPPDATA%\inklink\user-words.tsv`（`码\t词\t次数`，UTF-8），重启不丢，最多 4000 组码自动剪枝。分段上屏按**选中字数**反推学到哪个码（`pikeqiu` 选「皮」记在 `pi` 下，不是 `pikeqiu`）。**选错了就把字删掉**：上屏后 2 秒内把刚上屏的几个字全删光，这次学习自动撤回；单字不学；`--review-dict` / `--prune-single` / `--forget` 可以巡检和清理。**整句也学**：分段选完一句话（≥2 次选择、≥4 字）会按整段全拼再记一条，下次打同样的全拼整句候选往前排；**删掉整句也会撤回**（逐词和整句是两条独立的账）。**按应用分开记账**：同一个拼音在微信里和 VSCode 里可以各记各的（`boost_score = 全局 + 本应用×2`），词库文件第四列是应用名 |
@@ -383,6 +383,10 @@ DLL 被加载后无法卸载：脚本每次用**新文件名 + 改注册表**，
   要么认领了就自己把副作用做完（`EditAction::DeleteBack` 自己删字并返回 `BOOL(1)`）。
   异步编辑会话只有一个 `pending` 槽，连按两下会互相覆盖 → 次数要攒在计数器里
   （`pending_backspace`），会话一次删完。
+- **"Shift 单击切英文"的判断依据不能在 `OnKeyDown` 里记**：`Shift+=`（打 `+`）、`Shift+-`（打 `_`）、
+  `Shift+Tab` 这些我们**不认领**的键根本不会进 `OnKeyDown`，`shift_used` 一直是 false，
+  松开 Shift 就被当成"单击切换" → 打个 `+` 输入法就变英文了。要在 `OnTestKeyDown` 里就记
+  （`is_shift_chord(vk, shift, ctrl_alt_win)`），`OnKeyDown` 里也记一次做双保险。
 - **"API 返回 S_OK"不等于"事情做成了"**：`ITfRangeACP::GetExtent` 在 WPS 正文控件里返回
   `S_OK` 但给 `(0,0)`，`ITfRange::ShiftStart` 返回 `S_OK` 但 `shifted == 0`。两处都信返回值，
   结果就是"日志写 ok、界面一个字没少"。删字现在三级级联、每级都验证；最后一级是注入原生

@@ -1096,6 +1096,13 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
             log_line("test vk=8 claim=false (injected)");
             return Ok(BOOL(0));
         }
+        // 「这次按键是 Shift 组合键」这件事必须在这里就记下：
+        // 下面可能一个键都不认领（`Shift+=` → `+` 交给应用、英文模式下所有键都放行），
+        // 那种情况下 TSF 不会再调 OnKeyDown，只在 OnKeyDown 里记就会漏掉，
+        // 结果松开 Shift 被当成"单击"切换中英文（打个 `+` 就变英文）。
+        if is_shift_chord(vk, shift_held(), ctrl_alt_win_held()) {
+            self.inner.shift_used.store(true, Ordering::SeqCst);
+        }
         let composing = !self.inner.buffer.lock().unwrap_or_else(|p| p.into_inner()).is_empty();
         // 刚上屏、可能被撤回的词，要先把退格抢过来数一下
         let undo = !composing && self.undo_pending();
@@ -1197,14 +1204,12 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
             return Ok(BOOL(0));
         }
 
-        // Shift 期间按过任何别的键（包括 ? ! : " 这类要 Shift 的标点），
-        // 就说明这不是"单击切换中英文"，只是用 Shift 打字符。
-        // 少了这一条，打 `?`（Shift+/）会顺便把输入法切到英文。
-        {
-            const VK_SHIFT_ONLY: u32 = 0x10;
-            if vk != VK_SHIFT_ONLY && shift_held() {
-                self.inner.shift_used.store(true, Ordering::SeqCst);
-            }
+        // Shift 期间按过任何别的键（包括 ? ! : " 这类要 Shift 的标点，
+        // 也包括我们根本不认领的 + - _ =），就说明这不是"单击切换中英文"，
+        // 只是用 Shift 打字符。
+        // 少了这一条，打 `?`（Shift+/）或 `+`（Shift+=）会顺便把输入法切到英文。
+        if is_shift_chord(vk, shift_held(), ctrl_alt_win_held()) {
+            self.inner.shift_used.store(true, Ordering::SeqCst);
         }
 
         // 英文模式：所有键原样交给应用（Shift 除外，用 Shift 单击切回中文）
@@ -1870,6 +1875,16 @@ fn should_claim(vk: u32, composing: bool, shift: bool, caps: bool, english: bool
         return true;
     }
     false
+}
+
+/// 这一次按键算不算"在用 Shift 打字符"（而不是 Shift 单击切换中英文）。
+///
+/// 必须在 `OnTestKeyDown` 里就记下来，不能只在 `OnKeyDown` 里记：
+/// 有些键我们压根不认领（`Shift+=`、`Shift+-` 就是），不认领就不会有 `OnKeyDown`，
+/// 于是 `shift_used` 一直是 false，松开 Shift 就成了"单击切换"——表现为打个 `+` 就切到英文。
+fn is_shift_chord(vk: u32, shift: bool, ctrl_alt_win: bool) -> bool {
+    const VK_SHIFT_ONLY: u32 = 0x10;
+    vk != VK_SHIFT_ONLY && shift && !ctrl_alt_win
 }
 
 /// 当前每页候选数：收起 5，展开 25。
@@ -2723,6 +2738,23 @@ mod tests {
         // 但拼写中还是要认领（`-` 是分词符，展开态是翻页）
         assert!(should_claim(VK_OEM_MINUS, true, false, false, false));
         assert!(should_claim(VK_OEM_PLUS, true, false, false, false));
+    }
+
+    #[test]
+    fn shift_加号算组合键不算单击切换() {
+        // 用户实测：打 Shift+= / Shift+- 之后掉进英文模式。
+        // 原因是我们不认领这两个键 → 没有 OnKeyDown → shift_used 没置位 → 松开 Shift 当成单击。
+        const VK_SHIFT: u32 = 0x10;
+        assert!(is_shift_chord(VK_OEM_PLUS, true, false));
+        assert!(is_shift_chord(VK_OEM_MINUS, true, false));
+        assert!(is_shift_chord(VK_OEM_2, true, false)); // Shift+/ → ？
+        assert!(is_shift_chord(0x41, true, false)); // Shift+A
+        // Shift 本身不算（它就是"单击切换"的那个键）
+        assert!(!is_shift_chord(VK_SHIFT, true, false));
+        // 没按 Shift 不算
+        assert!(!is_shift_chord(VK_OEM_PLUS, false, false));
+        // Ctrl+Shift 是快捷键，也不算
+        assert!(!is_shift_chord(VK_OEM_PLUS, true, true));
     }
 
     #[test]

@@ -635,9 +635,11 @@ Obsidian 语料 + AI 兜底，默认关闭联网（符合项目铁律）。
 
 明确不做：插入字母、混淆集替换（模糊音已覆盖）、编辑距离 2。
 
+**Shift 组合键不再误切英文**（2026-10-28 修）：`Shift+=`（`+`）、`Shift+-`（`_`）在空闲态**不认领**（交给应用原样插入半角），于是 TSF 不调 `OnKeyDown`，`shift_used` 一直是 `false`，松开 Shift 就被 `OnKeyUp` 当成"单击切换中英文" —— 用户实测"按了 Shift+加号减号之后切不回中文"。修法：把"这次按键是 Shift 组合键"的判断提到 `OnTestKeyDown`（`is_shift_chord(vk, shift, ctrl_alt_win)`，排除 Shift 本身与 Ctrl/Alt/Win 快捷键），`OnKeyDown` 里再记一次做双保险。**教训**：凡是"根据按键序列推断意图"的状态，都要在最早的那个回调里记，不能挂在"认领之后才走"的路径上。
+
 **测试能力现状**：
 
-- 有：`cargo test` 41 个单测（按键认领、标点映射与引号交替、半角符号不转换、拼音切分、分段上屏消耗字母数、误选撤回与整句撤回的记账、整句上报门槛、候选窗上下翻与贴边、注入退格按次数放行与过期）
+- 有：`cargo test` 42 个单测（按键认领、标点映射与引号交替、半角符号不转换、Shift 组合键不误判单击切换、拼音切分、分段上屏消耗字母数、误选撤回与整句撤回的记账、整句上报门槛、候选窗上下翻与贴边、注入退格按次数放行与过期）
 - 有：`rime-server.exe --selftest` 24 项引擎侧断言（`utf8_char_count` / `strip_separators` /
   `split_lengths` / `learn_key`），纯 ASCII，不初始化 librime
 - 有：`tsf/test/test-harness.cc` GUI 自动化测试台（需要交互式桌面，agent 抢不到焦点）
