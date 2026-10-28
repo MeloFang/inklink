@@ -41,7 +41,12 @@ inklink/
 │  ├─ src/display.rs     组合串的下划线（ITfDisplayAttributeProvider + GUID_PROP_ATTRIBUTE）
 │  ├─ src/ipc.rs         命名管道客户端 + 引擎自动拉起
 │  ├─ src/pinyin.rs      402 音节表（贪心最长匹配；算分段上屏吃掉多少字母 + 组合串按音节显示的 `'`）
+│  ├─ src/state.rs       全局状态（注册表 HKCU\Software\inklink\State：中英、中文标点）
 │  └─ build.rs           把 VERSION 编进 DLL
+├─ ui/                   常驻 UI 进程（浮条 + 托盘；独立 crate，不加载进别人进程）
+│  ├─ src/main.rs        浮条窗口：中/英方块、标点方块、☰、拖动记忆
+│  ├─ src/state.rs       注册表读写（State / UI 位置 / 开机自启）
+│  └─ src/tray.rs        托盘图标 + 右键菜单
 ├─ rime-server/          C++ 引擎服务（链 librime，x86）
 │  └─ rime-server.cc     协议 [u8 type] + 查询/选词；个人词库学习层 + --selftest
 ├─ rime-config/          引擎侧配置源
@@ -106,6 +111,10 @@ cd C:\dsh\work\inklink\tsf
 cargo test --release                       # 54 个单测（按键认领 / 标点 / 引号 / 拼音切分 / 音节分隔显示 / 分词边界 / 分段上屏 / 误选撤回 / 整句上报 / 候选窗摆放与点击 / 注入退格抑制 / 显示属性 / 全局状态缺省值）
 cargo build --release --lib --target-dir target-static
 cargo build --release --lib --target i686-pc-windows-msvc --target-dir target-static
+
+# 浮条（独立进程，不加载进别的应用；改完必须重启它才生效）
+cd C:\dsh\work\inklink\ui
+cargo build --release
 ```
 
 引擎是 C++（`rime-server/rime-server.cc`），编译命令写在文件头注释里，需要 32 位 MSVC 环境

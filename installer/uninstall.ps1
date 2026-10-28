@@ -32,9 +32,10 @@ try {
     if ($changed) { Set-WinUserLanguageList -LanguageList $list -Force }
 } catch { Write-Host "  跳过：$_" -ForegroundColor DarkGray }
 
-# 2. 停引擎
-Write-Host '[2/5] 停止引擎...'
+# 2. 停引擎和浮条
+Write-Host '[2/5] 停止引擎和浮条...'
 Get-Process rime-server -ErrorAction SilentlyContinue | Stop-Process -Force
+Get-Process inklink-ui  -ErrorAction SilentlyContinue | Stop-Process -Force
 Start-Sleep -Seconds 1
 
 # 3. 清注册表
@@ -49,6 +50,7 @@ foreach ($k in @(
     Remove-Item $k -Recurse -Force -ErrorAction SilentlyContinue
 }
 Remove-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name 'inklink-engine' -ErrorAction SilentlyContinue
+Remove-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name 'inklink-ui' -ErrorAction SilentlyContinue
 
 # 4. 删文件
 Write-Host '[4/5] 删除文件...'

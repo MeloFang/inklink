@@ -70,3 +70,7 @@ msg.txt
 
 # 图标生成的中间预览图
 /installer/preview-*.png
+# 浮条的构建产物与调试截图
+/ui/target/
+/ui/shot-*.png
+/ui/*.log

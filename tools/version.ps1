@@ -39,7 +39,8 @@ function Set-InklinkVersion {
     # 同步各处声明的版本号，避免「DLL 0.1.23 / 安装包 0.1.22」这种错配
     # 只同步实际出货的组件；app/ 已退役，保持原版本号
     $targets = @(
-        @{ Path = 'tsf/Cargo.toml'; Pattern = '^version\s*=\s*".*"'; Replacement = "version = `"$Version`"" }
+        @{ Path = 'tsf/Cargo.toml'; Pattern = '^version\s*=\s*".*"'; Replacement = "version = `"$Version`"" },
+        @{ Path = 'ui/Cargo.toml';  Pattern = '^version\s*=\s*".*"'; Replacement = "version = `"$Version`"" }
     )
     foreach ($t in $targets) {
         $p = Join-Path $root $t.Path
