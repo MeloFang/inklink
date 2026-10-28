@@ -439,6 +439,8 @@ DLL 侧所有管道读也改成带超时的 `read_exact_timeout()`（`QUERY_TIME
 
 **退格由输入法自己执行**（2026-10-28 修）：`OnTestKeyDown` 认领过退格之后，有的应用就再也收不到这个键了 —— 实际体验是"按两下没反应，第三下才删掉一个字"。所以撤回窗口内不再依赖"认领 + `OnKeyDown` 返 FALSE 让应用自己删"，改成在编辑会话里 `EditAction::DeleteBack` 自己删：`GetSelection` → 有选中就删选中、没有就 `Collapse(TF_ANCHOR_START)` + `ShiftStart(-n)` → `SetText(empty)` → 光标落回删除点，`OnKeyDown` 返 `BOOL(1)` 把键吃掉。连按次数攒在 `pending_backspace`（异步会话只有一个 `pending` 槽，否则第二下会覆盖第一下）。
 
+**打错的拼音不再让原始字母抢第一屏**（2026-10-28 修）：`is_pinyin_code` 判"不像拼音"只说明它不能整串切成音节，不代表用户想打英文。再加一条判据：前缀能连着切出 ≥2 个完整音节就是拼音（`shashahs` → `sha|sha|…`），此时原始字母排到候选最后；`github`/`hello`/`test`/`world`/`thanks` 前缀凑不出两个音节，仍然排第一（保留"打英文一眼可见"的老行为）。实测 `shashahs` → 傻傻还是 傻傻 莎莎 沙沙…，英文词全部不回归。
+
 **还没做的**：长句分词边界学习。
 
 #### 误选撤回 + 词库巡检（2026-10-27 补，M1 续）

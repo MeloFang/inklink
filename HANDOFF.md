@@ -351,6 +351,9 @@ DLL 被加载后无法卸载：脚本每次用**新文件名 + 改注册表**，
 - **`argv` 是 ANSI 编码**（中文系统上是 GBK），命令行传中文（`--forget <码> <词>`）会匹配不上
   UTF-8 存的词 → 用 `argv_to_utf8()` 转换（`MultiByteToWideChar(CP_ACP)` + `WideCharToMultiByte(CP_UTF8)`）。
 - **误选撤回靠数退格，不靠 `ITfTextEditSink`**：后者要新增编辑观察者 + 跟踪 range，出错就是挂死。
+- **原始字母当不当第一个候选，要看"像不像在打拼音"**：`is_pinyin_code` 说不像，不代表用户想打英文。
+  现在再加一条判据 —— 前缀能连着切出 ≥2 个完整音节就是拼音（`shashahs` → `sha|sha|…`），
+  这时中文候选排前、原始字母排最后；`github`/`hello`/`test` 前缀连一个音节都凑不出两个，仍排第一。
 - **`OnTestKeyDown` 认领过的键，应用很可能收不到**，所以"认领但不处理（`OnKeyDown` 返 FALSE）"这种
   写法等于把键吃掉：撤回窗口里连按退格会出现"前两下没反应、第三下才删掉一个字"。要么别认领，
   要么认领了就自己把副作用做完（`EditAction::DeleteBack` 自己删字并返回 `BOOL(1)`）。

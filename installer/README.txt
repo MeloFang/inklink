@@ -29,6 +29,7 @@ inklink 输入法 __INKLINK_VERSION__  测试版
                   zhemge           -> 这个（多打一个字母）
                   shanghhai        -> 上海（多打一个字母）
                   末尾少打一个音    zheg / xiangm    -> 这个 / 项目
+  打坏一串也不怕    shashahs         -> 傻傻还是…（中文排前，要英文按 Shift 或回车）
   分段上屏        pikeqiu          选「皮」之后剩下的 keqiu 留在候选窗里，
                                    可以接着选「克」「球」；多打的字母自动丢掉
   记住你的选择    xiangmu          第一次「项目」在前，你选了「橡木」之后

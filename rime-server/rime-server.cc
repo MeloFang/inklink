@@ -748,13 +748,21 @@ static std::vector<std::string> query(const std::string& code) {
                 // 有纠错结果说明可能是打错的拼音（niihao → 你好），让纠错占第一，
                 // 原样紧跟其后（`update` 这种"恰好差一个字母就是合法拼音"的英文词
                 // 因此仍然一眼能看到）。像拼音的（`code`）原样排最后，一直如此。
-                if (!looks_pinyin) {
-                    size_t pos = corrected.empty() ? 0 : 1;
-                    if (pos > out.size()) pos = out.size();
-                    out.insert(out.begin() + pos, code);
-                } else {
-                    out.push_back(code);
+                //
+                // 2026-10-28：再补一条 —— 前缀能连着切出两个完整音节，说明用户是在打
+                // 拼音、只是后面打坏了（`shashahs` → sha|sha|…），这种情况原始字母
+                // 也不该抢第一屏：搜狗、微信输入法都是直接给中文，用户选中即是中文，
+                // 想要英文按 Shift/回车即可。真正的英文词（`github`/`hello`/`test`）
+                // 前缀一个音节都凑不出两个，仍然排第一。
+                size_t pos = out.size();   // 默认：排在候选最后
+                if (!looks_pinyin && corrected.empty()) {
+                    bool pinyin_typo = split_lengths(strip_separators(code)).size() >= 2;
+                    pos = pinyin_typo ? out.size() : 0;
+                } else if (!looks_pinyin) {
+                    pos = 1;
                 }
+                if (pos > out.size()) pos = out.size();
+                out.insert(out.begin() + pos, code);
             }
         }
     }
