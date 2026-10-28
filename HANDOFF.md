@@ -242,7 +242,7 @@ C:\inklink-engine\
 | 英文模式 | Shift 单击切（按下不动、松开才生效，期间按过别的键就不算单击）；CapsLock 开 = 大写英文；英文模式下不认领任何键（WPS/Excel 兼容） |
 | 32 位 | `inklink_tsf32.dll` 注册在 `WOW6432Node`，WPS 等可用 |
 | 模糊音 | 七组可选开关在 `rime-config\fuzzy.yaml`，跑 `tools\apply-fuzzy.ps1` 生成引擎配置并重启验证。**默认全关**（实测开 `zh_z` 会把 `zi` 的首选从「子」顶成「之」） |
-| **个人词库（M1）** | 你选过的词会被记住并顶到候选前面：`xiangmu` 选一次「橡木」→ 以后 `橡木` 排第一。存在 `%LOCALAPPDATA%\inklink\user-words.tsv`（`码\t词\t次数`，UTF-8），重启不丢，最多 4000 组码自动剪枝。分段上屏按**选中字数**反推学到哪个码（`pikeqiu` 选「皮」记在 `pi` 下，不是 `pikeqiu`） |
+| **个人词库（M1）** | 你选过的词会被记住并顶到候选前面：`xiangmu` 选一次「橡木」→ 以后 `橡木` 排第一。存在 `%LOCALAPPDATA%\inklink\user-words.tsv`（`码\t词\t次数`，UTF-8），重启不丢，最多 4000 组码自动剪枝。分段上屏按**选中字数**反推学到哪个码（`pikeqiu` 选「皮」记在 `pi` 下，不是 `pikeqiu`）。**选错了就把字删掉**：上屏后 2 秒内把刚上屏的几个字全删光，这次学习自动撤回；单字不学；`--review-dict` / `--prune-single` / `--forget` 可以巡检和清理 |
 | 安装器 | 脚本模板在 `installer\`，打包成 `dist\inklink-<版本>.zip`；`install.cmd` 一键装，带完整日志 `C:\Users\Public\inklink-install.log`，结尾 8 项自检 |
 | 单测 | `cd tsf && cargo test --release` → 27 passed（按键认领、标点映射含引号交替、拼音切分、分段上屏消耗字母数） |
 
@@ -250,7 +250,7 @@ C:\inklink-engine\
 
 | # | 任务 | 为什么现在做 |
 |:---|:---|:---|
-| 1 | M1 续：长句学习 + 撤销 | 现在只学"选中的那个词"，整句上屏和"选错了想改回来"还没接 |
+| 1 | M1 续：长句学习 | 现在只学"选中的那个词"，整句上屏不学（撤销已经做了）|
 | 2 | T5d 拼音下划线 | 拼音现在像普通英文，"最不像输入法"的地方 |
 | 3 | T5c 候选窗美化 | 圆角/间距/配色 |
 | 4 | T5e 个人云词库 + M3 AI | Obsidian 语料 + 翻译/续写，原始愿景，最后做 |
@@ -276,11 +276,31 @@ C:\inklink-engine\
   —— 那是引擎的配置区，用户词库是我们的产品数据。
 - 剪枝：`USER_MAX_CODES = 4000`，超了先丢"最高次数≤1"的（用过一次就再没选过的）。
 - `std::mutex g_user_mutex`：每连接一个线程，学习和查询会并发。
-- `rime-server.exe --selftest` 有 15 项纯 ASCII 断言（`utf8_char_count` / `strip_separators` /
-  `split_lengths` / `learn_key`），不初始化 librime、不碰管道，CI 或排障时直接跑。
+- `rime-server.exe --selftest` 有 20 项纯 ASCII 断言（`utf8_char_count` / `strip_separators` /
+  `split_lengths` / `learn_key` / `should_learn`），不初始化 librime、不碰管道，CI 或排障时直接跑。
 
 入口：`C:\dsh\work\inklink\rime-server\rime-server.cc` 的 `select_candidate()` → `learn()`。
 
+
+#### 误选撤回（2026-10-27 补）
+
+词库以前只加不减，选错的词会一直污染排序（实测 70 条里混了 `wojude -> 我局的` 这种）。
+现在的判据是**行为信号**：上屏后 2 秒内把刚上屏的字全删光 = 选错了。
+
+- DLL 侧 `CommitMark`（`tsf/src/lib.rs`）：提交时记下 `(码, 词, 剩余退格数, 2 秒期限)`，
+  非拼写态按退格就递减，删光时发 `ipc::unlearn()`，然后**把退格放行**（`Ok(BOOL(0))`），
+  所以用户看到的行为和平时打通格一样。
+- 引擎侧 `unlearn()`（协议 v4 `type=3`）：计数 >1 就减 1，否则删条目。
+- 不用 `ITfTextEditSink` 的理由：要新增编辑观察者 + 跟踪 range，出错就是挂死（见 1.0.1 选词死锁）。
+- 单字不学（`USER_MIN_CHARS = 2`）：单字由语言模型排序，学一遍只会跟模型打架。
+
+清理旧噪音：
+
+```powershell
+rime-server.exe --review-dict          # 按次数升序列出全部条目，单字带 <- single char
+rime-server.exe --prune-single         # 删掉所有单字条目
+rime-server.exe --forget wojude 我局的  # 删某一条（先停引擎，否则内存里的旧表会写回来）
+```
 ### 版本号与构建 / 部署 / 打包
 
 **版本格式 `X.V.Z`**（`VERSION` 是唯一真相源）：X = 里程碑（0=M0，1=M1，2=M2，3=M3），
@@ -304,6 +324,9 @@ DLL 被加载后无法卸载：脚本每次用**新文件名 + 改注册表**，
 ### 踩过的坑（本阶段新增）
 
 - `git commit -m` 带中文多行会被 PowerShell 拆坏（`error: unknown switch /`）→ 用 `git commit -F msg.txt`，文件 UTF-8 无 BOM。
+- **`argv` 是 ANSI 编码**（中文系统上是 GBK），命令行传中文（`--forget <码> <词>`）会匹配不上
+  UTF-8 存的词 → 用 `argv_to_utf8()` 转换（`MultiByteToWideChar(CP_ACP)` + `WideCharToMultiByte(CP_UTF8)`）。
+- **误选撤回靠数退格，不靠 `ITfTextEditSink`**：后者要新增编辑观察者 + 跟踪 range，出错就是挂死。
 - `.ps1` 必须 UTF-8 **带 BOM**；`.cmd` 必须**纯 ASCII + CRLF**（cmd.exe 按 OEM 代码页读，`goto` 在 LF-only 文件里会失效）。
 - `net session` 判管理员不可靠（Server 服务被禁就恒失败）→ 用 `fltmc`。
 - 拼写中按 `-` 的语义取决于是否展开：展开=翻页，收起=分词符。判定前必须先把 `expanded` 的 MutexGuard 放到块里释放，否则再 lock 会死锁。

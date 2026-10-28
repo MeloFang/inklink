@@ -347,6 +347,36 @@ pub fn select(index: usize, code: &str, word: &str) {
     }
 }
 
+/// 撤回一次学习：用户上屏后马上又把词删掉了，说明刚才那下是选错的。
+///
+/// 和 [`select`] 相反——那边加一次计数，这边减一次（减到 0 就删掉条目）。
+/// 只在"上屏后 2 秒内退格删光"时发，所以不会误伤真正想要的词。
+pub fn unlearn(code: &str, word: &str) {
+    if word.is_empty() {
+        return;
+    }
+    // SAFETY: 句柄在本函数内配对关闭；读操作带超时
+    unsafe {
+        let Some(pipe) = open_pipe(SELECT_TIMEOUT_MS) else {
+            return;
+        };
+        // 协议 v4：类型 3 = 撤回学习
+        //   [u8 type][u32 code_len][code][u16 word_len][word]
+        let code_bytes = code.as_bytes();
+        let word_bytes = word.as_bytes();
+        let mut req = Vec::with_capacity(7 + code_bytes.len() + word_bytes.len());
+        req.push(3u8);
+        req.extend_from_slice(&(code_bytes.len() as u32).to_le_bytes());
+        req.extend_from_slice(code_bytes);
+        req.extend_from_slice(&(word_bytes.len() as u16).to_le_bytes());
+        req.extend_from_slice(word_bytes);
+        write_all(pipe, &req);
+        let mut len_buf = [0u8; 4];
+        let _ = read_exact_timeout(pipe, &mut len_buf, SELECT_TIMEOUT_MS);
+        let _ = CloseHandle(pipe);
+    }
+}
+
 /// 把文本送进当前获得焦点的应用（在光标处插入）。
 /// 保留作回退：T4 之后主路径是 ITfRange::SetText，若某些应用不配合可回退到 SendInput。
 #[allow(dead_code)]

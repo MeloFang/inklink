@@ -101,6 +101,12 @@ static std::mutex g_user_mutex;
 static const int USER_COUNT_CAP = 999;
 /// 最多记多少个"拼音串"（每个串下词数不限）。超了就丢最弱的。
 static const size_t USER_MAX_CODES = 4000;
+/// 少于这么多字的词不学。
+///
+/// 单字本来就该由语言模型的整体概率排序，学一份"用户在这个码上选过这个字"
+/// 反而会跟模型打架：实测跑两天就攒出 `de -> 的`、`zai -> 在`、`ge -> 个`
+/// 这类十几条纯噪音，`zai` 那条还会把「在」顶到「再」前面。
+static const size_t USER_MIN_CHARS = 2;
 
 /// UTF-8 字符数（汉字算 1 个）。候选词长度要用它判断"选了几个字"。
 static size_t utf8_char_count(const std::string& s) {
@@ -478,12 +484,24 @@ static std::string learn_key(const std::string& raw_code, const std::string& wor
     return code.substr(0, used);
 }
 
+/// 这次选择值不值得学？
+///
+/// 三道筛子（纯逻辑，可以单独测）：
+///   1. 纯英文上屏（码本身就是词，比如打 github 直接上屏）不学——那是打英文
+///   2. 单字不学——单字由语言模型排序，学了反而跟模型打架（见 USER_MIN_CHARS）
+///   3. 空词不学
+static bool should_learn(const std::string& raw_code, const std::string& word) {
+    if (word.empty()) return false;
+    if (word == strip_separators(raw_code)) return false;
+    if (utf8_char_count(word) < USER_MIN_CHARS) return false;
+    return true;
+}
+
 /// 记一次"用户在这个拼音下选了这个词"。
 static void learn(const std::string& raw_code, const std::string& word) {
+    if (!should_learn(raw_code, word)) return;
     std::string key = learn_key(raw_code, word);
-    if (key.empty() || word.empty()) return;
-    // 纯英文上屏（码本身就是词）不学：那是"打英文"，不是选中文候选。
-    if (word == strip_separators(raw_code)) return;
+    if (key.empty()) return;
     std::lock_guard<std::mutex> lock(g_user_mutex);
     int& c = g_user[key][word];
     if (c < USER_COUNT_CAP) c++;
@@ -491,6 +509,138 @@ static void learn(const std::string& raw_code, const std::string& word) {
     prune_user();
     logf("learn key=%s word=%s count=%d", key.c_str(), word.c_str(), c);
     save_user();
+}
+
+/// 撤销一次学习：用户上屏后马上删掉了，说明刚才那个候选是选错的。
+///
+/// 计数减 1，减到 0 就把词删掉；这个码下没有词了就把码也删掉。
+/// 只在"上屏后立刻删"时调用（DLL 侧计时 2 秒），所以不会误伤真正想要的词。
+static void unlearn(const std::string& raw_code, const std::string& word) {
+    std::string key = learn_key(raw_code, word);
+    if (key.empty() || word.empty()) return;
+    std::lock_guard<std::mutex> lock(g_user_mutex);
+    auto it = g_user.find(key);
+    if (it == g_user.end()) {
+        logf("unlearn key=%s word=%s (no such code)", key.c_str(), word.c_str());
+        return;
+    }
+    auto wit = it->second.find(word);
+    if (wit == it->second.end()) {
+        logf("unlearn key=%s word=%s (no such word)", key.c_str(), word.c_str());
+        return;
+    }
+    if (wit->second > 1) {
+        wit->second--;
+        logf("unlearn key=%s word=%s count=%d", key.c_str(), word.c_str(), wit->second);
+    } else {
+        it->second.erase(wit);
+        logf("unlearn key=%s word=%s (removed)", key.c_str(), word.c_str());
+        if (it->second.empty()) g_user.erase(it);
+    }
+    g_user_dirty = true;
+    save_user();
+}
+
+/// Windows 的 `argv` 是按 ANSI 代码页解码的（中文系统上是 GBK），而内部一律用 UTF-8。
+/// 命令行里带中文（`--forget <码> <词>` 的第二个参数）时必须转一道，否则永远匹配不上。
+static std::string argv_to_utf8(const char* a) {
+    if (!a || !*a) return std::string();
+    int n = MultiByteToWideChar(CP_ACP, 0, a, -1, nullptr, 0);
+    if (n <= 1) return std::string(a);
+    std::wstring w((size_t)n - 1, L'\0');
+    MultiByteToWideChar(CP_ACP, 0, a, -1, &w[0], n);
+    int m = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), nullptr, 0, nullptr, nullptr);
+    if (m <= 0) return std::string(a);
+    std::string out((size_t)m, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), &out[0], m, nullptr, nullptr);
+    return out;
+}
+
+/// 词库巡检 / 清理命令（纯命令行，不需要 librime、不用连管道）。
+///
+///   --review-dict       列出全部条目，按"选中次数"升序（最没把握的在最上面）
+///   --prune-single      删掉所有单字条目（旧版本学的噪音，新版本已经不学了）
+///   --forget <码> [词]  删掉某个码下的条目（不给词就删整个码）
+///
+/// 为什么不自动判断"哪条是选错的"：离线能看到的只有计数，猜不准——
+/// 删错比留错更让人火大。真正可靠的信号是"上屏后立刻删掉"，
+/// 那个由 DLL 在线采集（协议 type=3，命中就发一次撤回），不靠离线猜测。
+static int dict_command(const std::string& mode, const std::string& code, const std::string& word) {
+    // 终端默认代码页是 GBK，直接 printf UTF-8 的中文会乱码；先切到 UTF-8。
+    SetConsoleOutputCP(65001);
+    std::lock_guard<std::mutex> lock(g_user_mutex);
+
+    if (mode == "review") {
+        struct Row {
+            std::string code;
+            std::string word;
+            int count;
+        };
+        std::vector<Row> rows;
+        for (const auto& kv : g_user)
+            for (const auto& t : kv.second) rows.push_back({kv.first, t.first, t.second});
+        std::stable_sort(rows.begin(), rows.end(),
+                         [](const Row& a, const Row& b) { return a.count < b.count; });
+        printf("user dict : %s\n", g_user_path.c_str());
+        printf("entries   : %zu\n\n", rows.size());
+        for (const auto& r : rows) {
+            const char* tag = utf8_char_count(r.word) < USER_MIN_CHARS ? "  <- single char" : "";
+            printf("  %-12s -> %s  x%d%s\n", r.code.c_str(), r.word.c_str(), r.count, tag);
+        }
+        printf("\ndelete one : --forget <code> [word]\n");
+        printf("drop chars : --prune-single\n");
+        return 0;
+    }
+
+    if (mode == "prune-single") {
+        size_t removed = 0;
+        for (auto it = g_user.begin(); it != g_user.end();) {
+            for (auto wit = it->second.begin(); wit != it->second.end();) {
+                if (utf8_char_count(wit->first) < USER_MIN_CHARS) {
+                    wit = it->second.erase(wit);
+                    removed++;
+                } else {
+                    ++wit;
+                }
+            }
+            if (it->second.empty()) it = g_user.erase(it);
+            else ++it;
+        }
+        if (removed > 0) {
+            g_user_dirty = true;
+            save_user();
+        }
+        printf("removed %zu single-char entries\n", removed);
+        return 0;
+    }
+
+    if (mode == "forget") {
+        if (code.empty()) {
+            printf("usage: --forget <code> [word]\n");
+            return 1;
+        }
+        auto it = g_user.find(code);
+        if (it == g_user.end()) {
+            printf("no such code: %s\n", code.c_str());
+            return 1;
+        }
+        size_t removed = 0;
+        if (word.empty()) {
+            removed = it->second.size();
+            g_user.erase(it);
+        } else {
+            removed = it->second.erase(word);
+            if (it->second.empty()) g_user.erase(code);
+        }
+        if (removed > 0) {
+            g_user_dirty = true;
+            save_user();
+        }
+        printf("removed %zu entries under %s\n", removed, code.c_str());
+        return removed > 0 ? 0 : 1;
+    }
+
+    return 1;
 }
 
 // ───────────────────────── 路径 ─────────────────────────
@@ -728,6 +878,29 @@ static void serve_client(HANDLE p) {
         return;
     }
 
+    if (type == 3) {
+        // 撤回学习（协议 v4）：[u32 code_len][code][u16 word_len][word]
+        // DLL 发现"上屏后立刻被删掉"就发这个，把刚才那次学习扣回去。
+        uint32_t clen = 0;
+        if (!read_exact(p, &clen, 4)) return;
+        if (clen > 4096) {
+            write_response(p, {});
+            return;
+        }
+        std::string code(clen, '\0');
+        if (clen > 0 && !read_exact(p, &code[0], clen)) return;
+        uint16_t wlen = 0;
+        if (!read_exact(p, &wlen, 2)) {
+            write_response(p, {});
+            return;
+        }
+        std::string word(wlen, '\0');
+        if (wlen > 0 && !read_exact(p, &word[0], wlen)) return;
+        unlearn(code, word);
+        write_response(p, {});
+        return;
+    }
+
     if (type != 1) return;
 
     uint32_t len = 0;
@@ -791,6 +964,12 @@ static int run_selftest() {
     ck(learn_key("zhemge", "这个") == "zhemge", "learn_key: mistyped code kept as-is");
     ck(learn_key("x", "西") == "x", "learn_key: single letter");
 
+    ck(!should_learn("de", "的"), "should_learn: single char is not learned");
+    ck(!should_learn("github", "github"), "should_learn: english commit is not learned");
+    ck(should_learn("xiangmu", "项目"), "should_learn: normal word is learned");
+    ck(should_learn("pikeqiu", "皮克"), "should_learn: two chars is enough");
+    ck(!should_learn("xiangmu", ""), "should_learn: empty word is not learned");
+
     if (fails == 0) {
         printf("\nall %d checks passed\n", total);
     } else {
@@ -813,6 +992,20 @@ int main(int argc, char** argv) {
     // 用户词库（个人词库）：启动就加载，第一次查询就能用上历史选择
     g_user_path = user_dict_path();
     load_user();
+
+    // 词库巡检命令（不需要 librime、不连管道，可以在引擎运行时跑）
+    for (int i = 1; i < argc; i++) {
+        std::string arg = argv[i];
+        if (arg == "--review-dict") return dict_command("review", "", "");
+        if (arg == "--prune-single") return dict_command("prune-single", "", "");
+        if (arg == "--forget") {
+            // argv 里带中文时是 ANSI（中文系统上是 GBK）编码，内部一律 UTF-8，
+            // 不转的话 `--forget wojude 我局的` 永远匹配不上。
+            std::string code = (i + 1 < argc) ? argv[i + 1] : "";
+            std::string word = (i + 2 < argc) ? argv_to_utf8(argv[i + 2]) : "";
+            return dict_command("forget", code, word);
+        }
+    }
 
 
     // 单例：和 Rust 版引擎同名互斥量，避免两个引擎抢同一个管道

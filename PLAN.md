@@ -406,12 +406,41 @@ DLL 侧所有管道读也改成带超时的 `read_exact_timeout()`（`QUERY_TIME
 - 计数上限 999；串数上限 `USER_MAX_CODES = 4000`，超了先丢"最高次数≤1"的（用过一次就再没选过的）。
 - `std::mutex g_user_mutex`：每连接一线程，学习与查询并发。
 - 存储位置**不能**在 `C:\inklink-engine\`（普通用户无写权限），也不混进 rime 的 `user_dir`。
-- `rime-server.exe --selftest`：15 项纯 ASCII 断言（`utf8_char_count` / `strip_separators` /
-  `split_lengths` / `learn_key`），不初始化 librime、不碰管道。
+- `rime-server.exe --selftest`：20 项纯 ASCII 断言（`utf8_char_count` / `strip_separators` /
+  `split_lengths` / `learn_key` / `should_learn`），不初始化 librime、不碰管道。
 
 **还没做的**：整句上屏不学（只学单词候选）、"选错了想撤销"没有入口（只能手改 tsv）、
 跨设备/跨应用权重没有区分。
 
+#### 误选撤回 + 词库巡检（2026-10-27 补，M1 续）
+
+**要解决的问题**：词库只加不减。实测 70 条里混进了 `wojude -> 我局的`、`jnude -> 峻德`、
+`zuiximian -> 最西面` 这种明显选错的，它们会一直污染排序；另有 15 条单字条目
+（`de -> 的`、`zai -> 在`…）纯噪音 —— 单字本来就该由语言模型排，学一遍只会跟模型打架。
+
+**判据：上屏后马上删掉 = 选错了。** 这是最可靠的行为信号，不需要 AI、不需要语言模型。
+
+| 层 | 做法 | 为什么这样做 |
+|:---|:---|:---|
+| DLL 侧 | 提交后记一个 `CommitMark`（码、词、剩余退格数、2 秒期限）。非拼写态按退格时递减，删光就发撤回，然后把退格**放行**给应用 | 不用 `ITfTextEditSink`：那要新增编辑观察者 + 跟踪 range，出错就是挂死（参见 1.0.1 的选词死锁）。数退格不需要新接口，退格本来就由我们处理 |
+| 引擎侧 | `unlearn()`：计数 >1 就减 1，否则删条目；`should_learn()` 三道筛子（空词 / 打英文 / 单字）挡在 `learn()` 前面 | 减而不是直接删：同一个词选过 3 次不会因为一次手滑清零 |
+| 命令行 | `--review-dict` 按次数升序列出全部条目（单字打标）/ `--prune-single` 删单字 / `--forget <码> [词]` 删单条 | 旧版本已经学进去的噪音，得有个不用手改 tsv 的清理入口 |
+
+**协议 v4**（在 v3 后面追加，不影响 v3 报文）：
+
+```
+type=3 撤回学习： [u8 3][u32 code_len][code utf8][u16 word_len][word utf8]
+```
+
+**为什么「减 1」而不是「加一次负分」**：条目本身就是 `码 -> 词 -> 次数`，次数是唯一排序依据；
+用负数会让 `apply_user_boost` 的比较变复杂，而且负数没有语义。
+
+**为什么撤回不出现在候选里**：撤回只改学习记录，不改当前文档 —— 用户已经按了退格，
+文字本来就被删掉了。输入法再「帮」他插回去是灾难。
+
+**坑**：`argv` 是 ANSI 编码（中文系统上是 GBK），`--forget wojude 我局的` 里的中文
+永远匹配不上 UTF-8 存的词 → 加了 `argv_to_utf8()`（`MultiByteToWideChar(CP_ACP)` +
+`WideCharToMultiByte(CP_UTF8)`）。
 ### T5b 拼音音节分隔显示
 
 librime 的 preedit 自带 `jian zou pian feng`，但候选窗顶部仍显示原始 `jianzoupianfeng`。
@@ -524,7 +553,7 @@ Obsidian 语料 + AI 兜底，默认关闭联网（符合项目铁律）。
 | T5c | 候选窗美化 | |
 | T5e | 个人云词库 | Obsidian 语料 + AI 兜底 |
 | T5f | librime 工程化 | 现在靠手工解 Weasel 包 |
-| M1 续 | 长句学习 / 撤销 | 整句上屏不学；选错了想改回来只能手改 tsv |
+| M1 续 | 长句学习 | 整句上屏不学（只学选中的那个词）；撤销已做（删掉刚上屏的词即撤回）|
 
 （T5a 用户词库学习已 ✅ 2026-10-27 实现，见上面同名小节；T5g 模糊音见「✅ 2026-10-27 已解决」）
 
@@ -554,7 +583,7 @@ Obsidian 语料 + AI 兜底，默认关闭联网（符合项目铁律）。
 **测试能力现状**：
 
 - 有：`cargo test` 27 个单测（按键认领、标点映射与引号交替、半角符号不转换、拼音切分、分段上屏消耗字母数）
-- 有：`rime-server.exe --selftest` 15 项引擎侧断言（`utf8_char_count` / `strip_separators` /
+- 有：`rime-server.exe --selftest` 20 项引擎侧断言（`utf8_char_count` / `strip_separators` /
   `split_lengths` / `learn_key`），纯 ASCII，不初始化 librime
 - 有：`tsf/test/test-harness.cc` GUI 自动化测试台（需要交互式桌面，agent 抢不到焦点）
 - 有：`tools/engine-pipe.ps1`（`Invoke-InklinkQuery`）直连引擎管道，纠错/模糊音/学习都靠它回归

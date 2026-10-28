@@ -128,6 +128,8 @@ struct TextServiceInner {
     english_mode: AtomicBool,
     /// 本次按下 Shift 期间是否打过字（用于区分"单击"和"按住"）
     shift_used: AtomicBool,
+    /// 刚上屏的词（用于识别"选错了、马上删掉"）
+    commit_mark: Mutex<Option<CommitMark>>,
 }
 
 #[implement(ITfTextInputProcessorEx, ITfKeyEventSink, ITfEditSession, ITfCompositionSink)]
@@ -157,8 +159,110 @@ impl TextService {
                 last_pos: Mutex::new(None),
                 english_mode: AtomicBool::new(false),
                 shift_used: AtomicBool::new(false),
+                commit_mark: Mutex::new(None),
             },
         }
+    }
+
+    /// 记下"刚上屏了 `word`（拼音是 `code`）"，好判断用户是不是马上把它删了。
+    fn mark_commit(&self, code: &str, word: &str) {
+        let mut g = self
+            .inner
+            .commit_mark
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        *g = CommitMark::new(code.to_string(), word.to_string());
+    }
+
+    /// 忘掉刚才那个上屏记录（用户又打别的字了）。
+    fn clear_commit_mark(&self) {
+        let mut g = self
+            .inner
+            .commit_mark
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        *g = None;
+    }
+
+    /// 有没有"刚上屏、还可能被撤回"的词。
+    fn undo_pending(&self) -> bool {
+        let g = self
+            .inner
+            .commit_mark
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        g.as_ref().map(|m| !m.expired()).unwrap_or(false)
+    }
+
+    /// 记一次退格。返回 `Some((code, word))` 表示刚上屏的词已被删光，
+    /// 该把那次学习撤回。
+    fn count_backspace(&self) -> Option<(String, String)> {
+        let mut g = self
+            .inner
+            .commit_mark
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let mut done = None;
+        let mut expired = false;
+        if let Some(mark) = g.as_mut() {
+            if mark.expired() {
+                expired = true;
+            } else {
+                done = mark.on_backspace();
+            }
+        }
+        if done.is_some() || expired {
+            *g = None;
+        }
+        done
+    }
+}
+
+/// 刚上屏的一个词，等着看用户是不是马上又把它删掉。
+///
+/// 为什么用"数退格次数"而不是 `ITfTextEditSink`：后者要注册新的编辑观察者、
+/// 还要跟踪 range，出错就是挂死（见 1.0.1 的选词死锁）；数退格不需要任何
+/// 新接口，而且退格事件本来就由我们处理。
+///
+/// 判据：上屏后 2 秒内连按 `word.chars().count()` 次退格 —— 中文里一个汉字
+/// 一次退格，正好等于把刚上屏的词删光。
+struct CommitMark {
+    code: String,
+    word: String,
+    remaining: usize,
+    deadline: std::time::Instant,
+}
+
+impl CommitMark {
+    /// 多久之内删掉才算"选错了"。太短来不及反悔，太长容易把正常编辑算进来。
+    const WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
+
+    fn new(code: String, word: String) -> Option<Self> {
+        let remaining = word.chars().count();
+        if remaining == 0 {
+            return None;
+        }
+        Some(Self {
+            code,
+            word,
+            remaining,
+            deadline: std::time::Instant::now() + Self::WINDOW,
+        })
+    }
+
+    /// 记一次退格。删光了返回 `(code, word)`，该撤回学习。
+    fn on_backspace(&mut self) -> Option<(String, String)> {
+        self.remaining = self.remaining.saturating_sub(1);
+        self.deadline = std::time::Instant::now() + Self::WINDOW;
+        if self.remaining == 0 {
+            Some((self.code.clone(), self.word.clone()))
+        } else {
+            None
+        }
+    }
+
+    fn expired(&self) -> bool {
+        std::time::Instant::now() > self.deadline
     }
 }
 
@@ -648,9 +752,13 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
         _lparam: LPARAM,
     ) -> windows::core::Result<BOOL> {
         let vk = wparam.0 as u32;
+        const VK_BACK: u32 = 0x08;
         let composing = !self.inner.buffer.lock().unwrap_or_else(|p| p.into_inner()).is_empty();
+        // 刚上屏、可能被撤回的词，要先把退格抢过来数一下
+        let undo = !composing && self.undo_pending();
         let claim = self.can_compose(pic.as_ref())
-            && should_claim(vk, composing, shift_held(), caps_on(), self.inner.english_mode.load(Ordering::SeqCst));
+            && (should_claim(vk, composing, shift_held(), caps_on(), self.inner.english_mode.load(Ordering::SeqCst))
+                || (undo && vk == VK_BACK));
         log_line(&format!("test vk={vk} claim={claim} composing={composing}"));
         Ok(BOOL(if claim { 1 } else { 0 }))
     }
@@ -695,6 +803,23 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
 
         if !composable {
             return Ok(BOOL(0));
+        }
+
+        // ── 误选撤回 ──
+        // 上屏后 2 秒内按退格把刚上屏的那几个字删光，说明那一下选错了：
+        // 把刚才记的学习减掉。无论撤回与否，退格都照常放行给应用
+        // （返回 FALSE），所以用户看到的行为和平时一样。
+        if vk == VK_BACK {
+            let composing = !self.inner.buffer.lock().unwrap_or_else(|p| p.into_inner()).is_empty();
+            if !composing {
+                if let Some((code, word)) = self.count_backspace() {
+                    log_line(&format!("unlearn code={code} word={word}"));
+                    ipc::unlearn(&code, &word);
+                }
+                return Ok(BOOL(0));
+            }
+        } else {
+            self.clear_commit_mark();
         }
 
         // Ctrl/Alt/Win 组合键：整体放行给应用（Ctrl+A/C/V/X/Z 等快捷键）。
@@ -1089,6 +1214,7 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
             VK_SPACE => {
                 let pick_idx = *page * page_size(*expanded) + *sel;
                 let pos = *self.inner.last_pos.lock().unwrap_or_else(|p| p.into_inner());
+                let code_before = buffer.clone();
                 match apply_pick(
                     pick_idx,
                     &mut cands,
@@ -1102,6 +1228,9 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                 ) {
                     Some(action) => {
                         log_line(&format!("pick {pick_idx} buffer={buffer}"));
+                        if let EditAction::Commit(word) = &action {
+                            self.mark_commit(&code_before, word);
+                        }
                         self.request_edit(action);
                         Ok(BOOL(1))
                     }
@@ -1167,6 +1296,7 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                         *sel = local;
                         let global = *page * page_size(*expanded) + local;
                         let pos = *self.inner.last_pos.lock().unwrap_or_else(|p| p.into_inner());
+                        let code_before = buffer.clone();
                         if let Some(action) = apply_pick(
                             global,
                             &mut cands,
@@ -1179,6 +1309,9 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                             pos,
                         ) {
                             log_line(&format!("pick(number {idx}) buffer={buffer}"));
+                            if let EditAction::Commit(word) = &action {
+                                self.mark_commit(&code_before, word);
+                            }
                             self.request_edit(action);
                             return Ok(BOOL(1));
                         }
@@ -2043,6 +2176,35 @@ mod tests {
     fn 空闲时普通字母要认领() {
         assert!(should_claim(VK_A_KEY, false, false, false, false));
         assert!(should_claim(VK_N_KEY, false, false, false, false));
+    }
+
+    #[test]
+    fn 上屏后连按退格删光才算误选() {
+        let mut mark =
+            CommitMark::new("xiangmu".to_string(), "项目".to_string()).expect("两个字应该被跟踪");
+        assert!(mark.on_backspace().is_none(), "只删一个字还不够，可能是在改后面的内容");
+        assert_eq!(
+            mark.on_backspace(),
+            Some(("xiangmu".to_string(), "项目".to_string())),
+            "删光两个字才是选错了"
+        );
+    }
+
+    #[test]
+    fn 空词和单个标点不做误选判断() {
+        assert!(CommitMark::new("x".to_string(), String::new()).is_none(), "空词不该跟踪");
+        let mut one = CommitMark::new("de".to_string(), "的".to_string()).expect("一个字也能跟踪");
+        assert_eq!(
+            one.on_backspace(),
+            Some(("de".to_string(), "的".to_string())),
+            "一个字删一次就删光了"
+        );
+    }
+
+    #[test]
+    fn 刚上屏的词在时间窗内有效() {
+        let mark = CommitMark::new("nihao".to_string(), "你好".to_string()).expect("应有标记");
+        assert!(!mark.expired(), "刚创建不该过期");
     }
 
     #[test]
