@@ -130,6 +130,8 @@ struct TextServiceInner {
     shift_used: AtomicBool,
     /// 刚上屏的词（用于识别"选错了、马上删掉"）
     commit_mark: Mutex<Option<CommitMark>>,
+    /// 正在逐词选择的这一句（用于整句学习）
+    sentence: Mutex<Option<SentenceAcc>>,
 }
 
 #[implement(ITfTextInputProcessorEx, ITfKeyEventSink, ITfEditSession, ITfCompositionSink)]
@@ -160,6 +162,7 @@ impl TextService {
                 english_mode: AtomicBool::new(false),
                 shift_used: AtomicBool::new(false),
                 commit_mark: Mutex::new(None),
+                sentence: Mutex::new(None),
             },
         }
     }
@@ -216,6 +219,60 @@ impl TextService {
         }
         done
     }
+
+
+    /// 记一次候选选择，供整句学习用。
+    ///
+    /// 返回 `Some((整句拼音, 整句文字))` 表示这一串拼音打完了 —— 该把整句
+    /// 也报给引擎学习：**同一个词你反复用整句打出来**，下次打同样的全拼时
+    /// 整句候选才该往上排。逐词的选择已经在 `apply_pick` 里报过了，两边
+    /// 记的是不同的码（词码 vs 整串全拼），不会互相覆盖。
+    ///
+    /// 只选一次的不用报：那一次本身就已经按整串记下了（`picks >= 2` 是门槛）。
+    fn note_pick_for_sentence(&self, code_before: &str, action: &EditAction) -> Option<(String, String)> {
+        let (word, finished) = match action {
+            EditAction::Commit(w) => (w.clone(), true),
+            EditAction::PickCompose(w, _) => (w.clone(), false),
+            _ => return None,
+        };
+        let mut g = self
+            .inner
+            .sentence
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        match g.as_mut() {
+            Some(acc) => {
+                acc.text.push_str(&word);
+                acc.picks += 1;
+            }
+            None => {
+                *g = Some(SentenceAcc {
+                    code: code_before.to_string(),
+                    text: word,
+                    picks: 1,
+                });
+            }
+        }
+        if !finished {
+            return None;
+        }
+        let acc = g.take()?;
+        if should_report_sentence(acc.picks, acc.text.chars().count()) {
+            Some((acc.code, acc.text))
+        } else {
+            None
+        }
+    }
+
+    /// 丢掉没打完的整句记录（Esc、退格删空、换成打英文、点了别处）。
+    fn sentence_clear(&self) {
+        let mut g = self
+            .inner
+            .sentence
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        *g = None;
+    }
 }
 
 /// 刚上屏的一个词，等着看用户是不是马上又把它删掉。
@@ -264,6 +321,29 @@ impl CommitMark {
     fn expired(&self) -> bool {
         std::time::Instant::now() > self.deadline
     }
+}
+
+/// 正在逐词选择的这一句。
+///
+/// 打 `jintiantianqi` 选「今天」再选「天气」，逐词学习记的是 `jintian→今天`
+/// 和 `tianqi→天气`；但整句 `jintiantianqi→今天天气` 才是用户真正想要的东西，
+/// 只记词的话下次打全拼，整句候选不会往上排。
+struct SentenceAcc {
+    /// 这一句开始时输入的完整拼音（还没被分段啃掉过）
+    code: String,
+    /// 已经选出来的字
+    text: String,
+    /// 选了几次
+    picks: usize,
+}
+
+/// 整句短于这个字数就不算"整句"（`今天天气` = 4）。
+const SENTENCE_MIN_CHARS: usize = 4;
+
+/// 要不要把这一句当成整句上报：至少选过两次（选一次的那次本身已经记过了），
+/// 且至少 `SENTENCE_MIN_CHARS` 个字。
+fn should_report_sentence(picks: usize, chars: usize) -> bool {
+    picks >= 2 && chars >= SENTENCE_MIN_CHARS
 }
 
 impl ITfTextInputProcessor_Impl for TextService_Impl {
@@ -355,6 +435,19 @@ impl TextService_Impl {
         }
         *self.inner.keystroke_mgr.lock().unwrap() = None;
         *self.inner.thread_mgr.lock().unwrap() = None;
+    }
+
+    /// 选完一个候选后的统一收尾：记"可能被撤回"的标记、记整句学习、提交编辑动作。
+    fn finish_pick(&self, code_before: &str, action: EditAction) -> BOOL {
+        if let EditAction::Commit(word) = &action {
+            self.mark_commit(code_before, word);
+        }
+        if let Some((code, text)) = self.note_pick_for_sentence(code_before, &action) {
+            log_line(&format!("learn-sentence code={code} text={text}"));
+            ipc::select(0, &code, &text);
+        }
+        self.request_edit(action);
+        BOOL(1)
     }
 
     /// 把一个动作交给编辑会话执行（异步，安全，不阻塞按键线程）。
@@ -710,6 +803,7 @@ impl ITfCompositionSink_Impl for TextService_Impl {
             *self.inner.page.lock().unwrap_or_else(|p| p.into_inner()) = 0;
             *self.inner.expanded.lock().unwrap_or_else(|p| p.into_inner()) = false;
             candwin::hide();
+            self.sentence_clear();
         }
         *self
             .inner
@@ -741,6 +835,7 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
             *self.inner.page.lock().unwrap_or_else(|p| p.into_inner()) = 0;
             *self.inner.expanded.lock().unwrap_or_else(|p| p.into_inner()) = false;
             candwin::hide();
+            self.sentence_clear();
         }
         Ok(())
     }
@@ -991,6 +1086,10 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                     return Ok(BOOL(0));
                 }
                 let at = (*cursor).min(buffer.len());
+                if !composing_now {
+                    // 新起一句：上一条没打完的整句记录作废
+                    self.sentence_clear();
+                }
                 buffer.insert(at, (vk as u8 as char).to_ascii_lowercase());
                 *cursor = at + 1;
                 (*cands, *matched_len) = query_with_fallback(&buffer);
@@ -1025,6 +1124,7 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                     *sel = 0;
                     if buffer.is_empty() {
                         candwin::hide();
+                        self.sentence_clear();
                         self.request_edit(EditAction::Cancel);
                     } else {
                         show_cand_window(&buffer, &cands, *page, *expanded, *sel, *self.inner.last_pos.lock().unwrap_or_else(|p| p.into_inner()));
@@ -1046,6 +1146,7 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                     *sel = 0;
                     if buffer.is_empty() {
                         candwin::hide();
+                        self.sentence_clear();
                         self.request_edit(EditAction::Cancel);
                     } else {
                         show_cand_window(&buffer, &cands, *page, *expanded, *sel, *self.inner.last_pos.lock().unwrap_or_else(|p| p.into_inner()));
@@ -1228,11 +1329,7 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                 ) {
                     Some(action) => {
                         log_line(&format!("pick {pick_idx} buffer={buffer}"));
-                        if let EditAction::Commit(word) = &action {
-                            self.mark_commit(&code_before, word);
-                        }
-                        self.request_edit(action);
-                        Ok(BOOL(1))
+                        Ok(self.finish_pick(&code_before, action))
                     }
                     None => Ok(BOOL(0)),
                 }
@@ -1246,6 +1343,7 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                     *matched_len = 0;
                     *cursor = 0;
                     candwin::hide();
+                    self.sentence_clear();
                     log_line(&format!("commit-raw {raw}"));
                     self.request_edit(EditAction::Commit(raw));
                     Ok(BOOL(1))
@@ -1269,6 +1367,7 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                     *page = 0;
                     *expanded = false;
                     candwin::hide();
+                    self.sentence_clear();
                     log_line(&format!("commit-raw(caps) {raw}"));
                     self.request_edit(EditAction::Commit(raw));
                     Ok(BOOL(1))
@@ -1309,11 +1408,7 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                             pos,
                         ) {
                             log_line(&format!("pick(number {idx}) buffer={buffer}"));
-                            if let EditAction::Commit(word) = &action {
-                                self.mark_commit(&code_before, word);
-                            }
-                            self.request_edit(action);
-                            return Ok(BOOL(1));
+                            return Ok(self.finish_pick(&code_before, action));
                         }
                     }
                 }
@@ -1327,6 +1422,7 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                 *matched_len = 0;
                 *cursor = 0;
                 candwin::hide();
+                self.sentence_clear();
                 if had {
                     self.request_edit(EditAction::Cancel);
                 }
@@ -1392,6 +1488,7 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                     *self.inner.expanded.lock().unwrap_or_else(|p| p.into_inner()) = false;
                     candwin::hide();
                     self.inner.english_mode.store(true, Ordering::SeqCst);
+                    self.sentence_clear();
                     log_line(&format!("commit-raw(shift-up) {raw}"));
                     self.request_edit(EditAction::Commit(raw));
                 } else {
@@ -2205,6 +2302,18 @@ mod tests {
     fn 刚上屏的词在时间窗内有效() {
         let mark = CommitMark::new("nihao".to_string(), "你好".to_string()).expect("应有标记");
         assert!(!mark.expired(), "刚创建不该过期");
+    }
+
+    #[test]
+    fn 整句要选过两次才算() {
+        // 一次选完整句（rime 给的整句候选）时，那一次本身已经按整串记下了
+        assert!(!should_report_sentence(1, 7), "只选一次不报整句");
+        // 分段上屏：今天 + 天气
+        assert!(should_report_sentence(2, 4), "选两次、四个字，就是整句");
+        // 选两次但太短（今天 = 2 字）不算整句
+        assert!(!should_report_sentence(2, 2), "两个字不算整句");
+        assert!(!should_report_sentence(3, 3), "三个字仍然太短");
+        assert!(should_report_sentence(3, 5));
     }
 
     #[test]
