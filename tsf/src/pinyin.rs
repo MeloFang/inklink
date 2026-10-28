@@ -92,10 +92,99 @@ pub fn consumed_letters(code: &str, chars: usize) -> usize {
     lens[..chars].iter().sum()
 }
 
+/// 音节边界在**字母下标**上的位置（在第 k 个字母之前插一个 `'`）。
+///
+/// 先把用户自己按的 `-` `_` `'` 归一成分隔符，再对每一段做贪心切分补上音节边界。
+/// `zheg` 这种切不动的尾巴也单独隔开（`zhe'g`），因为用户一眼能看出"g 是多余的"。
+fn boundary_positions(raw: &str) -> Vec<usize> {
+    let mut norm = String::with_capacity(raw.len());
+    let mut last_sep = true; // 开头不允许分隔符
+    for c in raw.chars() {
+        if c.is_ascii_alphabetic() {
+            norm.push(c.to_ascii_lowercase());
+            last_sep = false;
+        } else if matches!(c, '-' | '_' | '\'' | ' ') && !last_sep {
+            norm.push('\'');
+            last_sep = true;
+        }
+    }
+    while norm.ends_with('\'') {
+        norm.pop();
+    }
+
+    let mut bounds = Vec::new();
+    let mut base = 0usize;
+    for seg in norm.split('\'') {
+        if seg.is_empty() {
+            continue;
+        }
+        if base > 0 {
+            bounds.push(base);
+        }
+        let lens = split_lengths(seg);
+        let mut cum = 0usize;
+        for (idx, len) in lens.iter().enumerate() {
+            cum += *len;
+            if idx + 1 < lens.len() {
+                bounds.push(base + cum);
+            }
+        }
+        let consumed: usize = lens.iter().sum();
+        if consumed > 0 && consumed < seg.len() {
+            bounds.push(base + consumed);
+        }
+        base += seg.len();
+    }
+    bounds.sort_unstable();
+    bounds.dedup();
+    bounds
+}
+
+/// 组合串的显示形式：音节之间插 `'`，和搜狗/微信一样。
+///
+/// `raw` 是缓冲里的原始串（字母 + 用户自己按的 `-`/`_`），`cursor` 是它在里面的**字节**下标；
+/// 返回 (显示串, 光标在显示串里的位置)。两者都只含 ASCII，字节下标 = 字符下标 = UTF-16 长度，
+/// 所以结果可以直接喂给 `SetText` / `ShiftEnd`。
+///
+/// 规则：
+/// - 先归一用户给的边界，再对每段贪心切音节补边界（`xiangmu` → `xiang'mu`）
+/// - 切不动的尾巴接在 `'` 后面（`zheg` → `zhe'g`）；整串切不出音节就原样返回（`github`）
+/// - 光标落在音节边界上时停在分隔符**前面**（`xi|'an`）：退格删的是它前面那个字母，
+///   视觉上不该越过 `'`
+pub fn compose_view(raw: &str, cursor: usize) -> (String, usize) {
+    let letters: String = raw
+        .chars()
+        .filter(|c| c.is_ascii_alphabetic())
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    let before = raw
+        .char_indices()
+        .filter(|(i, c)| *i < cursor && c.is_ascii_alphabetic())
+        .count();
+
+    let bounds = boundary_positions(raw);
+    let mut out = String::with_capacity(letters.len() + bounds.len());
+    let mut out_cursor = None;
+    let mut bi = 0usize;
+    for (i, ch) in letters.char_indices() {
+        if i == before {
+            out_cursor = Some(out.len());
+        }
+        while bi < bounds.len() && bounds[bi] == i {
+            if i > 0 {
+                out.push('\'');
+            }
+            bi += 1;
+        }
+        out.push(ch);
+    }
+    let out_cursor = out_cursor.unwrap_or(out.len());
+    (out, out_cursor)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
     fn 切分常见拼音串() {
         assert_eq!(split_lengths("pikeqiu"), vec![2, 2, 3]);
@@ -132,5 +221,39 @@ mod tests {
         assert_eq!(consumed_letters("a", 1), 1);
         assert_eq!(consumed_letters("o", 1), 1);
         assert_eq!(consumed_letters("e", 1), 1);
+    }
+
+    #[test]
+    fn 组合串显示带音节分隔() {
+        // 多音节：贪心切分补分隔符
+        assert_eq!(compose_view("xiangmu", 7).0, "xiang'mu");
+        assert_eq!(compose_view("nihaoma", 7).0, "ni'hao'ma");
+        assert_eq!(compose_view("pikeqiu", 7).0, "pi'ke'qiu");
+        assert_eq!(compose_view("jintiantianqi", 13).0, "jin'tian'tian'qi");
+        // 用户自己给的边界优先（`-` `_` 都归一成 `'`）
+        assert_eq!(compose_view("xi'an", 5).0, "xi'an");
+        assert_eq!(compose_view("xi-an", 5).0, "xi'an");
+        assert_eq!(compose_view("xi_an", 5).0, "xi'an");
+        // 单个音节不加分隔符；切不动的英文原样
+        assert_eq!(compose_view("xian", 4).0, "xian");
+        assert_eq!(compose_view("github", 6).0, "github");
+        // 切不动的尾巴单独隔开，一眼看出哪个字母是多的
+        assert_eq!(compose_view("zheg", 4).0, "zhe'g");
+        // 空串
+        assert_eq!(compose_view("", 0).0, "");
+    }
+
+    #[test]
+    fn 显示光标停在音节边界前() {
+        // 光标在 xiang 之后：落在 `'` 前面（`xiang|'mu`），而不是后面
+        assert_eq!(compose_view("xiangmu", 5), ("xiang'mu".to_string(), 5));
+        // 光标在末尾：跳过分隔符，落在最后一个字母之后
+        assert_eq!(compose_view("xiangmu", 7), ("xiang'mu".to_string(), 8));
+        assert_eq!(compose_view("xiangmu", 0), ("xiang'mu".to_string(), 0));
+        // 原始串里的 `-` 不占显示位置
+        assert_eq!(compose_view("xi-an", 3), ("xi'an".to_string(), 2));
+        // 末尾：显示串是 `xi'an` 五个字符，光标在最后
+        assert_eq!(compose_view("xi-an", 5), ("xi'an".to_string(), 5));
+        assert_eq!(compose_view("xian", 2), ("xian".to_string(), 2));
     }
 }

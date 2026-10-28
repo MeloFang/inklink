@@ -39,7 +39,7 @@ inklink/
 │  ├─ src/lib.rs         按键状态机 + 组合串 + 候选导航
 │  ├─ src/candwin.rs     候选窗（Win32 弹出窗口）
 │  ├─ src/ipc.rs         命名管道客户端 + 引擎自动拉起
-│  ├─ src/pinyin.rs      402 音节表（贪心最长匹配，算分段上屏吃掉多少字母）
+│  ├─ src/pinyin.rs      402 音节表（贪心最长匹配；算分段上屏吃掉多少字母 + 组合串按音节显示的 `'`）
 │  └─ build.rs           把 VERSION 编进 DLL
 ├─ rime-server/          C++ 引擎服务（链 librime，x86）
 │  └─ rime-server.cc     协议 [u8 type] + 查询/选词；个人词库学习层 + --selftest
@@ -101,7 +101,7 @@ powershell -ExecutionPolicy Bypass -File tools\release.ps1
 $env:PATH = "$env:USERPROFILE\.cargo\bin;$env:PATH"
 
 cd C:\dsh\work\inklink\tsf
-cargo test --release                       # 45 个单测（按键认领 / 标点 / 引号 / 拼音切分 / 分词边界 / 分段上屏 / 误选撤回 / 整句上报 / 候选窗摆放与点击 / 注入退格抑制）
+cargo test --release                       # 47 个单测（按键认领 / 标点 / 引号 / 拼音切分 / 音节分隔显示 / 分词边界 / 分段上屏 / 误选撤回 / 整句上报 / 候选窗摆放与点击 / 注入退格抑制）
 cargo build --release --lib --target-dir target-static
 cargo build --release --lib --target i686-pc-windows-msvc --target-dir target-static
 ```

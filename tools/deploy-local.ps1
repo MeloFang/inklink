@@ -95,7 +95,11 @@ if ($staleDlls) {
 # ── 引擎 ───────────────────────────────────────────────────────
 if (-not (Get-Process rime-server -ErrorAction SilentlyContinue)) {
     if (Test-Path (Join-Path $ENG 'rime-server.exe')) {
-        Start-Process (Join-Path $ENG 'rime-server.exe') -WorkingDirectory $ENG -WindowStyle Hidden
+        # 输出重定向到文件：不重定向的话引擎会继承调用者的控制台/管道句柄，
+        # 用 Start-Process -Wait -Redirect* 之类的调用会一直等不到 EOF（踩过好几次）。
+        Start-Process (Join-Path $ENG 'rime-server.exe') -WorkingDirectory $ENG -WindowStyle Hidden `
+            -RedirectStandardOutput (Join-Path $ENG 'rime-server.stdout.log') `
+            -RedirectStandardError (Join-Path $ENG 'rime-server.stderr.log')
         Write-Host '  引擎已启动' -ForegroundColor Green
     } else {
         Write-Host "  警告：找不到 $ENG\rime-server.exe，引擎没起" -ForegroundColor Yellow

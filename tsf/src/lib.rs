@@ -876,14 +876,16 @@ impl ITfEditSession_Impl for TextService_Impl {
                 let Some(start_range) = sel[0].range.as_ref() else {
                     return Ok(());
                 };
-                let rest16: Vec<u16> = rest.encode_utf16().collect();
                 let sink: ITfCompositionSink = self.to_interface();
                 let ctx_comp: ITfContextComposition = ctx.cast()?;
                 // SAFETY: 标准 TSF 调用
                 let c = unsafe { ctx_comp.StartComposition(ec, start_range, &sink)? };
                 let range = unsafe { c.GetRange()? };
+                // 剩下的拼音也要按音节显示分隔符（和主组合串一致）
+                let (rest_view, rest_cursor) = pinyin::compose_view(&rest, rest.len());
+                let rest16: Vec<u16> = rest_view.encode_utf16().collect();
                 unsafe { range.SetText(ec, 0, &rest16)? };
-                self.place_caret(&ctx, ec, &range, rest.len())?;
+                self.place_caret(&ctx, ec, &range, rest_cursor)?;
                 let pos = text_ext_pos(&ctx, ec, &range);
                 *self.inner.last_pos.lock().unwrap_or_else(|p| p.into_inner()) = pos;
                 self.refresh_cand_window();
@@ -1464,7 +1466,7 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                         self.request_edit(EditAction::Cancel);
                     } else {
                         show_cand_window(&buffer, &cands, *page, *expanded, *sel, *self.inner.last_pos.lock().unwrap_or_else(|p| p.into_inner()));
-                        self.request_edit(EditAction::Compose(buffer.clone(), *cursor));
+                        self.request_edit(compose_action(&buffer, *cursor));
                     }
                     Ok(BOOL(1))
                 } else {
@@ -1486,7 +1488,7 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                         self.request_edit(EditAction::Cancel);
                     } else {
                         show_cand_window(&buffer, &cands, *page, *expanded, *sel, *self.inner.last_pos.lock().unwrap_or_else(|p| p.into_inner()));
-                        self.request_edit(EditAction::Compose(buffer.clone(), *cursor));
+                        self.request_edit(compose_action(&buffer, *cursor));
                     }
                     Ok(BOOL(1))
                 } else {
@@ -1967,6 +1969,8 @@ fn show_cand_window(
 ) {
     let size = page_size(expanded);
     let total_pages = (cands.len() + size - 1) / size;
+    // 候选窗上的拼音行和文档里的组合串用同一种显示（带音节分隔符）
+    let (pinyin_view, _) = pinyin::compose_view(pinyin, 0);
     let start = page * size;
     if start >= cands.len() {
         candwin::hide();
@@ -1981,7 +1985,7 @@ fn show_cand_window(
         return;
     };
     // 具体放哪儿（下方还是上方、左右怎么贴边）由 candwin 决定，它知道窗口尺寸
-    candwin::show(pinyin, slice, sel, page + 1, total_pages, caret);
+    candwin::show(&pinyin_view, slice, sel, page + 1, total_pages, caret);
 }
 
 /// 用 TSF 的 `ITfContextView::GetTextExt` 问应用"这段组合串在屏幕的哪个矩形里"。
@@ -2093,6 +2097,16 @@ fn strip_separators(code: &str) -> String {
     code.chars()
         .filter(|c| *c != '-' && *c != '_' && *c != '\'')
         .collect()
+}
+
+/// 组出一个"把拼音写进文档"的编辑动作：文本带音节分隔符，光标换算到显示串里。
+///
+/// 缓冲里存的是用户原样敲的串（`xiangmu` / `xi-an`），文档里显示的是带分隔符的形式
+/// （`xiang'mu` / `xi'an`）——和搜狗、微信一致。显示串只含 ASCII，
+/// 所以 `compose_view` 返回的下标可以直接给 `SetText` / `ShiftEnd` 用。
+fn compose_action(raw: &str, cursor: usize) -> EditAction {
+    let (text, cursor) = pinyin::compose_view(raw, cursor);
+    EditAction::Compose(text, cursor)
 }
 
 /// 把缓冲里的分词符统一成音节边界 `'`（`xi-an` → `xi'an`）。

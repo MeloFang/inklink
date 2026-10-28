@@ -524,8 +524,16 @@ type=3 撤回学习： [u8 3][u32 code_len][code utf8][u16 word_len][word utf8]
 `WideCharToMultiByte(CP_UTF8)`）。
 ### T5b 拼音音节分隔显示
 
-librime 的 preedit 自带 `jian zou pian feng`，但候选窗顶部仍显示原始 `jianzoupianfeng`。
-可在查询响应里附带 preedit，DLL 用它替换拼音行。
+✅ **2026-10-28 已实现（M1 续）**，但走的不是这条路线：librime 的 preedit 确实自带
+`jian zou pian feng`（要改查询响应协议把 preedit 带回来），而我们在 DLL 里用 402 音节表
+自己切分（`pinyin::compose_view`），一行协议都不用动，还能单测。
+
+- 缓冲里存用户原样敲的串，文档里和候选窗拼音行显示的都是带 `'` 的形式
+  （`xiangmu` → `xiang'mu`、`jintiantianqi` → `jin'tian'tian'qi`、`zheg` → `zhe'g`）
+- 用户自己按的 `-`/`_` 归一成 `'` 并优先保留（`xi-an` 显示 `xi'an`，不会又被并成 `xian`）
+- 光标换算：落在音节边界时停在分隔符**前面**（`xiang|'mu`），因为退格删的是前一个字母
+- 显示串只含 ASCII，所以下标 = 字节 = UTF-16 长度，`SetText` / `ShiftEnd` 可以直接用
+- 单测：`组合串显示带音节分隔`、`显示光标停在音节边界前`
 
 ### T5c 候选窗美化
 
@@ -617,11 +625,12 @@ Obsidian 语料 + AI 兜底，默认关闭联网（符合项目铁律）。
 - 英文候选：`github` / `vscode` 这类不像拼音的输入，原始串排候选第一
 - 32 位 DLL：WPS 等 32 位应用可用（注册到 Wow6432Node）
 - 候选窗：收起 1×5 / 展开 5×5，**只给选中行标 1-5**，↑↓ 换行、←→ 换列、数字键选当前行
-- 分词符：`-`/`_` 留在组合串、查询前剥离（`xiang-mu` 显示为 `xiang-mu`）
+- **分词符**：`-`/`_` 留在组合串、查询前剥离；**显示层按音节插 `'`**（`xiangmu` → `xiang'mu`、`xi-an` → `xi'an`、`zheg` → `zhe'g`）
 - **分段上屏**：选字后剩余拼音保留继续选（`pikeqiu` 选「皮」→ 串变 `keqiu`）；尾巴多打的字母按汉字数吃掉（`pikeqiux` 3 字 → 吃掉 8 个）
 - **模糊音**（2026-10-27）：`rime-config\fuzzy.yaml` 七组开关 + `tools\apply-fuzzy.ps1` 生成配置并重启引擎验证；默认全关（开了会污染候选）
 - **纠错探针**（2026-10-27，引擎侧）：`niihao`→你好、`xiangmuu`→项目、`zhemge`→这个、`shanghhai`→上海、`nihoa`→你好、`jintain`→今天。详见下面「纠错探针怎么工作」
-- 25 个按键/切分逻辑单测（`cargo test --release`）
+- **M1 个人词库**（1.0.0–1.0.13）：选词记忆、误选撤回、整句学习与整句撤回、跨应用记账、分词边界、`--review-dict` 巡检
+- 47 个单测（`cargo test --release`）+ 引擎 32 项 `--selftest`
 - 安装包 + 一键安装/卸载脚本（带完整日志 + 8 项自检）
 - 仓库清理：14.4 GB → 563 MB
 
@@ -630,13 +639,11 @@ Obsidian 语料 + AI 兜底，默认关闭联网（符合项目铁律）。
 | | 内容 | 备注 |
 |:---|:---|:---|
 | T5d | 拼音下划线 | 现在拼音像普通英文文字，是"最不像输入法"的地方 |
-| T5b | 音节分隔显示 | librime preedit 已有 `jian zou pian feng`，未接到候选窗 |
 | T5c | 候选窗美化 | |
 | T5e | 个人云词库 | Obsidian 语料 + AI 兜底 |
 | T5f | librime 工程化 | 现在靠手工解 Weasel 包 |
-| M1 续 | 组合串按音节显示分隔符 | 现在 `xian` 就显示 `xian`，搜狗显示 `xi'an`；纯显示层，不影响查询 |
 
-（T5a 用户词库学习已 ✅ 2026-10-27 实现，见上面同名小节；T5g 模糊音见「✅ 2026-10-27 已解决」）
+（T5a 用户词库学习已 ✅ 2026-10-27 实现；T5b 音节分隔显示已 ✅ 2026-10-28 实现，见同名小节；T5g 模糊音见「✅ 2026-10-27 已解决」）
 
 ### 纠错探针怎么工作（2026-10-27）
 
