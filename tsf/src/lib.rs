@@ -92,6 +92,8 @@ enum EditAction {
     Cancel,
     /// 插入一段文字到当前选区（中文标点用，没有组合）
     Insert(String),
+    /// 自己删掉光标前的一个字（误选撤回时用，见 `OnKeyDown` 的退格分支）
+    DeleteBack,
 }
 
 struct TextServiceInner {
@@ -134,6 +136,8 @@ struct TextServiceInner {
     sentence: Mutex<Option<SentenceAcc>>,
     /// 刚上屏的那一句（用于整句的撤回）
     sentence_mark: Mutex<Option<CommitMark>>,
+    /// 攒着还没执行的退格次数（自己删字用，见 EditAction::DeleteBack）
+    pending_backspace: Mutex<usize>,
 }
 
 #[implement(ITfTextInputProcessorEx, ITfKeyEventSink, ITfEditSession, ITfCompositionSink)]
@@ -166,6 +170,7 @@ impl TextService {
                 commit_mark: Mutex::new(None),
                 sentence: Mutex::new(None),
                 sentence_mark: Mutex::new(None),
+                pending_backspace: Mutex::new(0),
             },
         }
     }
@@ -205,6 +210,12 @@ impl TextService {
             .sentence_mark
             .lock()
             .unwrap_or_else(|p| p.into_inner()) = None;
+        // 攒着没执行的退格次数也作废，否则等下删字会多删
+        *self
+            .inner
+            .pending_backspace
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = 0;
     }
 
     /// 有没有"刚上屏、还可能被撤回"的词或整句。
@@ -823,6 +834,70 @@ impl ITfEditSession_Impl for TextService_Impl {
                 }
                 Ok(())
             }
+            EditAction::DeleteBack => {
+                // 误选撤回时自己删字。
+                //
+                // 为什么不让应用删：我们在 `OnTestKeyDown` 里认领了退格之后，
+                // 有的应用（微信、记事本）就再也收不到这个键了 ——
+                // 用户看到的是"按了两下没反应，第三下才删掉一个字"。
+                // 所以这里自己把光标前一个字删掉，`OnKeyDown` 返回 TRUE 把键吃掉。
+                let mut sel = [TF_SELECTION::default()];
+                let mut fetched = 0u32;
+                let mut why = "ok";
+                // 连按了好几下退格就一次删完（计数器由 OnKeyDown 累加）
+                let want = {
+                    let mut n = self
+                        .inner
+                        .pending_backspace
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner());
+                    let v = *n;
+                    *n = 0;
+                    v
+                };
+                let want = want.max(1) as i32;
+                // SAFETY: 标准 TSF range 操作，全部在同一个编辑会话内
+                unsafe {
+                    match ctx.GetSelection(ec, TF_DEFAULT_SELECTION, &mut sel, &mut fetched) {
+                        Err(_) => why = "GetSelection failed",
+                        Ok(()) => match sel[0].range.as_ref() {
+                            None => why = "no range",
+                            Some(range) => {
+                                // 有选中内容就删选中内容；只有一个光标就往前扩 `want` 个字。
+                                if range.IsEmpty(ec).map(|e| e.as_bool()).unwrap_or(true) {
+                                    if range.Collapse(ec, TF_ANCHOR_START).is_err() {
+                                        why = "Collapse failed";
+                                    } else {
+                                        let mut shifted = 0i32;
+                                        if range
+                                            .ShiftStart(ec, -want, &mut shifted, std::ptr::null())
+                                            .is_err()
+                                        {
+                                            why = "ShiftStart failed";
+                                        }
+                                    }
+                                }
+                                if why == "ok" {
+                                    if range.SetText(ec, 0, &[]).is_err() {
+                                        why = "SetText failed";
+                                    } else {
+                                        let _ = range.Collapse(ec, TF_ANCHOR_END);
+                                        let caret = [TF_SELECTION {
+                                            range: std::mem::ManuallyDrop::new(Some(range.clone())),
+                                            style: Default::default(),
+                                        }];
+                                        if ctx.SetSelection(ec, &caret).is_err() {
+                                            why = "SetSelection failed";
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                    }
+                }
+                log_line(&format!("delete-back -> {why}"));
+                Ok(())
+            }
         }
     }
 }
@@ -958,15 +1033,34 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
         }
 
         // ── 误选撤回 ──
-        // 上屏后 2 秒内按退格把刚上屏的那几个字删光，说明那一下选错了：
-        // 把刚才记的学习减掉。无论撤回与否，退格都照常放行给应用
-        // （返回 FALSE），所以用户看到的行为和平时一样。
+        // 上屏后 2 秒内按退格，把刚上屏的几个字删光就说明那一下选错了：
+        // 把刚才记的学习减掉。
+        //
+        // 这段窗口里退格由**我们**执行（`EditAction::DeleteBack` 自己删一个字），
+        // 因为 `OnTestKeyDown` 认领了之后有的应用就收不到这个键了 ——
+        // 之前的表现是"按两下没反应，第三下才删掉"。窗口之外的退格不认领、
+        // 也不经这里，应用照常自己删。
         if vk == VK_BACK {
             let composing = !self.inner.buffer.lock().unwrap_or_else(|p| p.into_inner()).is_empty();
             if !composing {
+                let had_mark = self.undo_pending();
                 for (code, word) in self.count_backspace() {
                     log_line(&format!("unlearn code={code} word={word}"));
                     ipc::unlearn(&code, &word);
+                }
+                if had_mark {
+                    // 连按两下时异步编辑会话可能还没跑起来，pending 只有一个槽，
+                    // 所以把次数攒在计数器里，会话一次按次数删完。
+                    {
+                        let mut n = self
+                            .inner
+                            .pending_backspace
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner());
+                        *n += 1;
+                    }
+                    self.request_edit(EditAction::DeleteBack);
+                    return Ok(BOOL(1));
                 }
                 return Ok(BOOL(0));
             }

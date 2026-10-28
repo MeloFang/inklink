@@ -351,6 +351,11 @@ DLL 被加载后无法卸载：脚本每次用**新文件名 + 改注册表**，
 - **`argv` 是 ANSI 编码**（中文系统上是 GBK），命令行传中文（`--forget <码> <词>`）会匹配不上
   UTF-8 存的词 → 用 `argv_to_utf8()` 转换（`MultiByteToWideChar(CP_ACP)` + `WideCharToMultiByte(CP_UTF8)`）。
 - **误选撤回靠数退格，不靠 `ITfTextEditSink`**：后者要新增编辑观察者 + 跟踪 range，出错就是挂死。
+- **`OnTestKeyDown` 认领过的键，应用很可能收不到**，所以"认领但不处理（`OnKeyDown` 返 FALSE）"这种
+  写法等于把键吃掉：撤回窗口里连按退格会出现"前两下没反应、第三下才删掉一个字"。要么别认领，
+  要么认领了就自己把副作用做完（`EditAction::DeleteBack` 自己删字并返回 `BOOL(1)`）。
+  异步编辑会话只有一个 `pending` 槽，连按两下会互相覆盖 → 次数要攒在计数器里
+  （`pending_backspace`），会话一次删完。
 - `.ps1` 必须 UTF-8 **带 BOM**；`.cmd` 必须**纯 ASCII + CRLF**（cmd.exe 按 OEM 代码页读，`goto` 在 LF-only 文件里会失效）。
 - `net session` 判管理员不可靠（Server 服务被禁就恒失败）→ 用 `fltmc`。
 - 拼写中按 `-` 的语义取决于是否展开：展开=翻页，收起=分词符。判定前必须先把 `expanded` 的 MutexGuard 放到块里释放，否则再 lock 会死锁。

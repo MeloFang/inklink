@@ -437,6 +437,8 @@ DLL 侧所有管道读也改成带超时的 `read_exact_timeout()`（`QUERY_TIME
 
 逻辑抽成 `fn step_mark(slot: &mut Option<CommitMark>) -> Option<(String, String)>`（过期自动清槽、删光返回 `(码, 词)`），不依赖 COM，可直接单测（`删掉最后一个词只撤回那个词`、`一直删到整句没了整句也撤回`、`过期的标记不再算误选`）。
 
+**退格由输入法自己执行**（2026-10-28 修）：`OnTestKeyDown` 认领过退格之后，有的应用就再也收不到这个键了 —— 实际体验是"按两下没反应，第三下才删掉一个字"。所以撤回窗口内不再依赖"认领 + `OnKeyDown` 返 FALSE 让应用自己删"，改成在编辑会话里 `EditAction::DeleteBack` 自己删：`GetSelection` → 有选中就删选中、没有就 `Collapse(TF_ANCHOR_START)` + `ShiftStart(-n)` → `SetText(empty)` → 光标落回删除点，`OnKeyDown` 返 `BOOL(1)` 把键吃掉。连按次数攒在 `pending_backspace`（异步会话只有一个 `pending` 槽，否则第二下会覆盖第一下）。
+
 **还没做的**：长句分词边界学习。
 
 #### 误选撤回 + 词库巡检（2026-10-27 补，M1 续）
