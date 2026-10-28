@@ -637,9 +637,14 @@ Obsidian 语料 + AI 兜底，默认关闭联网（符合项目铁律）。
 
 **Shift 组合键不再误切英文**（2026-10-28 修）：`Shift+=`（`+`）、`Shift+-`（`_`）在空闲态**不认领**（交给应用原样插入半角），于是 TSF 不调 `OnKeyDown`，`shift_used` 一直是 `false`，松开 Shift 就被 `OnKeyUp` 当成"单击切换中英文" —— 用户实测"按了 Shift+加号减号之后切不回中文"。修法：把"这次按键是 Shift 组合键"的判断提到 `OnTestKeyDown`（`is_shift_chord(vk, shift, ctrl_alt_win)`，排除 Shift 本身与 Ctrl/Alt/Win 快捷键），`OnKeyDown` 里再记一次做双保险。**教训**：凡是"根据按键序列推断意图"的状态，都要在最早的那个回调里记，不能挂在"认领之后才走"的路径上。
 
+**鼠标点候选 + 数字后面的半角标点**（2026-10-28 修）：用户实测两个问题 ——「待选的文字我想用鼠标去点击会直接留下英文而不是中文」和「输入数字之后打的。会是.而不是。」。
+- 鼠标：根因不是"没实现点击"，而是**实现成了点击穿透**（`WM_NCHITTEST -> HTTRANSPARENT`），点候选等于在文档里点了一下，组合串被打断、拼音原样留在文档里。改法：窗口自己收 `WM_LBUTTONDOWN`，`hit_index()` 把窗口坐标换成候选下标（整格可点，含序号那一小块），`hide()` 之后通过 `set_click_handler` 存下的函数指针回调 `lib.rs` 的 `handle_cand_click()` —— 上屏必须走编辑会话，只能在那边发。和空格/数字键走的是同一个 `apply_pick()` + `finish_pick()`，所以分段上屏、学习、撤回标记全都一致。
+- 标点：`。` `，` `：` 在数字后面应该是半角（`3.14`、`1,000`、`10:30`）。按键线程看不到文档内容，所以新增 `EditAction::InsertPunct(全角, 半角)`，由编辑会话里的 `preceding_char_is_digit()` 用 `ITfRange::ShiftStart(-1)` + `GetText` 读光标前一个字符再决定（读完 `Collapse(TF_ANCHOR_END)` 把光标放回原处）。有选区时直接算"不是数字"，反正接下来是整段替换。
+- 顺带把 `Insert` 分支里的插字逻辑抽成 `insert_at_caret()`，两个分支共用（含 `SendInput` 兜底）。
+
 **测试能力现状**：
 
-- 有：`cargo test` 42 个单测（按键认领、标点映射与引号交替、半角符号不转换、Shift 组合键不误判单击切换、拼音切分、分段上屏消耗字母数、误选撤回与整句撤回的记账、整句上报门槛、候选窗上下翻与贴边、注入退格按次数放行与过期）
+- 有：`cargo test` 44 个单测（按键认领、标点映射与引号交替、半角符号不转换、数字后半角标点、Shift 组合键不误判单击切换、拼音切分、分段上屏消耗字母数、误选撤回与整句撤回的记账、整句上报门槛、候选窗上下翻与贴边、候选窗点击命中格、注入退格按次数放行与过期）
 - 有：`rime-server.exe --selftest` 24 项引擎侧断言（`utf8_char_count` / `strip_separators` /
   `split_lengths` / `learn_key`），纯 ASCII，不初始化 librime
 - 有：`tsf/test/test-harness.cc` GUI 自动化测试台（需要交互式桌面，agent 抢不到焦点）

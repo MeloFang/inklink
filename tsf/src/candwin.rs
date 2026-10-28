@@ -12,7 +12,7 @@
 //! 约束：
 //! - `WS_EX_NOACTIVATE`：不抢焦点，否则组合串会断、焦点会从应用跑掉
 //! - 由 TSF 线程的消息循环驱动，**不另起线程**
-//! - 只做显示，不做交互（数字键选择在 lib.rs 里处理）
+//! - 只做显示 + 鼠标点击选词；上屏动作通过回调交给 `lib.rs`（编辑会话必须在那边发）
 
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering};
 use std::sync::Mutex;
@@ -26,9 +26,9 @@ use windows_sys::Win32::Graphics::Gdi::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, GetClientRect, RegisterClassW, SetWindowPos, ShowWindow,
-    CW_USEDEFAULT, HTTRANSPARENT, MA_NOACTIVATE, SWP_NOACTIVATE, SWP_NOZORDER, SW_HIDE,
-    SW_SHOWNOACTIVATE, WM_ERASEBKGND, WM_MOUSEACTIVATE, WM_NCHITTEST, WM_PAINT, WNDCLASSW,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    CW_USEDEFAULT, MA_NOACTIVATE, SWP_NOACTIVATE, SWP_NOZORDER, SW_HIDE, SW_SHOWNOACTIVATE,
+    WM_ERASEBKGND, WM_LBUTTONDOWN, WM_MOUSEACTIVATE, WM_PAINT, WNDCLASSW, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
 static HWND_CELL: AtomicIsize = AtomicIsize::new(0);
@@ -40,6 +40,26 @@ static PAGE: AtomicUsize = AtomicUsize::new(1);
 static TOTAL_PAGES: AtomicUsize = AtomicUsize::new(1);
 static FONT_CAND: AtomicIsize = AtomicIsize::new(0);
 static FONT_PINYIN: AtomicIsize = AtomicIsize::new(0);
+
+/// 鼠标点了候选之后要干什么：`(上下文指针, 候选在整页里的下标)`。
+///
+/// 上屏必须走 TSF 编辑会话，那套东西在 `lib.rs` 里，所以窗口过程只负责
+/// "算出点的是第几个"然后回调出去，不自己动文档。
+pub type ClickHandler = unsafe extern "system" fn(ctx: usize, index: usize);
+
+static CLICK_FN: AtomicUsize = AtomicUsize::new(0);
+static CLICK_CTX: AtomicUsize = AtomicUsize::new(0);
+
+/// 装/换点击回调（`Activate` 时装、`Deactivate` 时拆）。
+pub fn set_click_handler(f: ClickHandler, ctx: usize) {
+    CLICK_CTX.store(ctx, Ordering::SeqCst);
+    CLICK_FN.store(f as usize, Ordering::SeqCst);
+}
+
+pub fn clear_click_handler() {
+    CLICK_FN.store(0, Ordering::SeqCst);
+    CLICK_CTX.store(0, Ordering::SeqCst);
+}
 
 const CLASS_NAME: &str = "inklink-candidate";
 
@@ -202,6 +222,29 @@ fn window_size(candidates: &[String]) -> (i32, i32) {
     (w.max(220), h)
 }
 
+/// 窗口内坐标 → 候选下标（点在拼音行或空白处返回 None）。
+///
+/// 和 `WM_PAINT` 里的算式必须保持一致：整格都算可点（含序号那一小块），
+/// 因为用户是"照着看见的那一格点"，不是照着文字的像素点。
+fn hit_index(x: i32, y: i32, candidates: &[String]) -> Option<usize> {
+    let grid_top = PAD + PINYIN_H;
+    if y < grid_top {
+        return None;
+    }
+    let cell_w = cell_width(candidates);
+    let col = (x - PAD) / cell_w;
+    let row = (y - grid_top) / ROW_H;
+    if col < 0 || col >= COLS as i32 || row < 0 {
+        return None;
+    }
+    let idx = row as usize * COLS + col as usize;
+    if idx < candidates.len() {
+        Some(idx)
+    } else {
+        None
+    }
+}
+
 fn cell_width(candidates: &[String]) -> i32 {
     unsafe {
         let hdc = GetDC(std::ptr::null_mut());
@@ -289,7 +332,27 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
     match msg {
         WM_ERASEBKGND => 1,
         WM_MOUSEACTIVATE => MA_NOACTIVATE as LRESULT,
-        WM_NCHITTEST => HTTRANSPARENT as LRESULT,
+        // 鼠标点候选：算出点的是第几个，收起窗口，把上屏交给 lib.rs。
+        //
+        // 以前这里是 `WM_NCHITTEST -> HTTRANSPARENT`（点击穿透到下面的应用），
+        // 结果是"点候选"等于"在文档里点了一下"：组合串被打断，拼音原样留在文档里。
+        WM_LBUTTONDOWN => {
+            let x = (lparam as i16) as i32;
+            let y = ((lparam >> 16) as i16) as i32;
+            let cands = CANDIDATES.lock().unwrap_or_else(|p| p.into_inner()).clone();
+            if let Some(idx) = hit_index(x, y, &cands) {
+                let stored = CLICK_FN.load(Ordering::SeqCst);
+                let ctx = CLICK_CTX.load(Ordering::SeqCst);
+                hide();
+                if stored != 0 {
+                    // SAFETY: 指针只在 `Activate`..`Deactivate` 之间有效，
+                    // 而候选窗只在这段时间里可见，能点到就说明它还在。
+                    let handler: ClickHandler = std::mem::transmute::<usize, ClickHandler>(stored);
+                    handler(ctx, idx);
+                }
+            }
+            0
+        }
         WM_PAINT => {
             let mut ps: PAINTSTRUCT = std::mem::zeroed();
             let hdc = BeginPaint(hwnd, &mut ps);
@@ -414,6 +477,29 @@ mod tests {
     use super::*;
 
     const AREA: (i32, i32, i32, i32) = (0, 0, 1920, 1040);
+
+    /// 鼠标点在格子里要落到正确的候选上
+    #[test]
+    fn 点哪一格就选哪一个() {
+        let cands: Vec<String> = (0..7).map(|i| format!("词{i}")).collect();
+        // 拼音行不算
+        assert_eq!(hit_index(10, 2, &cands), None);
+        // 第一行第一个（点在序号那一小块也算）
+        assert_eq!(hit_index(PAD + 3, PAD + PINYIN_H + 5, &cands), Some(0));
+        // 第一行第三个
+        let cw = cell_width(&cands);
+        assert_eq!(hit_index(PAD + cw * 2 + 3, PAD + PINYIN_H + 5, &cands), Some(2));
+        // 第二行第一个 = 下标 5
+        assert_eq!(
+            hit_index(PAD + 3, PAD + PINYIN_H + ROW_H + 5, &cands),
+            Some(5)
+        );
+        // 第二行第三个是空的（只有 7 个）
+        assert_eq!(
+            hit_index(PAD + cw * 2 + 3, PAD + PINYIN_H + ROW_H + 5, &cands),
+            None
+        );
+    }
 
     /// 下面有地方就贴在光标下面
     #[test]

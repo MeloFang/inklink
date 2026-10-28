@@ -98,6 +98,12 @@ enum EditAction {
     Cancel,
     /// 插入一段文字到当前选区（中文标点用，没有组合）
     Insert(String),
+    /// 插标点，但先看一眼光标前一个字符：是数字就插半角，否则插全角。
+    ///
+    /// 参数是 `(全角, 半角)`。数字后面要的是 `3.14`、`10:30`、`1,000` 里的那个
+    /// 半角符号（用户实测："输入数字之后打的。会是.而不是。"）；判断必须在编辑
+    /// 会话里做，因为按键线程上拿不到文档内容。
+    InsertPunct(String, String),
     /// 自己删掉光标前的一个字（误选撤回时用，见 `OnKeyDown` 的退格分支）
     DeleteBack,
 }
@@ -496,6 +502,20 @@ impl ITfTextInputProcessorEx_Impl for TextService_Impl {
     }
 }
 
+/// 候选窗鼠标点击的跳板：`candwin` 的窗口过程在 UI 线程里直接调进来。
+///
+/// # Safety
+/// `ctx` 必须是 `advise_keys` 里存进去的 `TextService_Impl` 指针。候选窗只在
+/// 激活期间可见，能点到就说明对象还活着；`unadvise_keys` 会把回调拆掉。
+unsafe extern "system" fn cand_click_thunk(ctx: usize, index: usize) {
+    if ctx == 0 {
+        return;
+    }
+    unsafe {
+        let svc = &*(ctx as *const TextService_Impl);
+        let _ = svc.handle_cand_click(index);
+    }
+}
 impl TextService_Impl {
     /// 挂上按键接收器：TSF 把按键通过 `ITfKeystrokeMgr` 分发给注册的 sink。
     /// 幂等——Activate/ActivateEx 可能被反复调用，重复挂载会让同一按键触发多次回调。
@@ -522,6 +542,10 @@ impl TextService_Impl {
 
         // 激活时顺手确保引擎在跑——引擎崩了下次切输入法就自动复活
         ipc::ensure_engine();
+
+        // 候选窗点鼠标选词：回调跳板带上自己，窗口过程只要把下标送回来。
+        // 只在激活期间有效（`unadvise_keys` 里拆掉）。
+        candwin::set_click_handler(cand_click_thunk, self as *const TextService_Impl as usize);
 
         // 把自己作为按键 sink 挂上去（传引用，而不是把 owned 接口交给 Param）
         let sink: ITfKeyEventSink = self.to_interface();
@@ -552,6 +576,7 @@ impl TextService_Impl {
         }
         *self.inner.keystroke_mgr.lock().unwrap() = None;
         *self.inner.thread_mgr.lock().unwrap() = None;
+        candwin::clear_click_handler();
     }
 
     /// 选完一个候选后的统一收尾：记"可能被撤回"的标记、记整句学习、提交编辑动作。
@@ -568,6 +593,43 @@ impl TextService_Impl {
         }
         self.request_edit(action);
         BOOL(1)
+    }
+
+    /// 鼠标点了候选窗里的某一格：走和空格/数字键完全一样的那条路。
+    ///
+    /// `index` 是**整页里的下标**（网格第几格），不是"第几行第几个"；
+    /// 窗口过程那边的 `hit_index` 已经算好了。
+    fn handle_cand_click(&self, index: usize) -> BOOL {
+        let mut buffer = self.inner.buffer.lock().unwrap_or_else(|p| p.into_inner());
+        if buffer.is_empty() {
+            return BOOL(0);
+        }
+        let mut cands = self.inner.cands.lock().unwrap_or_else(|p| p.into_inner());
+        let mut cursor = self.inner.cursor.lock().unwrap_or_else(|p| p.into_inner());
+        let mut matched_len = self.inner.matched_len.lock().unwrap_or_else(|p| p.into_inner());
+        let mut page = self.inner.page.lock().unwrap_or_else(|p| p.into_inner());
+        let mut expanded = self.inner.expanded.lock().unwrap_or_else(|p| p.into_inner());
+        let mut sel = self.inner.sel.lock().unwrap_or_else(|p| p.into_inner());
+        let pos = *self.inner.last_pos.lock().unwrap_or_else(|p| p.into_inner());
+        let code_before = buffer.clone();
+        let pick_idx = *page * page_size(*expanded) + index;
+        match apply_pick(
+            pick_idx,
+            &mut cands,
+            &mut buffer,
+            &mut cursor,
+            &mut matched_len,
+            &mut page,
+            &mut expanded,
+            &mut sel,
+            pos,
+        ) {
+            Some(action) => {
+                log_line(&format!("pick(mouse {index}) buffer={buffer}"));
+                self.finish_pick(&code_before, action)
+            }
+            None => BOOL(0),
+        }
     }
 
     /// 把一个动作交给编辑会话执行（异步，安全，不阻塞按键线程）。
@@ -850,38 +912,21 @@ impl ITfEditSession_Impl for TextService_Impl {
                 Ok(())
             }
             EditAction::Insert(text) => {
-                // 中文标点：直接替换当前选区，不需要组合。
-                // 某些应用（Electron 系）对裸选区 SetText 不认，失败时回退到 SendInput。
-                let utf16: Vec<u16> = text.encode_utf16().collect();
-                let mut sel = [TF_SELECTION::default()];
-                let mut fetched = 0u32;
-                let mut why = "ok";
-                // SAFETY: 标准 TSF 调用
-                unsafe {
-                    match ctx.GetSelection(ec, TF_DEFAULT_SELECTION, &mut sel, &mut fetched) {
-                        Err(_) => why = "GetSelection failed",
-                        Ok(()) => match sel[0].range.as_ref() {
-                            None => why = "no range",
-                            Some(range) => {
-                                if range.SetText(ec, 0, &utf16).is_err() {
-                                    why = "SetText failed";
-                                } else {
-                                    let _ = range.Collapse(ec, TF_ANCHOR_END);
-                                    let caret = [TF_SELECTION {
-                                        range: std::mem::ManuallyDrop::new(Some(range.clone())),
-                                        style: Default::default(),
-                                    }];
-                                    if ctx.SetSelection(ec, &caret).is_err() {
-                                        why = "SetSelection failed";
-                                    }
-                                }
-                            }
-                        },
-                    }
-                }
+                let why = insert_at_caret(&ctx, ec, &text);
                 log_line(&format!("insert '{text}' -> {why}"));
                 if why != "ok" {
                     // TSF 这条路不通，退回注入字符
+                    ipc::send_text(&text);
+                }
+                Ok(())
+            }
+            EditAction::InsertPunct(full, half) => {
+                // 数字后面要半角（`3.14` `10:30` `1,000`），其余照旧全角。
+                let digit = preceding_char_is_digit(&ctx, ec);
+                let text = if digit { half } else { full };
+                let why = insert_at_caret(&ctx, ec, &text);
+                log_line(&format!("insert-punct '{text}' digit_before={digit} -> {why}"));
+                if why != "ok" {
                     ipc::send_text(&text);
                 }
                 Ok(())
@@ -1331,8 +1376,21 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                         }
                         self.request_edit(EditAction::Commit(text));
                     } else {
-                        log_line(&format!("punct vk={vk:#x} -> {ch}"));
-                        self.request_edit(EditAction::Insert(ch));
+                        // 数字后面要半角（`3.14`、`10:30`、`1,000`）：
+                        // 光标前一个字符得在编辑会话里才看得到，这里只把两种写法都传下去。
+                        match digit_pair(vk, shift) {
+                            Some((full, half)) => {
+                                log_line(&format!("punct vk={vk:#x} -> digit-aware"));
+                                self.request_edit(EditAction::InsertPunct(
+                                    full.to_string(),
+                                    half.to_string(),
+                                ));
+                            }
+                            None => {
+                                log_line(&format!("punct vk={vk:#x} -> {ch}"));
+                                self.request_edit(EditAction::Insert(ch));
+                            }
+                        }
                     }
                     return Ok(BOOL(1));
                 }
@@ -1945,6 +2003,85 @@ fn text_ext_pos(ctx: &ITfContext, ec: u32, range: &ITfRange) -> Option<CaretPos>
     }
 }
 
+/// 把一段文字插到光标处（没有选区就是纯插入，有选区就是替换）。
+///
+/// 某些应用（Electron 系）对裸选区 `SetText` 不认，所以返回 `why` 让调用方
+/// 决定要不要退回 `SendInput`。
+fn insert_at_caret(ctx: &ITfContext, ec: u32, text: &str) -> &'static str {
+    let utf16: Vec<u16> = text.encode_utf16().collect();
+    let mut sel = [TF_SELECTION::default()];
+    let mut fetched = 0u32;
+    let mut why = "ok";
+    // SAFETY: 标准 TSF 调用，处于编辑会话内
+    unsafe {
+        match ctx.GetSelection(ec, TF_DEFAULT_SELECTION, &mut sel, &mut fetched) {
+            Err(_) => why = "GetSelection failed",
+            Ok(()) => match sel[0].range.as_ref() {
+                None => why = "no range",
+                Some(range) => {
+                    if range.SetText(ec, 0, &utf16).is_err() {
+                        why = "SetText failed";
+                    } else {
+                        let _ = range.Collapse(ec, TF_ANCHOR_END);
+                        let caret = [TF_SELECTION {
+                            range: std::mem::ManuallyDrop::new(Some(range.clone())),
+                            style: Default::default(),
+                        }];
+                        if ctx.SetSelection(ec, &caret).is_err() {
+                            why = "SetSelection failed";
+                        }
+                    }
+                }
+            },
+        }
+    }
+    why
+}
+
+/// 光标前一个字符是不是阿拉伯数字？
+///
+/// 探针只在**光标是塌缩状态**时做（有选区就直接答"不是"，反正接下来是替换）。
+/// NBSP 之类不影响：只认 `0-9`。
+/// 读完把光标放回原处，调用方拿到的还是同一个光标位置。
+fn preceding_char_is_digit(ctx: &ITfContext, ec: u32) -> bool {
+    // SAFETY: 标准 TSF 查询，处于编辑会话内
+    unsafe {
+        let mut sel = [TF_SELECTION::default()];
+        let mut fetched = 0u32;
+        if ctx.GetSelection(ec, TF_DEFAULT_SELECTION, &mut sel, &mut fetched).is_err() {
+            return false;
+        }
+        let Some(range) = sel[0].range.as_ref() else {
+            return false;
+        };
+        let mut anchor = 0i32;
+        let mut cch = 0i32;
+        let collapsed = range
+            .cast::<ITfRangeACP>()
+            .map(|acp| acp.GetExtent(&mut anchor, &mut cch).is_ok() && cch == 0)
+            .unwrap_or(false);
+        if !collapsed {
+            return false;
+        }
+        let mut shifted = 0i32;
+        if range.ShiftStart(ec, -1, &mut shifted, std::ptr::null()).is_err() || shifted == 0 {
+            return false;
+        }
+        let mut buf = [0u16; 2];
+        // pcch 是入参（缓冲区长度）也是出参（实际写入长度）
+        let mut got = buf.len() as u32;
+        let digit = match range.GetText(ec, 0, &mut buf, &mut got) {
+            Ok(()) if got >= 1 => char::from_u32(buf[got as usize - 1] as u32)
+                .map(|c| c.is_ascii_digit())
+                .unwrap_or(false),
+            _ => false,
+        };
+        // 放回原处：区间现在是 [前一个字符, 光标]，塌缩到末尾就回到光标
+        let _ = range.Collapse(ec, TF_ANCHOR_END);
+        digit
+    }
+}
+
 /// 查候选；整串查不到就逐步缩短，返回 (候选, 命中的前缀长度)。
 ///
 /// 这样 `xiangmm` 会退到 `xiang` 出候选，而不是整串查不到直接卡死。
@@ -2124,6 +2261,17 @@ fn halfwidth_symbol(vk: u32, shift: bool) -> Option<&'static str> {
         (VK_OEM_PLUS, false) => "=",
         (VK_OEM_MINUS, true) => "_",
         (VK_OEM_PLUS, true) => "+",
+        _ => return None,
+    })
+}
+
+/// 这几个标点在数字后面应该是半角：`3.14` / `1,000` / `10:30`。
+/// 返回 `(全角, 半角)`，由编辑会话看光标前一个字符决定用哪个。
+fn digit_pair(vk: u32, shift: bool) -> Option<(&'static str, &'static str)> {
+    Some(match (vk, shift) {
+        (VK_OEM_PERIOD, false) => ("。", "."),
+        (VK_OEM_COMMA, false) => ("，", ","),
+        (VK_OEM_1, true) => ("：", ":"),
         _ => return None,
     })
 }
@@ -2699,6 +2847,18 @@ mod tests {
     #[test]
     fn 拼写中不认领_tab() {
         assert!(!should_claim(VK_TAB_KEY, true, false, false, false));
+    }
+
+    #[test]
+    fn 数字后面的标点是半角() {
+        // `3.14`、`1,000`、`10:30` 里的符号
+        assert_eq!(digit_pair(VK_OEM_PERIOD, false), Some(("。", ".")));
+        assert_eq!(digit_pair(VK_OEM_COMMA, false), Some(("，", ",")));
+        assert_eq!(digit_pair(VK_OEM_1, true), Some(("：", ":")));
+        // 不是这几个键的一律走普通标点
+        assert_eq!(digit_pair(VK_OEM_1, false), None, "分号不受影响");
+        assert_eq!(digit_pair(VK_OEM_PERIOD, true), None, "Shift+. 是》");
+        assert_eq!(digit_pair(VK_OEM_2, false), None);
     }
 
     #[test]
