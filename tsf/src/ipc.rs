@@ -273,6 +273,41 @@ fn start_process(exe: &str) {
     }
 }
 
+/// 当前进程是什么应用（exe 名，去掉 `.exe`、转小写），用于个人词库分应用记账。
+///
+/// 为什么要分应用：同一个拼音在不同地方想打的词不一样 —— 聊天里 `xiangmu`
+/// 常选「想你」，工作软件里常选「项目」。全记在一起会互相污染。
+///
+/// 取不到（宿主进程异常）时返回空串，引擎就当"未知应用"，退回全局权重。
+fn app_tag() -> &'static str {
+    static TAG: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    TAG.get_or_init(|| {
+        use windows_sys::Win32::System::LibraryLoader::GetModuleFileNameW;
+        let mut buf = vec![0u16; 1024];
+        // SAFETY: null HMODULE = 当前进程；缓冲区长度已按最大路径给足
+        let n = unsafe { GetModuleFileNameW(std::ptr::null_mut(), buf.as_mut_ptr(), 1024) };
+        if n == 0 {
+            return String::new();
+        }
+        let path = String::from_utf16_lossy(&buf[..n as usize]);
+        let name = path.rsplit(['\\', '/']).next().unwrap_or("");
+        let name = name
+            .strip_suffix(".exe")
+            .or_else(|| name.strip_suffix(".EXE"))
+            .unwrap_or(name);
+        name.to_ascii_lowercase()
+    })
+}
+
+/// 在报文末尾追加"当前应用"（协议 v5 的可选尾巴）。
+///
+/// 引擎先探测有没有这段数据，没有就当作老协议 —— 所以新旧随便混搭都不会挂。
+fn push_app(req: &mut Vec<u8>) {
+    let app = app_tag().as_bytes();
+    req.extend_from_slice(&(app.len() as u16).to_le_bytes());
+    req.extend_from_slice(app);
+}
+
 /// 向引擎查询候选。连不上 / 超时都返回空（输入法绝不能让应用卡住）。
 pub fn query(code: &str) -> Vec<String> {
     if code.is_empty() {
@@ -290,6 +325,7 @@ pub fn query(code: &str) -> Vec<String> {
         req.push(1u8);
         req.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
         req.extend_from_slice(bytes);
+        push_app(&mut req);
         write_all(pipe, &req);
 
         let mut len_buf = [0u8; 4];
@@ -345,6 +381,7 @@ pub fn select(index: usize, code: &str, word: &str) {
         req.extend_from_slice(code_bytes);
         req.extend_from_slice(&(word_bytes.len() as u16).to_le_bytes());
         req.extend_from_slice(word_bytes);
+        push_app(&mut req);
         write_all(pipe, &req);
         // 读掉响应（count=0），避免服务端阻塞在 flush
         let mut len_buf = [0u8; 4];
@@ -376,6 +413,7 @@ pub fn unlearn(code: &str, word: &str) {
         req.extend_from_slice(code_bytes);
         req.extend_from_slice(&(word_bytes.len() as u16).to_le_bytes());
         req.extend_from_slice(word_bytes);
+        push_app(&mut req);
         write_all(pipe, &req);
         let mut len_buf = [0u8; 4];
         let _ = read_exact_timeout(pipe, &mut len_buf, SELECT_TIMEOUT_MS);

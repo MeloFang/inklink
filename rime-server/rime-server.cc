@@ -91,7 +91,19 @@ static std::mutex g_rime_mutex;
 // 存哪儿：`%LOCALAPPDATA%\inklink\user-words.tsv`。
 // 不能放 `C:\inklink-engine\`（安装目录，普通用户没有写权限），也不该放 rime 的
 // user_dir（那里是 rime 自己 deploy 的地盘，混进去容易被误删）。
-static std::map<std::string, std::map<std::string, int>> g_user;
+//
+// **按应用分开记账**：同一个拼音在不同应用里想打的词是不一样的
+// （微信里 `hai` 常选「还行」，VSCode 里 `hai` 更可能选「函数」？其实都是词，
+// 但 `xiangmu` 在聊天里是「想你」、在工位上是「项目」）。所以每个词除了
+// 全局次数（`total`，= 各应用次数之和）还记一份 `app -> 次数`。
+// 查询时按"当前应用"加分：当前应用里的使用次数算双倍。
+struct UserWord {
+    /// 全局次数（各应用之和，读盘时重算，不单独存）
+    int total = 0;
+    /// 应用名（exe 名小写，如 `weixin`）-> 次数；空串 = 老版本/未知应用
+    std::map<std::string, int> apps;
+};
+static std::map<std::string, std::map<std::string, UserWord>> g_user;
 static std::string g_user_path;
 static bool g_user_dirty = false;
 /// 每个连接一个线程，学习与查询可能并发 → 用户词库要自己上锁。
@@ -152,9 +164,20 @@ static void load_user() {
         if (b == std::string::npos) continue;
         std::string code = s.substr(0, a);
         std::string text = s.substr(a + 1, b - a - 1);
-        int count = atoi(s.c_str() + b + 1);
+        // 第四列（应用名）是 1.0.9 加的；老文件只有三列，当成"未知应用"
+        size_t c = s.find('\t', b + 1);
+        std::string app;
+        int count = 0;
+        if (c == std::string::npos) {
+            count = atoi(s.c_str() + b + 1);
+        } else {
+            count = atoi(s.c_str() + b + 1);
+            app = s.substr(c + 1);
+        }
         if (!code.empty() && !text.empty() && count > 0) {
-            g_user[code][text] = count;
+            UserWord& w = g_user[code][text];
+            w.apps[app] += count;
+            w.total += count;
             total++;
         }
     }
@@ -163,6 +186,9 @@ static void load_user() {
 }
 
 /// 落盘。先写 `.tmp` 再改名 —— 半截写坏的文件比没有更糟（会把整本词库读成空）。
+///
+/// 文件格式：`码 \t 词 \t 次数 \t 应用名`，**每个 (码,词,应用) 一行**。
+/// 全局次数不单独存，读盘时把各应用加起来 —— 少一个字段就少一处不一致。
 static void save_user() {
     if (!g_user_dirty) return;
     std::string tmp = g_user_path + ".tmp";
@@ -174,8 +200,16 @@ static void save_user() {
     size_t total = 0;
     for (const auto& kv : g_user) {
         for (const auto& t : kv.second) {
-            fprintf(f, "%s\t%s\t%d\n", kv.first.c_str(), t.first.c_str(), t.second);
-            total++;
+            if (t.second.apps.empty()) {
+                fprintf(f, "%s\t%s\t%d\t\n", kv.first.c_str(), t.first.c_str(), t.second.total);
+                total++;
+                continue;
+            }
+            for (const auto& ap : t.second.apps) {
+                fprintf(f, "%s\t%s\t%d\t%s\n", kv.first.c_str(), t.first.c_str(), ap.second,
+                        ap.first.c_str());
+                total++;
+            }
         }
     }
     fclose(f);
@@ -196,7 +230,7 @@ static void prune_user() {
             int best = 0;
             // 注意：windows.h 有 max 宏，`std::max(` 会被宏展开成语法错误，
             // 三元写最稳（本文件其它地方用 `std::min<size_t>(...)`，带模板参数所以没事）。
-            for (const auto& t : it->second) best = best > t.second ? best : t.second;
+            for (const auto& t : it->second) best = best > t.second.total ? best : t.second.total;
             if (best <= 1) {
                 it = g_user.erase(it);
                 dropped = true;
@@ -425,17 +459,34 @@ static std::vector<std::string> collect_page0(const std::string& code, size_t ne
     return out;
 }
 
-/// 把用户选过的词提到前面（同一拼音内按次数降序）。
-static void apply_user_boost(const std::string& code, std::vector<std::string>& cands) {
+/// 一个词在"当前应用"里的排序分。
+///
+/// 规则：全局次数 + 当前应用次数 ×2 —— 当前应用里的使用次数算双倍。
+/// 为什么不是"只用当前应用的次数"：新应用里你一次都没选过，等于把整本词库
+/// 关掉；为什么不是"只看全局"：那就又退回到所有应用混在一起了。
+/// 双倍是个能解释、能单测的经验值：同一份使用次数下，本应用里的词一定赢，
+/// 但别的应用里反复用过的词仍能靠全局次数压过一个刚用一次的。
+static int boost_score(const UserWord& w, const std::string& app) {
+    int app_count = 0;
+    if (!app.empty()) {
+        auto it = w.apps.find(app);
+        if (it != w.apps.end()) app_count = it->second;
+    }
+    return w.total + app_count * 2;
+}
+
+/// 把用户选过的词提到前面（同一拼音内按分数降序）。
+static void apply_user_boost(const std::string& code, const std::string& app,
+                             std::vector<std::string>& cands) {
     std::lock_guard<std::mutex> lock(g_user_mutex);
     auto it = g_user.find(code);
     if (it == g_user.end() || it->second.empty()) return;
     std::stable_sort(cands.begin(), cands.end(), [&](const std::string& a, const std::string& b) {
         int ca = 0, cb = 0;
         auto fa = it->second.find(a);
-        if (fa != it->second.end()) ca = fa->second;
+        if (fa != it->second.end()) ca = boost_score(fa->second, app);
         auto fb = it->second.find(b);
-        if (fb != it->second.end()) cb = fb->second;
+        if (fb != it->second.end()) cb = boost_score(fb->second, app);
         return ca > cb;
     });
 }
@@ -498,16 +549,21 @@ static bool should_learn(const std::string& raw_code, const std::string& word) {
 }
 
 /// 记一次"用户在这个拼音下选了这个词"。
-static void learn(const std::string& raw_code, const std::string& word) {
+///
+/// `app` 是应用名（exe 名小写），空串表示不知道（老 DLL）。
+static void learn(const std::string& raw_code, const std::string& word, const std::string& app) {
     if (!should_learn(raw_code, word)) return;
     std::string key = learn_key(raw_code, word);
     if (key.empty()) return;
     std::lock_guard<std::mutex> lock(g_user_mutex);
-    int& c = g_user[key][word];
-    if (c < USER_COUNT_CAP) c++;
+    UserWord& w = g_user[key][word];
+    if (w.total >= USER_COUNT_CAP) return;
+    w.total++;
+    w.apps[app]++;
     g_user_dirty = true;
     prune_user();
-    logf("learn key=%s word=%s count=%d", key.c_str(), word.c_str(), c);
+    logf("learn key=%s word=%s app=%s count=%d (this app %d)", key.c_str(), word.c_str(),
+         app.empty() ? "-" : app.c_str(), w.total, w.apps[app]);
     save_user();
 }
 
@@ -515,7 +571,10 @@ static void learn(const std::string& raw_code, const std::string& word) {
 ///
 /// 计数减 1，减到 0 就把词删掉；这个码下没有词了就把码也删掉。
 /// 只在"上屏后立刻删"时调用（DLL 侧计时 2 秒），所以不会误伤真正想要的词。
-static void unlearn(const std::string& raw_code, const std::string& word) {
+/// 分应用记账之后：先扣当前应用的次数，当前应用没记过就扣用得最多的那个应用
+/// （用户在 A 应用里学了、在 B 应用里删掉，也该把那条记录减回去）。
+static void unlearn(const std::string& raw_code, const std::string& word,
+                    const std::string& app) {
     std::string key = learn_key(raw_code, word);
     if (key.empty() || word.empty()) return;
     std::lock_guard<std::mutex> lock(g_user_mutex);
@@ -529,10 +588,31 @@ static void unlearn(const std::string& raw_code, const std::string& word) {
         logf("unlearn key=%s word=%s (no such word)", key.c_str(), word.c_str());
         return;
     }
-    if (wit->second > 1) {
-        wit->second--;
-        logf("unlearn key=%s word=%s count=%d", key.c_str(), word.c_str(), wit->second);
-    } else {
+    UserWord& w = wit->second;
+    // 选择扣哪个应用：当前应用优先，否则扣次数最多的那个
+    std::string target;
+    if (!app.empty() && w.apps.find(app) != w.apps.end()) {
+        target = app;
+    } else if (!w.apps.empty()) {
+        int best = -1;
+        for (const auto& ap : w.apps) {
+            if (ap.second > best) {
+                best = ap.second;
+                target = ap.first;
+            }
+        }
+    }
+    if (!w.apps.empty()) {
+        auto ait = w.apps.find(target);
+        if (ait != w.apps.end()) {
+            ait->second--;
+            if (ait->second <= 0) w.apps.erase(ait);
+        }
+    }
+    if (w.total > 0) w.total--;
+    logf("unlearn key=%s word=%s app=%s total=%d", key.c_str(), word.c_str(),
+         target.empty() ? "-" : target.c_str(), w.total);
+    if (w.total <= 0) {
         it->second.erase(wit);
         logf("unlearn key=%s word=%s (removed)", key.c_str(), word.c_str());
         if (it->second.empty()) g_user.erase(it);
@@ -575,17 +655,30 @@ static int dict_command(const std::string& mode, const std::string& code, const 
             std::string code;
             std::string word;
             int count;
+            std::string apps;
         };
         std::vector<Row> rows;
-        for (const auto& kv : g_user)
-            for (const auto& t : kv.second) rows.push_back({kv.first, t.first, t.second});
+        for (const auto& kv : g_user) {
+            for (const auto& t : kv.second) {
+                // 分应用明细：哪个应用里用过几次，一眼看出"这话是在哪儿打的"
+                std::string apps;
+                for (const auto& ap : t.second.apps) {
+                    if (!apps.empty()) apps += ",";
+                    apps += ap.first.empty() ? "(unknown)" : ap.first;
+                    apps += ":";
+                    apps += std::to_string(ap.second);
+                }
+                rows.push_back({kv.first, t.first, t.second.total, apps});
+            }
+        }
         std::stable_sort(rows.begin(), rows.end(),
                          [](const Row& a, const Row& b) { return a.count < b.count; });
         printf("user dict : %s\n", g_user_path.c_str());
         printf("entries   : %zu\n\n", rows.size());
         for (const auto& r : rows) {
             const char* tag = utf8_char_count(r.word) < USER_MIN_CHARS ? "  <- single char" : "";
-            printf("  %-12s -> %s  x%d%s\n", r.code.c_str(), r.word.c_str(), r.count, tag);
+            printf("  %-12s -> %s  x%d  {%s}%s\n", r.code.c_str(), r.word.c_str(), r.count,
+                   r.apps.c_str(), tag);
         }
         printf("\ndelete one : --forget <code> [word]\n");
         printf("drop chars : --prune-single\n");
@@ -669,7 +762,8 @@ static std::string user_dict_path() {
 // ───────────────────────── 查询 ─────────────────────────
 static const int MAX_CANDS = 50;
 
-static std::vector<std::string> query(const std::string& code) {
+/// `app` 是发起查询的应用名（exe 名小写），空串表示不知道（老 DLL）。
+static std::vector<std::string> query(const std::string& code, const std::string& app) {
     std::vector<std::string> out;
     if (code.empty()) return out;
 
@@ -768,7 +862,7 @@ static std::vector<std::string> query(const std::string& code) {
     }
     // 用户词库：这个拼音下用户选过的词提前（次数多的更前）。
     // 放在纠错/英文兜底之后、返回之前 —— 用户的手动选择优先级最高。
-    apply_user_boost(strip_separators(code), out);
+    apply_user_boost(strip_separators(code), app, out);
 
     // 组合留着，下次查询开头会清
     return out;
@@ -785,10 +879,12 @@ static std::vector<std::string> query(const std::string& code) {
 /// DLL 会带上 `code`（用户当时打的拼音串）和 `word`（选中的词）：
 ///   引擎不用跨连接记住"上一次查询是什么"（多应用并发时会串），
 ///   也不用猜用户到底选了第几个（下标在应用之间没有意义）。
-static bool select_candidate(uint32_t index, const std::string& code, const std::string& word) {
-    logf("select %u code=%s word=%s", index, code.c_str(), word.c_str());
+static bool select_candidate(uint32_t index, const std::string& code, const std::string& word,
+                            const std::string& app) {
+    logf("select %u code=%s word=%s app=%s", index, code.c_str(), word.c_str(),
+         app.empty() ? "-" : app.c_str());
     if (word.empty()) return true;
-    learn(code, word);
+    learn(code, word, app);
     return true;
 }
 
@@ -820,6 +916,20 @@ static bool wait_readable(HANDLE p, DWORD ms) {
         if (GetTickCount() - start >= ms) return false;
         Sleep(5);
     }
+}
+
+/// 读可选的"应用名"尾巴（协议 v5）：`[u16 app_len][app]`。
+///
+/// 老 DLL 不会发这一段，所以先 `wait_readable` 探测 —— 没有就当空串，
+/// 绝不能死等（否则又是一次"两边互等，UI 线程挂死"）。
+static std::string read_app(HANDLE p) {
+    if (!wait_readable(p, 100)) return std::string();
+    uint16_t alen = 0;
+    if (!read_exact(p, &alen, 2)) return std::string();
+    if (alen == 0 || alen > 256) return std::string();
+    std::string app(alen, '\0');
+    if (!read_exact(p, &app[0], alen)) return std::string();
+    return app;
 }
 
 static bool write_all(HANDLE p, const void* buf, DWORD n) {
@@ -881,7 +991,7 @@ static void serve_client(HANDLE p) {
         }
         std::string word(wlen, '\0');
         if (wlen > 0 && !read_exact(p, &word[0], wlen)) return;
-        select_candidate(index, code, word);
+        select_candidate(index, code, word, read_app(p));
         write_response(p, {});
         return;
     }
@@ -904,7 +1014,7 @@ static void serve_client(HANDLE p) {
         }
         std::string word(wlen, '\0');
         if (wlen > 0 && !read_exact(p, &word[0], wlen)) return;
-        unlearn(code, word);
+        unlearn(code, word, read_app(p));
         write_response(p, {});
         return;
     }
@@ -921,7 +1031,7 @@ static void serve_client(HANDLE p) {
     std::vector<std::string> cands;
     {
         std::lock_guard<std::mutex> lock(g_rime_mutex);
-        cands = query(code);
+        cands = query(code, read_app(p));
     }
     logf("q=%s n=%u", code.c_str(), (unsigned)cands.size());
     for (size_t i = 0; i < cands.size() && i < 3; i++) {
@@ -977,6 +1087,21 @@ static int run_selftest() {
     ck(should_learn("xiangmu", "项目"), "should_learn: normal word is learned");
     ck(should_learn("pikeqiu", "皮克"), "should_learn: two chars is enough");
     ck(!should_learn("xiangmu", ""), "should_learn: empty word is not learned");
+
+    // boost_score：全局 + 当前应用次数 ×2（当前应用里的词一定赢，但全局次数仍能
+    // 让"在别处反复用过的词"压过"刚用过一次的词"）
+    UserWord bw;
+    bw.total = 5;
+    bw.apps["weixin"] = 2;
+    ck(boost_score(bw, "weixin") == 9, "boost_score: own app doubled");
+    ck(boost_score(bw, "code") == 5, "boost_score: other app counts global only");
+    ck(boost_score(bw, "") == 5, "boost_score: unknown app counts global only");
+
+    UserWord once;
+    once.total = 1;
+    once.apps["code"] = 1;
+    ck(boost_score(bw, "code") > boost_score(once, "code"),
+        "boost_score: used in other apps still beats used once");
 
     if (fails == 0) {
         printf("\nall %d checks passed\n", total);

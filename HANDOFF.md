@@ -242,7 +242,7 @@ C:\inklink-engine\
 | 英文模式 | Shift 单击切（按下不动、松开才生效，期间按过别的键就不算单击）；CapsLock 开 = 大写英文；英文模式下不认领任何键（WPS/Excel 兼容） |
 | 32 位 | `inklink_tsf32.dll` 注册在 `WOW6432Node`，WPS 等可用 |
 | 模糊音 | 七组可选开关在 `rime-config\fuzzy.yaml`，跑 `tools\apply-fuzzy.ps1` 生成引擎配置并重启验证。**默认全关**（实测开 `zh_z` 会把 `zi` 的首选从「子」顶成「之」） |
-| **个人词库（M1）** | 你选过的词会被记住并顶到候选前面：`xiangmu` 选一次「橡木」→ 以后 `橡木` 排第一。存在 `%LOCALAPPDATA%\inklink\user-words.tsv`（`码\t词\t次数`，UTF-8），重启不丢，最多 4000 组码自动剪枝。分段上屏按**选中字数**反推学到哪个码（`pikeqiu` 选「皮」记在 `pi` 下，不是 `pikeqiu`）。**选错了就把字删掉**：上屏后 2 秒内把刚上屏的几个字全删光，这次学习自动撤回；单字不学；`--review-dict` / `--prune-single` / `--forget` 可以巡检和清理。**整句也学**：分段选完一句话（≥2 次选择、≥4 字）会按整段全拼再记一条，下次打同样的全拼整句候选往前排；**删掉整句也会撤回**（逐词和整句是两条独立的账） |
+| **个人词库（M1）** | 你选过的词会被记住并顶到候选前面：`xiangmu` 选一次「橡木」→ 以后 `橡木` 排第一。存在 `%LOCALAPPDATA%\inklink\user-words.tsv`（`码\t词\t次数`，UTF-8），重启不丢，最多 4000 组码自动剪枝。分段上屏按**选中字数**反推学到哪个码（`pikeqiu` 选「皮」记在 `pi` 下，不是 `pikeqiu`）。**选错了就把字删掉**：上屏后 2 秒内把刚上屏的几个字全删光，这次学习自动撤回；单字不学；`--review-dict` / `--prune-single` / `--forget` 可以巡检和清理。**整句也学**：分段选完一句话（≥2 次选择、≥4 字）会按整段全拼再记一条，下次打同样的全拼整句候选往前排；**删掉整句也会撤回**（逐词和整句是两条独立的账）。**按应用分开记账**：同一个拼音在微信里和 VSCode 里可以各记各的（`boost_score = 全局 + 本应用×2`），词库文件第四列是应用名 |
 | 安装器 | 脚本模板在 `installer\`，打包成 `dist\inklink-<版本>.zip`；`install.cmd` 一键装，带完整日志 `C:\Users\Public\inklink-install.log`，结尾 8 项自检 |
 | 单测 | `cd tsf && cargo test --release` → 27 passed（按键认领、标点映射含引号交替、拼音切分、分段上屏消耗字母数） |
 
@@ -250,7 +250,7 @@ C:\inklink-engine\
 
 | # | 任务 | 为什么现在做 |
 |:---|:---|:---|
-| 1 | M1 续：跨应用的权重区分 | 现在所有应用共用一套词库，微信里养出来的习惯会影响写代码的候选 |
+| 1 | M1 续：分词边界学习 | 现在按选中字数反推音节，跨词边界（想打「西安」却切成 `xi'an`）还不准 |
 | 2 | T5d 拼音下划线 | 拼音现在像普通英文，"最不像输入法"的地方 |
 | 3 | T5c 候选窗美化 | 圆角/间距/配色 |
 | 4 | T5e 个人云词库 + M3 AI | Obsidian 语料 + 翻译/续写，原始愿景，最后做 |
@@ -261,7 +261,7 @@ C:\inklink-engine\
 （上次一次性全加导致查询崩溃，这次每步都单测 + 端到端验证）：
 
 1. 记录到内存 + 日志 —— 连续查询不崩
-2. 落盘 `%LOCALAPPDATA%\inklink\user-words.tsv`（`码\t词\t次数`，写 `.tmp` 再 `MoveFileExA` 原子替换）
+2. 落盘 `%LOCALAPPDATA%\inklink\user-words.tsv`（`码\t词\t次数\t应用名`，写 `.tmp` 再 `MoveFileExA` 原子替换）
 3. 接排序提升：`query()` 返回前 `apply_user_boost()` 按次数 `std::stable_sort`
 
 关键设计：
@@ -276,10 +276,29 @@ C:\inklink-engine\
   —— 那是引擎的配置区，用户词库是我们的产品数据。
 - 剪枝：`USER_MAX_CODES = 4000`，超了先丢"最高次数≤1"的（用过一次就再没选过的）。
 - `std::mutex g_user_mutex`：每连接一个线程，学习和查询会并发。
-- `rime-server.exe --selftest` 有 20 项纯 ASCII 断言（`utf8_char_count` / `strip_separators` /
+- `rime-server.exe --selftest` 有 24 项纯 ASCII 断言（`utf8_char_count` / `strip_separators` /
   `split_lengths` / `learn_key` / `should_learn`），不初始化 librime、不碰管道，CI 或排障时直接跑。
 
 入口：`C:\dsh\work\inklink\rime-server\rime-server.cc` 的 `select_candidate()` → `learn()`。
+
+
+#### 跨应用权重区分（2026-10-28 补）
+
+以前所有应用共用一套词库：微信里养出来的习惯会影响写代码时候选。现在按**宿主 exe 名**分开记账。
+
+- DLL 侧 `ipc::app_tag()`：`GetModuleFileNameW(null)` 取宿主进程路径 → 去 `.exe`、转小写
+  （`weixin` / `code` / `notepad`），`OnceLock` 缓存一次。取不到就是空串（未知应用）。
+- **协议 v5**：type 1/2/3 三种报文末尾**追加可选** `[u16 app_len][app]`。引擎先 `wait_readable(p, 100)`
+  探一下，没有就当空串 —— 老 DLL 一个字节都不用改，也不会挂（1.0.1 那次死锁的教训）。
+- 存储：`UserWord { total, apps }`，文件每条 `码\t词\t次数\t应用名`，**每个 (码,词,应用) 一行**；
+  `total` 不单独存，读盘时求和。老的三列文件读进来就是"未知应用"，照样能用。
+- 排序分：`boost_score(w, app) = w.total + w.apps[app] * 2`（本应用次数双倍）。
+  只算本应用等于新应用里词库全关；只看全局又退回混在一起。
+- 撤回也分应用：先扣当前应用，当前应用没记过就扣次数最多的那个。
+- `--review-dict` 会打印分应用明细：`xiangmu -> 橡木  x2  {weixin:1,code:1}`。
+
+实测（管道带 app）：`code` 里选「项目」、`weixin` 里选「橡木」之后，
+`code` 查到 `项目|橡木|…`，`weixin` 查到 `橡木|项目|…` —— 同一份词库两个应用各排各的。
 
 
 #### 误选撤回（2026-10-27 补）

@@ -406,10 +406,32 @@ DLL 侧所有管道读也改成带超时的 `read_exact_timeout()`（`QUERY_TIME
 - 计数上限 999；串数上限 `USER_MAX_CODES = 4000`，超了先丢"最高次数≤1"的（用过一次就再没选过的）。
 - `std::mutex g_user_mutex`：每连接一线程，学习与查询并发。
 - 存储位置**不能**在 `C:\inklink-engine\`（普通用户无写权限），也不混进 rime 的 `user_dir`。
-- `rime-server.exe --selftest`：20 项纯 ASCII 断言（`utf8_char_count` / `strip_separators` /
+- `rime-server.exe --selftest`：24 项纯 ASCII 断言（`utf8_char_count` / `strip_separators` /
   `split_lengths` / `learn_key` / `should_learn`），不初始化 librime、不碰管道。
 
-**还没做的**：跨设备/跨应用权重没有区分。"选错了想撤销"和"整句上屏也学习"都已补上，见下面两节。
+**还没做的**：跨设备权重没有区分。"选错了想撤销"、"整句上屏也学习"、"跨应用权重区分"都已补上，见下面三节。
+
+#### 跨应用权重区分（2026-10-28 补，M1 续）
+
+**要解决的问题**：所有应用共用一套词库，微信里养出来的习惯会污染写代码的候选。
+同一个拼音在不同地方想打的词不一样 —— 聊天里 `xiangmu` 常选「想你」，工位上常选「项目」。
+
+| 层 | 做法 |
+|:---|:---|
+| 应用标识 | DLL 用 `GetModuleFileNameW(null)` 取宿主 exe 名，去 `.exe`、转小写（`weixin`/`code`/`notepad`），`OnceLock` 缓存；取不到就是空串（未知应用） |
+| 协议 v5 | type 1/2/3 三种报文末尾**追加可选** `[u16 app_len][app]`。引擎先 `wait_readable(p, 100)` 探测，没有就当空串 —— 老 DLL 一个字节都不用改，也不会挂（复用 1.0.1 那次死锁的教训） |
+| 存储 | `UserWord { total, apps }`，`apps` 是 `应用名 -> 次数`。文件每条 `码\t词\t次数\t应用名`，**每个 (码,词,应用) 一行**；`total` 不单独存，读盘时求和（少一个字段少一处不一致）。老的三列文件当成"未知应用"读进来 |
+| 排序分 | `boost_score(w, app) = w.total + w.apps[app] * 2`：当前应用里的次数算**双倍** |
+| 撤回 | `unlearn` 先扣当前应用；当前应用没记过就扣次数最多的那个（在 A 学、在 B 删也能减回去） |
+
+**为什么是"双倍"而不是"只看本应用"**：只看本应用等于新应用里词库全关（一次都没选过）；
+只看全局又退回所有应用混在一起。双倍是个能解释、能单测的经验值 —— 同等次数下本应用的词一定赢，
+但别的应用里反复用过的词仍能靠全局次数压过刚用一次的。
+
+`--review-dict` 现在会打印分应用明细（`xiangmu -> 橡木  x2  {weixin:1,code:1}`）。
+
+**实测**（管道带 app 参数）：`code` 里选「项目」、`weixin` 里选「橡木」之后 →
+`code` 查 `项目|橡木|…`，`weixin` 查 `橡木|项目|…`，同一份词库两个应用各排各的。
 
 #### 整句学习（2026-10-28 补，M1 续）
 
@@ -584,7 +606,7 @@ Obsidian 语料 + AI 兜底，默认关闭联网（符合项目铁律）。
 | T5c | 候选窗美化 | |
 | T5e | 个人云词库 | Obsidian 语料 + AI 兜底 |
 | T5f | librime 工程化 | 现在靠手工解 Weasel 包 |
-| M1 续 | 跨应用的权重区分 | 现在所有应用共用一套词库；分词边界学习也没做 |
+| M1 续 | 分词边界学习 | 现在按选中字数反推音节，跨词边界（`xianga` 想打「西安」）还不准 |
 
 （T5a 用户词库学习已 ✅ 2026-10-27 实现，见上面同名小节；T5g 模糊音见「✅ 2026-10-27 已解决」）
 
@@ -614,7 +636,7 @@ Obsidian 语料 + AI 兜底，默认关闭联网（符合项目铁律）。
 **测试能力现状**：
 
 - 有：`cargo test` 39 个单测（按键认领、标点映射与引号交替、半角符号不转换、拼音切分、分段上屏消耗字母数、误选撤回与整句撤回的记账、整句上报门槛、候选窗上下翻与贴边）
-- 有：`rime-server.exe --selftest` 20 项引擎侧断言（`utf8_char_count` / `strip_separators` /
+- 有：`rime-server.exe --selftest` 24 项引擎侧断言（`utf8_char_count` / `strip_separators` /
   `split_lengths` / `learn_key`），纯 ASCII，不初始化 librime
 - 有：`tsf/test/test-harness.cc` GUI 自动化测试台（需要交互式桌面，agent 抢不到焦点）
 - 有：`tools/engine-pipe.ps1`（`Invoke-InklinkQuery`）直连引擎管道，纠错/模糊音/学习都靠它回归
