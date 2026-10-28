@@ -135,14 +135,33 @@ static size_t utf8_char_count(const std::string& s) {
     return n;
 }
 
-/// 去掉分词符（`xiang-mu` → `xiangmu`）。
+/// 去掉分词符（`xiang-mu` → `xiangmu`）。`'` 也算分词符：查询 librime 时要还原成整串。
 static std::string strip_separators(const std::string& s) {
     std::string out;
     out.reserve(s.size());
     for (char c : s) {
-        if (c == '-' || c == '_') continue;
+        if (c == '-' || c == '_' || c == '\'') continue;
         out.push_back(c);
     }
+    return out;
+}
+
+/// 把用户打的分词符统一成音节边界 `'`（`xi-an` / `xi_an` → `xi'an`）。
+///
+/// 边界是**用户表达的意图**：`xian` 是一个音节（先），`xi'an` 是两个（西安）。
+/// 所以学习要按带边界的写法记（见 learn_key），下次同样的边界才复用；
+/// 而送给 librime 查询时两边都还原成 `xian`（见 query）。
+static std::string normalize_boundaries(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    for (char c : s) {
+        if (c == '-' || c == '_' || c == ' ' || c == '\'') {
+            if (!out.empty() && out.back() != '\'') out.push_back('\'');
+            continue;
+        }
+        out.push_back(c);
+    }
+    while (!out.empty() && out.back() == '\'') out.pop_back();
     return out;
 }
 
@@ -476,19 +495,46 @@ static int boost_score(const UserWord& w, const std::string& app) {
 }
 
 /// 把用户选过的词提到前面（同一拼音内按分数降序）。
+///
+/// `code` 是**带边界的原始码**（`xi'an`）。两种记法都算：
+///   - 精确匹配（`xi'an` 下学过的）权重 ×4 —— 用户用边界明确表达的分隔意图最准；
+///   - 抹掉边界（`xian` 下学过的）权重 ×1 —— 历史上按整串学的也算数。
+/// 精确匹配、但 librime 这次没给出这个词的，直接补到最前面（最多 3 个）：
+/// 用户明明为这个边界选过它，藏起来等于没学。
 static void apply_user_boost(const std::string& code, const std::string& app,
                              std::vector<std::string>& cands) {
     std::lock_guard<std::mutex> lock(g_user_mutex);
-    auto it = g_user.find(code);
-    if (it == g_user.end() || it->second.empty()) return;
-    std::stable_sort(cands.begin(), cands.end(), [&](const std::string& a, const std::string& b) {
-        int ca = 0, cb = 0;
-        auto fa = it->second.find(a);
-        if (fa != it->second.end()) ca = boost_score(fa->second, app);
-        auto fb = it->second.find(b);
-        if (fb != it->second.end()) cb = boost_score(fb->second, app);
-        return ca > cb;
-    });
+    std::string exact = normalize_boundaries(code);
+    std::string flat = strip_separators(exact);
+    auto it_exact = g_user.find(exact);
+    auto it_flat = (flat == exact) ? g_user.end() : g_user.find(flat);
+    bool has_exact = it_exact != g_user.end() && !it_exact->second.empty();
+    bool has_flat = it_flat != g_user.end() && !it_flat->second.empty();
+    if (!has_exact && !has_flat) return;
+    auto score = [&](const std::string& w) {
+        int s = 0;
+        if (has_exact) {
+            auto f = it_exact->second.find(w);
+            if (f != it_exact->second.end()) s += boost_score(f->second, app) * 4;
+        }
+        if (has_flat) {
+            auto f = it_flat->second.find(w);
+            if (f != it_flat->second.end()) s += boost_score(f->second, app);
+        }
+        return s;
+    };
+    std::stable_sort(cands.begin(), cands.end(),
+                     [&](const std::string& a, const std::string& b) { return score(a) > score(b); });
+    if (has_exact) {
+        size_t added = 0;
+        for (const auto& kv : it_exact->second) {
+            if (added >= 3) break;
+            if (std::find(cands.begin(), cands.end(), kv.first) != cands.end()) continue;
+            cands.insert(cands.begin() + added, kv.first);
+            added++;
+        }
+        if (added) logf("boost %s: inserted %zu learned words", exact.c_str(), added);
+    }
 }
 
 // ───────────────────────── 用户词库：学习 ─────────────────────────
@@ -521,18 +567,36 @@ static std::vector<size_t> split_lengths(const std::string& code) {
 ///   pikeqiu + 皮克 (2 字) → 学 `pike`  → 皮克
 ///   xiangmu + 项目 (2 字) → 学 `xiangmu` → 项目
 /// 字数 ≥ 音节数时按整串记（多打的尾巴字母一起吃掉，反正下次是同一个串）。
+///
+/// **分词边界要留住**（2026-10-28，M1 续：分词边界学习）：
+///   xi'an   + 西安 (2 字) → 学 `xi'an`  → 下次打 xi'an 才优先，打 xian 仍是「先」
+///   xi-an   + 西安        → 同上（`-` 统一成 `'`）
+///   xiang-mu + 项目       → 学 `xiang-mu`
+/// 边界是用户主动表达的分隔意图，抹掉它等于把"西安"和"先"混成同一个码。
 static std::string learn_key(const std::string& raw_code, const std::string& word) {
-    std::string code = strip_separators(raw_code);
-    if (code.empty() || word.empty()) return std::string();
+    std::string code = normalize_boundaries(raw_code);
+    std::string flat = strip_separators(code);
+    if (flat.empty() || word.empty()) return std::string();
     size_t chars = utf8_char_count(word);
     if (chars == 0) return std::string();
-    std::vector<size_t> lens = split_lengths(code);
-    if (lens.empty()) return code;              // 不像拼音（纯英文），整串学
-    if (chars >= lens.size()) return code;      // 整串都吃掉了
+    std::vector<size_t> lens = split_lengths(flat);
     size_t used = 0;
-    for (size_t i = 0; i < chars && i < lens.size(); i++) used += lens[i];
-    if (used == 0 || used > code.size()) return code;
-    return code.substr(0, used);
+    if (lens.empty() || chars >= lens.size()) {
+        used = flat.size();                     // 不像拼音（纯英文）或整串都吃掉了
+    } else {
+        for (size_t i = 0; i < chars && i < lens.size(); i++) used += lens[i];
+    }
+    if (used == 0) used = flat.size();
+    // 把"吃掉几个字母"映射回带边界的原串（字母才算数，`'` 跳过）
+    size_t letters = 0, pos = 0;
+    for (; pos < code.size(); pos++) {
+        if (code[pos] == '\'') continue;
+        if (letters >= used) break;
+        letters++;
+    }
+    std::string key = code.substr(0, pos);
+    while (!key.empty() && key.back() == '\'') key.pop_back();
+    return key.empty() ? flat : key;
 }
 
 /// 这次选择值不值得学？
@@ -767,7 +831,12 @@ static std::vector<std::string> query(const std::string& code, const std::string
     std::vector<std::string> out;
     if (code.empty()) return out;
 
-    bool looks_pinyin = is_pinyin_code(code);
+    // 带边界的原始码（`xi'an`）只给用户词库用；送给 librime 的一律还原成整串
+    // （它不认 `'` 当分隔，实测 `xi'an` 与 `xian` 的候选集一样）。
+    const std::string flat = strip_separators(code);
+    if (flat.empty()) return out;
+
+    bool looks_pinyin = is_pinyin_code(flat);
 
     // ── 纠错探针 ──
     // 三种情况分开处理：
@@ -777,8 +846,8 @@ static std::vector<std::string> query(const std::string& code, const std::string
     //  - 中间多/错/换位一个字母（`zhemge`/`niihao`/`jintain`）：rime 只能拿多余
     //    字母硬切出一串怪词，这时候纠错结果才更可信。
     std::vector<std::string> corrected;
-    if (code.size() >= 3 && !is_full_pinyin(code) && !ends_with_half_syllable(code)) {
-        std::vector<std::string> vars = edit_variants(code);
+    if (flat.size() >= 3 && !is_full_pinyin(flat) && !ends_with_half_syllable(flat)) {
+        std::vector<std::string> vars = edit_variants(flat);
         if (vars.size() > 8) vars.resize(8);
         for (const std::string& v : vars) {
             for (const std::string& w : collect_page0(v, 6)) {
@@ -793,7 +862,7 @@ static std::vector<std::string> query(const std::string& code, const std::string
     }
 
     g_clear(g_session);
-    if (!g_simulate(g_session, code.c_str())) {
+    if (!g_simulate(g_session, flat.c_str())) {
         g_clear(g_session);
         if (corrected.empty()) return out;
         return corrected;   // 连 rime 都喂不进去，直接给纠错结果
@@ -830,13 +899,14 @@ static std::vector<std::string> query(const std::string& code, const std::string
 
     // 英文候选：把原始输入作为一个候选追加（github、vscode 这类英文词）。
     // librime 只认拼音，纯英文会被切成 给/过/跟，用户就没法直接上屏英文了。
-    if (code.size() >= 2) {
+    // 用户打了分词边界（`xi'an`）就是在说"这是拼音"，不再塞英文字母候选。
+    if (flat.size() >= 2 && flat == code) {
         bool is_pure_alpha = true;
-        for (char c : code) {
+        for (char c : flat) {
             if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'))) { is_pure_alpha = false; break; }
         }
         if (is_pure_alpha && out.size() < (size_t)MAX_CANDS) {
-            auto it = std::find(out.begin(), out.end(), code);
+            auto it = std::find(out.begin(), out.end(), flat);
             if (it == out.end()) {
                 // 不像拼音时英文原样要留在第一屏：没有纠错结果（github/vscode）排最前；
                 // 有纠错结果说明可能是打错的拼音（niihao → 你好），让纠错占第一，
@@ -850,19 +920,21 @@ static std::vector<std::string> query(const std::string& code, const std::string
                 // 前缀一个音节都凑不出两个，仍然排第一。
                 size_t pos = out.size();   // 默认：排在候选最后
                 if (!looks_pinyin && corrected.empty()) {
-                    bool pinyin_typo = split_lengths(strip_separators(code)).size() >= 2;
+                    bool pinyin_typo = split_lengths(flat).size() >= 2;
                     pos = pinyin_typo ? out.size() : 0;
                 } else if (!looks_pinyin) {
                     pos = 1;
                 }
                 if (pos > out.size()) pos = out.size();
-                out.insert(out.begin() + pos, code);
+                out.insert(out.begin() + pos, flat);
             }
         }
     }
     // 用户词库：这个拼音下用户选过的词提前（次数多的更前）。
     // 放在纠错/英文兜底之后、返回之前 —— 用户的手动选择优先级最高。
-    apply_user_boost(strip_separators(code), app, out);
+    // 传**带边界**的原始码：`xi'an` 下学过的「西安」只在打 `xi'an` 时提前，
+    // 打 `xian` 仍然是「先」（这就是分词边界学习）。
+    apply_user_boost(code, app, out);
 
     // 组合留着，下次查询开头会清
     return out;
@@ -1066,6 +1138,12 @@ static int run_selftest() {
     ck(utf8_char_count("github") == 6, "utf8_char_count: ascii per char");
     ck(strip_separators("xiang-mu") == "xiangmu", "strip_separators: drop dash");
     ck(strip_separators("xiang_mu") == "xiangmu", "strip_separators: drop underscore");
+    ck(strip_separators("xi'an") == "xian", "strip_separators: drop apostrophe");
+    ck(normalize_boundaries("xi-an") == "xi'an", "normalize_boundaries: dash -> apostrophe");
+    ck(normalize_boundaries("xi_an") == "xi'an", "normalize_boundaries: underscore -> apostrophe");
+    ck(normalize_boundaries("xi--an") == "xi'an", "normalize_boundaries: collapse repeats");
+    ck(normalize_boundaries("xian") == "xian", "normalize_boundaries: plain unchanged");
+    ck(normalize_boundaries("-xian-") == "xian", "normalize_boundaries: trim edges");
 
     std::vector<size_t> l1 = split_lengths("pikeqiu");
     ck(l1.size() == 3 && l1[0] == 2 && l1[1] == 2 && l1[2] == 3,
@@ -1078,7 +1156,9 @@ static int run_selftest() {
     ck(learn_key("pikeqiu", "皮") == "pi", "learn_key: 1 char -> first 1 syllable");
     ck(learn_key("pikeqiu", "皮克") == "pike", "learn_key: 2 chars -> first 2 syllables");
     ck(learn_key("xiangmu", "项目") == "xiangmu", "learn_key: whole code");
-    ck(learn_key("xiang-mu", "项目") == "xiangmu", "learn_key: separators stripped");
+    ck(learn_key("xiang-mu", "项目") == "xiang'mu", "learn_key: boundary kept");
+    ck(learn_key("xi'an", "西安") == "xi'an", "learn_key: apostrophe boundary kept");
+    ck(learn_key("xi-an", "西安") == "xi'an", "learn_key: dash becomes apostrophe");
     ck(learn_key("zhemge", "这个") == "zhemge", "learn_key: mistyped code kept as-is");
     ck(learn_key("x", "西") == "x", "learn_key: single letter");
 

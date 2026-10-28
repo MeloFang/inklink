@@ -101,7 +101,7 @@ powershell -ExecutionPolicy Bypass -File tools\release.ps1
 $env:PATH = "$env:USERPROFILE\.cargo\bin;$env:PATH"
 
 cd C:\dsh\work\inklink\tsf
-cargo test --release                       # 44 个单测（按键认领 / 标点 / 引号 / 拼音切分 / 分段上屏 / 误选撤回 / 整句上报 / 候选窗摆放与点击 / 注入退格抑制）
+cargo test --release                       # 45 个单测（按键认领 / 标点 / 引号 / 拼音切分 / 分词边界 / 分段上屏 / 误选撤回 / 整句上报 / 候选窗摆放与点击 / 注入退格抑制）
 cargo build --release --lib --target-dir target-static
 cargo build --release --lib --target i686-pc-windows-msvc --target-dir target-static
 ```
@@ -109,8 +109,9 @@ cargo build --release --lib --target i686-pc-windows-msvc --target-dir target-st
 引擎是 C++（`rime-server/rime-server.cc`），编译命令写在文件头注释里，需要 32 位 MSVC 环境
 （`vcvars32.bat`）；日常改 DLL 不需要动它。
 
-引擎侧还有一份可单测的纯逻辑：`rime-server.exe --selftest` 跑 24 项断言
-（`utf8_char_count` / `strip_separators` / `split_lengths` / `learn_key`），纯 ASCII 输出，
+引擎侧还有一份可单测的纯逻辑：`rime-server.exe --selftest` 跑 32 项断言
+（`utf8_char_count` / `strip_separators` / `normalize_boundaries` / `split_lengths` / `learn_key` /
+`should_learn` / `boost_score`），纯 ASCII 输出，
 不初始化 librime、不碰管道，改学习逻辑后先跑它。
 
 引擎侧配置（模糊音）在 `rime-config\fuzzy.yaml`，用 `tools\apply-fuzzy.ps1` 生成到

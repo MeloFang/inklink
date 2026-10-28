@@ -242,7 +242,7 @@ C:\inklink-engine\
 | 英文模式 | Shift 单击切（按下不动、松开才生效，期间按过别的键就不算单击）；CapsLock 开 = 大写英文；英文模式下不认领任何键（WPS/Excel 兼容）。**"按过别的键"要在 `OnTestKeyDown` 里记**，因为 `Shift+=`、`Shift+-` 这类我们根本不认领的键没有 `OnKeyDown` |
 | 32 位 | `inklink_tsf32.dll` 注册在 `WOW6432Node`，WPS 等可用 |
 | 模糊音 | 七组可选开关在 `rime-config\fuzzy.yaml`，跑 `tools\apply-fuzzy.ps1` 生成引擎配置并重启验证。**默认全关**（实测开 `zh_z` 会把 `zi` 的首选从「子」顶成「之」） |
-| **个人词库（M1）** | 你选过的词会被记住并顶到候选前面：`xiangmu` 选一次「橡木」→ 以后 `橡木` 排第一。存在 `%LOCALAPPDATA%\inklink\user-words.tsv`（`码\t词\t次数`，UTF-8），重启不丢，最多 4000 组码自动剪枝。分段上屏按**选中字数**反推学到哪个码（`pikeqiu` 选「皮」记在 `pi` 下，不是 `pikeqiu`）。**选错了就把字删掉**：上屏后 2 秒内把刚上屏的几个字全删光，这次学习自动撤回；单字不学；`--review-dict` / `--prune-single` / `--forget` 可以巡检和清理。**整句也学**：分段选完一句话（≥2 次选择、≥4 字）会按整段全拼再记一条，下次打同样的全拼整句候选往前排；**删掉整句也会撤回**（逐词和整句是两条独立的账）。**按应用分开记账**：同一个拼音在微信里和 VSCode 里可以各记各的（`boost_score = 全局 + 本应用×2`），词库文件第四列是应用名 |
+| **个人词库（M1）** | 你选过的词会被记住并顶到候选前面：`xiangmu` 选一次「橡木」→ 以后 `橡木` 排第一。存在 `%LOCALAPPDATA%\inklink\user-words.tsv`（`码\t词\t次数`，UTF-8），重启不丢，最多 4000 组码自动剪枝。分段上屏按**选中字数**反推学到哪个码（`pikeqiu` 选「皮」记在 `pi` 下，不是 `pikeqiu`）。**选错了就把字删掉**：上屏后 2 秒内把刚上屏的几个字全删光，这次学习自动撤回；单字不学；`--review-dict` / `--prune-single` / `--forget` 可以巡检和清理。**整句也学**：分段选完一句话（≥2 次选择、≥4 字）会按整段全拼再记一条，下次打同样的全拼整句候选往前排；**删掉整句也会撤回**（逐词和整句是两条独立的账）。**按应用分开记账**：同一个拼音在微信里和 VSCode 里可以各记各的（`boost_score = 全局 + 本应用×2`），词库文件第四列是应用名。**分词边界也是信息**：打 `xi'an` 选「西安」只记在 `xi'an` 下（`-` 会自动换成 `'`），下次打 `xi'an`/`xi-an` 西安排第一，打 `xian` 仍然是「先」 |
 | 安装器 | 脚本模板在 `installer\`，打包成 `dist\inklink-<版本>.zip`；`install.cmd` 一键装，带完整日志 `C:\Users\Public\inklink-install.log`，结尾 8 项自检 |
 | 单测 | `cd tsf && cargo test --release` → 27 passed（按键认领、标点映射含引号交替、拼音切分、分段上屏消耗字母数） |
 
@@ -250,7 +250,7 @@ C:\inklink-engine\
 
 | # | 任务 | 为什么现在做 |
 |:---|:---|:---|
-| 1 | M1 续：分词边界学习 | 现在按选中字数反推音节，跨词边界（想打「西安」却切成 `xi'an`）还不准 |
+| 1 | M1 续：组合串按音节显示分隔符 | `xian` 现在显示成 `xian`，搜狗显示 `xi'an`；纯显示层，不影响查询 |
 | 2 | T5d 拼音下划线 | 拼音现在像普通英文，"最不像输入法"的地方 |
 | 3 | T5c 候选窗美化 | 圆角/间距/配色 |
 | 4 | T5e 个人云词库 + M3 AI | Obsidian 语料 + 翻译/续写，原始愿景，最后做 |
@@ -276,8 +276,9 @@ C:\inklink-engine\
   —— 那是引擎的配置区，用户词库是我们的产品数据。
 - 剪枝：`USER_MAX_CODES = 4000`，超了先丢"最高次数≤1"的（用过一次就再没选过的）。
 - `std::mutex g_user_mutex`：每连接一个线程，学习和查询会并发。
-- `rime-server.exe --selftest` 有 24 项纯 ASCII 断言（`utf8_char_count` / `strip_separators` /
-  `split_lengths` / `learn_key` / `should_learn`），不初始化 librime、不碰管道，CI 或排障时直接跑。
+- `rime-server.exe --selftest` 有 32 项纯 ASCII 断言（`utf8_char_count` / `strip_separators` /
+  `normalize_boundaries` / `split_lengths` / `learn_key` / `should_learn` / `boost_score`），
+  不初始化 librime、不碰管道，CI 或排障时直接跑。
 
 入口：`C:\dsh\work\inklink\rime-server\rime-server.cc` 的 `select_candidate()` → `learn()`。
 
@@ -299,6 +300,25 @@ C:\inklink-engine\
 
 实测（管道带 app）：`code` 里选「项目」、`weixin` 里选「橡木」之后，
 `code` 查到 `项目|橡木|…`，`weixin` 查到 `橡木|项目|…` —— 同一份词库两个应用各排各的。
+
+
+#### 分词边界学习（2026-10-28 补）
+
+`xian` 是一个音节（先），`xi'an` 是两个（西安）。用户主动打边界就是在说"按 xi + an 切"，
+所以我们**不再把它抹掉**：
+
+- DLL：`normalize_boundaries()` 把 `-` / `_` 统一成 `'` 再发给引擎（`xi-an`、`xi_an`、`xi'an` 等价）；
+  引擎内部才 `strip_separators()` 还原成 `xian` 喂 librime。
+- 记账键带边界：`learn_key("xi'an", "西安") == "xi'an"`、`learn_key("xiang-mu", "项目") == "xiang'mu"`，
+  分段上屏的 `pikeqiu + 皮` 仍然是 `pi`。
+- 排序时两个键都看：带边界 ×4、抹掉边界 ×1。所以 `xi'an` 下学过的「西安」只在打 `xi'an` 时赢，
+  打 `xian` 仍然是「先」。学过的词若 librime 没给，直接补到最前（最多 3 个）。
+- 打了边界就不再追加"原始字母"候选 —— 用户已经在说这是拼音了。
+
+实测：`xi'an` + 西安 学一次 → `xi'an` / `xi-an` 首候选都是「西安」，`xian` 仍是「先」。
+
+⚠️ **librime 不认 `'` 当分隔**：`xi'an` 和 `xian` 喂进去候选集完全一样（schema 里的
+`delimiter: " '"` 只在真实按键流里生效），所以边界只能靠我们自己记账。
 
 
 #### 误选撤回（2026-10-27 补）

@@ -406,8 +406,9 @@ DLL 侧所有管道读也改成带超时的 `read_exact_timeout()`（`QUERY_TIME
 - 计数上限 999；串数上限 `USER_MAX_CODES = 4000`，超了先丢"最高次数≤1"的（用过一次就再没选过的）。
 - `std::mutex g_user_mutex`：每连接一线程，学习与查询并发。
 - 存储位置**不能**在 `C:\inklink-engine\`（普通用户无写权限），也不混进 rime 的 `user_dir`。
-- `rime-server.exe --selftest`：24 项纯 ASCII 断言（`utf8_char_count` / `strip_separators` /
-  `split_lengths` / `learn_key` / `should_learn`），不初始化 librime、不碰管道。
+- `rime-server.exe --selftest`：32 项纯 ASCII 断言（`utf8_char_count` / `strip_separators` /
+  `normalize_boundaries` / `split_lengths` / `learn_key` / `should_learn` / `boost_score`），
+  不初始化 librime、不碰管道。
 
 **还没做的**：跨设备权重没有区分。"选错了想撤销"、"整句上屏也学习"、"跨应用权重区分"都已补上，见下面三节。
 
@@ -466,6 +467,31 @@ DLL 侧所有管道读也改成带超时的 `read_exact_timeout()`（`QUERY_TIME
 **打错的拼音不再让原始字母抢第一屏**（2026-10-28 修）：`is_pinyin_code` 判"不像拼音"只说明它不能整串切成音节，不代表用户想打英文。再加一条判据：前缀能连着切出 ≥2 个完整音节就是拼音（`shashahs` → `sha|sha|…`），此时原始字母排到候选最后；`github`/`hello`/`test`/`world`/`thanks` 前缀凑不出两个音节，仍然排第一（保留"打英文一眼可见"的老行为）。实测 `shashahs` → 傻傻还是 傻傻 莎莎 沙沙…，英文词全部不回归。
 
 **还没做的**：长句分词边界学习。
+
+#### 分词边界学习（2026-10-28 补，M1 续）
+
+**要解决的问题**：`xian` 是一个音节（先），`xi'an` 是两个（西安）。用户主动打上边界
+就是在表达"我要按 xi + an 切"，但我们以前**把边界抹掉了** —— `strip_separators()` 在查
+引擎之前就把 `-` / `_` 删干净，于是 `xi'an` 和 `xian` 走的是同一个码，学到的也是同一份记录。
+
+| 层 | 做法 |
+|:---|:---|
+| 协议 | 送进引擎的码改成**带边界**（`-` / `_` 先统一成 `'`，见 DLL 的 `normalize_boundaries()`）；引擎自己再还原成整串喂 librime |
+| 记账键 | `learn_key()` 把"吃掉几个字母"映射回带边界的原串：`xi'an` + 西安 → 学 `xi'an`；`xiang-mu` + 项目 → 学 `xiang'mu`；`pikeqiu` + 皮 → 仍是 `pi` |
+| 排序 | `apply_user_boost()` 同时看两个键：**带边界**的权重 ×4、抹掉边界的 ×1。所以打 `xi'an` 时边界学过的「西安」稳赢，打 `xian` 时那份记录根本不参与 |
+| 兜底 | 带边界学过的词如果 librime 这次没给（生僻词），直接补进候选最前面（最多 3 个）——用户明明为这个边界选过它 |
+| 英文候选 | 打了边界就不再追加"原始字母"候选：用户已经在说"这是拼音"了 |
+
+为什么 ×4 而不是各记一份：两份记录会让"边界"这个信号消失（`xi'an` 学完顺手把 `xian` 也带跑了）。
+边际写法本身就带信息量，只有用户真的照着打才该生效。
+
+实测：`xi'an` + 西安 学一次后 → `xi'an` 与 `xi-an` 首候选都是「西安」（n=30），
+`xian` 仍是「先」（n=31）。
+
+**坑**：librime **不认** `'` 当分隔（`xi'an` 与 `xian` 喂进去候选集一样，实测 `delimiter: " '"`
+只在真实按键流里生效），所以边界只能靠我们自己记账，别指望引擎帮忙切。
+
+**还没做的**：组合串按音节显示分隔符（`sha'sh'h'` 那样，属于显示层）。
 
 #### 误选撤回 + 词库巡检（2026-10-27 补，M1 续）
 
@@ -608,7 +634,7 @@ Obsidian 语料 + AI 兜底，默认关闭联网（符合项目铁律）。
 | T5c | 候选窗美化 | |
 | T5e | 个人云词库 | Obsidian 语料 + AI 兜底 |
 | T5f | librime 工程化 | 现在靠手工解 Weasel 包 |
-| M1 续 | 分词边界学习 | 现在按选中字数反推音节，跨词边界（`xianga` 想打「西安」）还不准 |
+| M1 续 | 组合串按音节显示分隔符 | 现在 `xian` 就显示 `xian`，搜狗显示 `xi'an`；纯显示层，不影响查询 |
 
 （T5a 用户词库学习已 ✅ 2026-10-27 实现，见上面同名小节；T5g 模糊音见「✅ 2026-10-27 已解决」）
 
@@ -644,9 +670,9 @@ Obsidian 语料 + AI 兜底，默认关闭联网（符合项目铁律）。
 
 **测试能力现状**：
 
-- 有：`cargo test` 44 个单测（按键认领、标点映射与引号交替、半角符号不转换、数字后半角标点、Shift 组合键不误判单击切换、拼音切分、分段上屏消耗字母数、误选撤回与整句撤回的记账、整句上报门槛、候选窗上下翻与贴边、候选窗点击命中格、注入退格按次数放行与过期）
-- 有：`rime-server.exe --selftest` 24 项引擎侧断言（`utf8_char_count` / `strip_separators` /
-  `split_lengths` / `learn_key`），纯 ASCII，不初始化 librime
+- 有：`cargo test` 45 个单测（按键认领、标点映射与引号交替、半角符号不转换、数字后半角标点、Shift 组合键不误判单击切换、拼音切分、分词边界归一、分段上屏消耗字母数、误选撤回与整句撤回的记账、整句上报门槛、候选窗上下翻与贴边、候选窗点击命中格、注入退格按次数放行与过期）
+- 有：`rime-server.exe --selftest` 32 项引擎侧断言（`utf8_char_count` / `strip_separators` /
+  `normalize_boundaries` / `split_lengths` / `learn_key` / `should_learn` / `boost_score`），纯 ASCII，不初始化 librime
 - 有：`tsf/test/test-harness.cc` GUI 自动化测试台（需要交互式桌面，agent 抢不到焦点）
 - 有：`tools/engine-pipe.ps1`（`Invoke-InklinkQuery`）直连引擎管道，纠错/模糊音/学习都靠它回归
 - 缺：端到端验证（TSF 是否真把字符插进应用）只能人工测；个人词库的学习效果目前靠管道手工上报验证

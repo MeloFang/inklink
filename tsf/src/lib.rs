@@ -2090,7 +2090,31 @@ fn preceding_char_is_digit(ctx: &ITfContext, ec: u32) -> bool {
 /// 分隔符只做显示与最终原样上屏，不参与音节匹配：
 /// `xiang-mu` 送进引擎前变成 `xiangmu`，才能查到「项目」。
 fn strip_separators(code: &str) -> String {
-    code.chars().filter(|c| *c != '-' && *c != '_').collect()
+    code.chars()
+        .filter(|c| *c != '-' && *c != '_' && *c != '\'')
+        .collect()
+}
+
+/// 把缓冲里的分词符统一成音节边界 `'`（`xi-an` → `xi'an`）。
+///
+/// 边界是**用户表达的意图**：`xian` 是一个音节（先），`xi'an` 是两个（西安）。
+/// 所以送进引擎的码要带着边界（引擎按带边界的码记账，见 `learn_key`），
+/// 只有真正送去 librime 的那一步才还原成整串。
+fn normalize_boundaries(code: &str) -> String {
+    let mut out = String::with_capacity(code.len());
+    for ch in code.chars() {
+        if ch == '-' || ch == '_' || ch == '\'' || ch == ' ' {
+            if !out.is_empty() && !out.ends_with('\'') {
+                out.push('\'');
+            }
+            continue;
+        }
+        out.push(ch);
+    }
+    while out.ends_with('\'') {
+        out.pop();
+    }
+    out
 }
 
 /// 缓冲里消耗掉 `letters` 个字母后，该剪到的字节下标。
@@ -2187,17 +2211,30 @@ fn apply_pick(
 }
 
 fn query_with_fallback(code: &str) -> (Vec<String>, usize) {
-    let code = strip_separators(code);
-    if code.is_empty() {
+    // 带着边界发出去（`xi'an`）：引擎用它查 librime（还原成 `xian`），
+    // 同时用它当用户词库的键 —— 这样"在 xi'an 下选过西安"不会污染 `xian`。
+    let code = normalize_boundaries(code);
+    if strip_separators(&code).is_empty() {
         return (Vec::new(), 0);
     }
     let mut probe = code;
-    while probe.len() >= 1 {
+    loop {
+        let flat_len = strip_separators(&probe).len();
+        if flat_len == 0 {
+            break;
+        }
         let r = ipc::query(&probe);
         if !r.is_empty() {
-            return (r, probe.len());
+            return (r, flat_len);
         }
+        // 往前退一个字母再试（末尾打错的字母丢掉），退到分隔符也一起退掉
         probe.pop();
+        while probe.ends_with('\'') {
+            probe.pop();
+        }
+        if probe.is_empty() {
+            break;
+        }
     }
     (Vec::new(), 0)
 }
@@ -2840,8 +2877,25 @@ mod tests {
         assert_eq!(strip_separators("xiang_mu"), "xiangmu");
         assert_eq!(strip_separators("xiang-mu-"), "xiangmu");
         assert_eq!(strip_separators("xiangmu"), "xiangmu");
+        assert_eq!(strip_separators("xi'an"), "xian");
         assert_eq!(strip_separators("-"), "");
         assert_eq!(strip_separators(""), "");
+    }
+
+    #[test]
+    fn 分词符统一成音节边界() {
+        // 打 `xi-an` / `xi_an` 都是「要 xi 和 an 两个音节」
+        assert_eq!(normalize_boundaries("xi-an"), "xi'an");
+        assert_eq!(normalize_boundaries("xi_an"), "xi'an");
+        assert_eq!(normalize_boundaries("xi--an"), "xi'an");
+        assert_eq!(normalize_boundaries("xi'an"), "xi'an");
+        // 没打边界的不要凭空造边界
+        assert_eq!(normalize_boundaries("xian"), "xian");
+        // 首尾的边界没有意义，去掉
+        assert_eq!(normalize_boundaries("-xian-"), "xian");
+        assert_eq!(normalize_boundaries(""), "");
+        // 边界位置原样保留（`xiang-mu` 是 xiang | mu）
+        assert_eq!(normalize_boundaries("xiang-mu"), "xiang'mu");
     }
 
     #[test]
