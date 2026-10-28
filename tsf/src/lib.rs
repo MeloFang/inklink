@@ -18,7 +18,8 @@ use windows::Win32::System::Com::{IClassFactory, IClassFactory_Impl};
 use windows::Win32::UI::TextServices::{
     ITfComposition, ITfCompositionSink, ITfCompositionSink_Impl, ITfContext, ITfContextComposition,
     ITfEditSession, ITfEditSession_Impl, ITfKeyEventSink, ITfKeyEventSink_Impl, ITfKeystrokeMgr,
-    ITfRange, ITfTextInputProcessorEx, ITfTextInputProcessorEx_Impl, ITfTextInputProcessor_Impl,
+    ITfRange, ITfRangeACP, ITfTextInputProcessorEx, ITfTextInputProcessorEx_Impl,
+    ITfTextInputProcessor_Impl,
     ITfThreadMgr, TF_ANCHOR_END, TF_ANCHOR_START, TF_DEFAULT_SELECTION, TF_ES_ASYNC,
     TF_ES_READWRITE, TF_SELECTION,
 };
@@ -42,6 +43,11 @@ const GRID_COLS: usize = 5;
 const PAGE_SIZE_COLLAPSED: usize = 5;
 /// 展开时每页 25 个（5 行 × 5 列）
 const PAGE_SIZE_EXPANDED: usize = 25;
+
+/// 光标在屏幕上的位置：`(x, 顶边 y, 底边 y)`。
+///
+/// 顶边不能省：候选窗在屏幕底部时要往上翻，翻的基准是顶边（见 `candwin::place`）。
+type CaretPos = (i32, i32, i32);
 
 // ─────────────────────────── COM 类工厂 ───────────────────────────
 
@@ -124,8 +130,8 @@ struct TextServiceInner {
     pending: Mutex<Option<EditAction>>,
     /// 是否由我们主动结束组合（提交/取消），用于区分外部终止
     self_terminating: AtomicBool,
-    /// 最近一次 GetTextExt 拿到的组合串屏幕位置
-    last_pos: Mutex<Option<(i32, i32)>>,
+    /// 最近一次 GetTextExt 拿到的组合串屏幕位置（左下起 `(x, 顶边, 底边)`）
+    last_pos: Mutex<Option<CaretPos>>,
     /// 英文模式：Shift 单击切换，开启后所有键原样交给应用
     english_mode: AtomicBool,
     /// 本次按下 Shift 期间是否打过字（用于区分"单击"和"按住"）
@@ -863,32 +869,62 @@ impl ITfEditSession_Impl for TextService_Impl {
                         Ok(()) => match sel[0].range.as_ref() {
                             None => why = "no range",
                             Some(range) => {
-                                // 有选中内容就删选中内容；只有一个光标就往前扩 `want` 个字。
-                                if range.IsEmpty(ec).map(|e| e.as_bool()).unwrap_or(true) {
+                                // 首选 ACP 精确指定要删的区间。
+                                //
+                                // 为什么不用 Collapse + ShiftStart（1.0.5/1.0.6 用的就是这个）：
+                                // 在某些宿主上 `ShiftStart` 返回 S_OK 却一步都没移动，
+                                // 于是 `SetText(&[])` 作用在一个空区间上 —— 日志写 `ok`、
+                                // 界面上一个字都没少，用户看到的是"按四下才删掉一个字"。
+                                // `ITfRangeACP::GetExtent/SetExtent` 直接给锚点和长度，没有歧义。
+                                if let Ok(acp) = range.cast::<ITfRangeACP>() {
+                                    let (mut anchor, mut cch) = (0i32, 0i32);
+                                    if acp.GetExtent(&mut anchor, &mut cch).is_err() {
+                                        why = "GetExtent failed";
+                                    } else {
+                                        // 有选中内容就删选中；只有一个光标就往前吃 want 个字。
+                                        let (from, len) = if cch > 0 {
+                                            (anchor, cch)
+                                        } else {
+                                            let from = if anchor - want < 0 { 0 } else { anchor - want };
+                                            (from, anchor - from)
+                                        };
+                                        if len <= 0 {
+                                            why = "nothing to delete";
+                                        } else if acp.SetExtent(from, len).is_err() {
+                                            why = "SetExtent failed";
+                                        } else {
+                                            log_line(&format!(
+                                                "delete-back acp anchor={anchor} cch={cch} from={from} len={len} want={want}"
+                                            ));
+                                            if range.SetText(ec, 0, &[]).is_err() {
+                                                why = "SetText failed";
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    // 宿主不认 ITfRangeACP：退回 ShiftStart，并把实际移动量记进日志
+                                    let mut shifted = 0i32;
                                     if range.Collapse(ec, TF_ANCHOR_START).is_err() {
                                         why = "Collapse failed";
-                                    } else {
-                                        let mut shifted = 0i32;
-                                        if range
-                                            .ShiftStart(ec, -want, &mut shifted, std::ptr::null())
-                                            .is_err()
-                                        {
-                                            why = "ShiftStart failed";
-                                        }
+                                    } else if range
+                                        .ShiftStart(ec, -want, &mut shifted, std::ptr::null())
+                                        .is_err()
+                                    {
+                                        why = "ShiftStart failed";
+                                    } else if shifted == 0 {
+                                        why = "ShiftStart no-op";
+                                    } else if range.SetText(ec, 0, &[]).is_err() {
+                                        why = "SetText failed";
                                     }
                                 }
                                 if why == "ok" {
-                                    if range.SetText(ec, 0, &[]).is_err() {
-                                        why = "SetText failed";
-                                    } else {
-                                        let _ = range.Collapse(ec, TF_ANCHOR_END);
-                                        let caret = [TF_SELECTION {
-                                            range: std::mem::ManuallyDrop::new(Some(range.clone())),
-                                            style: Default::default(),
-                                        }];
-                                        if ctx.SetSelection(ec, &caret).is_err() {
-                                            why = "SetSelection failed";
-                                        }
+                                    let _ = range.Collapse(ec, TF_ANCHOR_END);
+                                    let caret = [TF_SELECTION {
+                                        range: std::mem::ManuallyDrop::new(Some(range.clone())),
+                                        style: Default::default(),
+                                    }];
+                                    if ctx.SetSelection(ec, &caret).is_err() {
+                                        why = "SetSelection failed";
                                     }
                                 }
                             }
@@ -1768,7 +1804,7 @@ fn show_cand_window(
     page: usize,
     expanded: bool,
     sel: usize,
-    pos: Option<(i32, i32)>,
+    pos: Option<CaretPos>,
 ) {
     let size = page_size(expanded);
     let total_pages = (cands.len() + size - 1) / size;
@@ -1781,18 +1817,19 @@ fn show_cand_window(
     let slice = &cands[start..end];
     // 没有可信的光标位置就干脆不显示：宁可看不到候选窗，也不要在屏幕某个
     // 角落飘一个和光标无关的框（以前的 (200, 200) 兜底就是这个毛病）。
-    let Some((x, y)) = pos.or_else(ipc::caret_screen_pos) else {
+    let Some(caret) = pos.or_else(ipc::caret_screen_rect) else {
         candwin::hide();
         return;
     };
-    candwin::show(pinyin, slice, sel, page + 1, total_pages, x + 4, y + 8);
+    // 具体放哪儿（下方还是上方、左右怎么贴边）由 candwin 决定，它知道窗口尺寸
+    candwin::show(pinyin, slice, sel, page + 1, total_pages, caret);
 }
 
 /// 用 TSF 的 `ITfContextView::GetTextExt` 问应用"这段组合串在屏幕的哪个矩形里"。
 ///
 /// 这是主流输入法的做法：坐标由应用自己算，所以 VSCode / WPS / 浏览器都精准。
 /// 失败返回 `None`（老式应用或应用没实现时），调用方再退到光标/鼠标兜底。
-fn text_ext_pos(ctx: &ITfContext, ec: u32, range: &ITfRange) -> Option<(i32, i32)> {
+fn text_ext_pos(ctx: &ITfContext, ec: u32, range: &ITfRange) -> Option<CaretPos> {
     // SAFETY: 标准 TSF 查询，处于编辑会话内
     unsafe {
         let view = ctx.GetActiveView().ok()?;
@@ -1802,7 +1839,8 @@ fn text_ext_pos(ctx: &ITfContext, ec: u32, range: &ITfRange) -> Option<(i32, i32
         if rect.left == 0 && rect.top == 0 && rect.right == 0 && rect.bottom == 0 {
             return None;
         }
-        Some((rect.left, rect.bottom))
+        // 顶边和底边都给出去：候选窗在屏幕底部时要往上翻
+        Some((rect.left, rect.top, rect.bottom))
     }
 }
 
@@ -1858,7 +1896,7 @@ fn apply_pick(
     page: &mut usize,
     expanded: &mut bool,
     sel: &mut usize,
-    pos: Option<(i32, i32)>,
+    pos: Option<CaretPos>,
 ) -> Option<EditAction> {
     let pick = cands.get(pick_idx)?.clone();
     // 上报选词，让引擎记进个人词库（失败不影响上屏）。

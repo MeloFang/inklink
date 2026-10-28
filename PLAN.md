@@ -613,7 +613,7 @@ Obsidian 语料 + AI 兜底，默认关闭联网（符合项目铁律）。
 
 **测试能力现状**：
 
-- 有：`cargo test` 34 个单测（按键认领、标点映射与引号交替、半角符号不转换、拼音切分、分段上屏消耗字母数、误选撤回与整句撤回的记账、整句上报门槛）
+- 有：`cargo test` 39 个单测（按键认领、标点映射与引号交替、半角符号不转换、拼音切分、分段上屏消耗字母数、误选撤回与整句撤回的记账、整句上报门槛、候选窗上下翻与贴边）
 - 有：`rime-server.exe --selftest` 20 项引擎侧断言（`utf8_char_count` / `strip_separators` /
   `split_lengths` / `learn_key`），纯 ASCII，不初始化 librime
 - 有：`tsf/test/test-harness.cc` GUI 自动化测试台（需要交互式桌面，agent 抢不到焦点）

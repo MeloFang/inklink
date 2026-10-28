@@ -98,13 +98,16 @@ unsafe fn read_exact_timeout(pipe: HANDLE, buf: &mut [u8], timeout_ms: u32) -> b
     true
 }
 
-/// 取当前光标（插入点）的屏幕坐标：返回 (x, 光标底边 y)。
+/// 取当前光标（插入点）的屏幕位置：返回 `(x, 光标顶边 y, 光标底边 y)`。
+///
+/// 必须同时给顶边：候选窗在屏幕底部时是往上翻的（和各主流输入法一样），
+/// 翻上去的位置 = 顶边 - 间距 - 窗高，只靠底边算会盖住光标所在那一行。
 ///
 /// 三级回退（现代应用如 WPS/Electron 常没有标准光标，GetGUIThreadInfo 会失败）：
 ///   1. GetGUIThreadInfo 的光标矩形
 ///   2. GetCaretPos + ClientToScreen
 ///   3. 鼠标位置（用户一般在点击处打字）
-pub fn caret_screen_pos() -> Option<(i32, i32)> {
+pub fn caret_screen_rect() -> Option<(i32, i32, i32)> {
     unsafe {
         if let Some(p) = caret_via_gui_thread() {
             return Some(p);
@@ -112,16 +115,16 @@ pub fn caret_screen_pos() -> Option<(i32, i32)> {
         if let Some(p) = caret_via_get_caret_pos() {
             return Some(p);
         }
-        // 最后兜底：鼠标位置
+        // 最后兜底：鼠标位置（不知道字高，给个常见行高）
         use windows_sys::Win32::UI::WindowsAndMessaging::GetCursorPos;
         let mut pt = windows_sys::Win32::Foundation::POINT { x: 0, y: 0 };
         GetCursorPos(&mut pt);
-        Some((pt.x, pt.y))
+        Some((pt.x, pt.y, pt.y + 20))
     }
 }
 
 /// 方法 1：前台线程的光标矩形。
-unsafe fn caret_via_gui_thread() -> Option<(i32, i32)> {
+unsafe fn caret_via_gui_thread() -> Option<(i32, i32, i32)> {
     use windows_sys::Win32::Graphics::Gdi::ClientToScreen;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         GetForegroundWindow, GetGUIThreadInfo, GetWindowThreadProcessId, GUITHREADINFO,
@@ -151,11 +154,13 @@ unsafe fn caret_via_gui_thread() -> Option<(i32, i32)> {
     if ClientToScreen(info.hwndCaret, &mut pt) == 0 {
         return None;
     }
-    Some((pt.x, pt.y))
+    // 底边已经换算过；顶边 = 底边 - 字高（rcCaret 的高度是客户区像素，无需再换算）
+    let height = (rc.bottom - rc.top).max(1);
+    Some((pt.x, pt.y - height, pt.y))
 }
 
 /// 方法 2：GetCaretPos（相对于拥有焦点的窗口的客户区）。
-unsafe fn caret_via_get_caret_pos() -> Option<(i32, i32)> {
+unsafe fn caret_via_get_caret_pos() -> Option<(i32, i32, i32)> {
     use windows_sys::Win32::Graphics::Gdi::ClientToScreen;
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetFocus;
     use windows_sys::Win32::UI::WindowsAndMessaging::GetCaretPos;
@@ -171,7 +176,8 @@ unsafe fn caret_via_get_caret_pos() -> Option<(i32, i32)> {
     if focus.is_null() || ClientToScreen(focus, &mut pt) == 0 {
         return None;
     }
-    Some((pt.x, pt.y))
+    // GetCaretPos 给的是光标顶边；字高未知，按常见行高 20 往下推
+    Some((pt.x, pt.y, pt.y + 20))
 }
 
 /// 引擎进程是否在跑（管道是否有可用实例）。

@@ -63,15 +63,16 @@ const SEL_COLOR: u32 = 0x0000_66FF; // #ff6600 橙色高亮（BGR）
 const BORDER_COLOR: u32 = 0x00E0_E0E0; // 浅灰边框
 const CORNER_RADIUS: i32 = 8; // 圆角半径
 
-/// 显示候选窗。`x, y` 是屏幕坐标（左上角）。
+/// 显示候选窗。`caret` 是光标的三段坐标 `(x, 顶边 y, 底边 y)`（屏幕坐标）。
+///
+/// 位置在这里算，不交给调用方，因为"放不下就往上翻"要同时知道窗口尺寸和屏幕边界。
 pub fn show(
     pinyin: &str,
     candidates: &[String],
     sel: usize,
     page: usize,
     total_pages: usize,
-    x: i32,
-    y: i32,
+    caret: (i32, i32, i32),
 ) {
     unsafe {
         ensure_window();
@@ -86,6 +87,7 @@ pub fn show(
         TOTAL_PAGES.store(total_pages, Ordering::SeqCst);
 
         let (w, h) = window_size(candidates);
+        let (x, y) = place(caret, w, h);
         SetWindowPos(
             hwnd as HWND,
             std::ptr::null_mut(),
@@ -100,6 +102,84 @@ pub fn show(
         SetWindowRgn(hwnd as HWND, region, 1);
         ShowWindow(hwnd as HWND, SW_SHOWNOACTIVATE);
         InvalidateRect(hwnd as HWND, std::ptr::null(), 1);
+    }
+}
+
+/// 光标到候选窗的间距（搜狗、微软拼音都在 4~8 像素之间）
+const GAP: i32 = 6;
+/// 候选窗距离屏幕边缘的最小留白
+const EDGE: i32 = 4;
+
+/// 算出候选窗左上角：默认在光标下方，**下面放不下就翻到光标上方**。
+///
+/// 这一条是用户拿搜狗对比出来的：光标靠近任务栏时，候选窗如果硬贴着往下画，
+/// 一半会在屏幕外，等于不能选字。翻上去的基准是光标**顶边**，不是底边——
+/// 用底边算会把光标所在那一行盖住。
+fn place(caret: (i32, i32, i32), w: i32, h: i32) -> (i32, i32) {
+    let (caret_x, _, caret_bottom) = caret;
+    let area = work_area(caret_x, caret_bottom);
+    place_in(area, caret, w, h)
+}
+
+/// `place` 的纯计算部分（可用区由调用方给，便于单测）。
+fn place_in(area: (i32, i32, i32, i32), caret: (i32, i32, i32), w: i32, h: i32) -> (i32, i32) {
+    let (left, top, right, bottom) = area;
+    let (caret_x, caret_top, caret_bottom) = caret;
+
+    // 竖直：先试下方，放不下改上方，上方也放不下就贴着可用区顶部
+    // （贴顶之后窗口底边 = top + h，只要 h ≤ 可用区高度就一定在区域内）
+    let mut y = caret_bottom + GAP;
+    if y + h > bottom {
+        y = caret_top - GAP - h;
+    }
+    if y < top {
+        y = top;
+    }
+
+    // 水平：以光标为基准，右边放不下就左移
+    let mut x = caret_x + EDGE;
+    if x + w > right {
+        x = right - w - EDGE;
+    }
+    x = x.max(left);
+
+    (x, y)
+}
+
+/// 该点所在显示器的可用区域（已经扣掉任务栏）。取不到就退到整个主屏。
+fn work_area(x: i32, y: i32) -> (i32, i32, i32, i32) {
+    use windows_sys::Win32::Foundation::POINT;
+    use windows_sys::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    };
+    unsafe {
+        let pt = POINT { x, y };
+        let monitor = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+        if !monitor.is_null() {
+            let mut info: MONITORINFO = std::mem::zeroed();
+            info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+            if GetMonitorInfoW(monitor, &mut info) != 0 {
+                let r = info.rcWork;
+                return (r.left, r.top, r.right, r.bottom);
+            }
+        }
+        // 兜底：主屏物理尺寸（不管任务栏，总比画到屏幕外强）
+        let (sw, sh) = screen_size();
+        (0, 0, sw, sh)
+    }
+}
+
+/// 主屏尺寸（拿不到就给个保守值）。
+fn screen_size() -> (i32, i32) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
+    unsafe {
+        let w = GetSystemMetrics(SM_CXSCREEN);
+        let h = GetSystemMetrics(SM_CYSCREEN);
+        if w > 0 && h > 0 {
+            (w, h)
+        } else {
+            (1280, 720)
+        }
     }
 }
 
@@ -327,4 +407,54 @@ unsafe fn get_font(
     );
     slot.store(f as isize, Ordering::SeqCst);
     f
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const AREA: (i32, i32, i32, i32) = (0, 0, 1920, 1040);
+
+    /// 下面有地方就贴在光标下面
+    #[test]
+    fn 光标下方有地方就往下放() {
+        let (x, y) = place_in(AREA, (400, 300, 320), 500, 180);
+        assert_eq!(x, 404);
+        assert_eq!(y, 320 + GAP);
+    }
+
+    /// 贴着任务栏时翻到光标上方，且不盖住光标所在那一行
+    #[test]
+    fn 下面放不下就翻到上方() {
+        let caret = (400, 960, 980);
+        let (_, y) = place_in(AREA, caret, 500, 180);
+        assert_eq!(y, caret.1 - GAP - 180);
+        assert!(y + 180 <= caret.1);
+        assert!(y >= 0);
+    }
+
+    /// 右边放不下就往左挪，别出屏幕
+    #[test]
+    fn 右边放不下就往左挪() {
+        let (x, _) = place_in(AREA, (1880, 300, 320), 500, 180);
+        assert_eq!(x, 1920 - 500 - EDGE);
+        assert!(x + 500 <= 1920);
+    }
+
+    /// 上下都放不下就贴顶，整个窗口仍要留在可用区里
+    #[test]
+    fn 上下都放不下就贴顶() {
+        let area = (0, 0, 1920, 200);
+        let (_, y) = place_in(area, (400, 120, 140), 500, 180);
+        assert_eq!(y, 0);
+        assert!(y + 180 <= 200);
+    }
+
+    /// 窗口比可用区还高：贴顶，不能是负数（剩下的部分只能被裁掉）
+    #[test]
+    fn 窗口比可用区还高时贴顶() {
+        let area = (0, 0, 1920, 200);
+        let (_, y) = place_in(area, (400, 10, 30), 500, 1200);
+        assert_eq!(y, 0);
+    }
 }

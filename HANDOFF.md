@@ -232,7 +232,7 @@ C:\inklink-engine\
 |:---|:---|
 | 中文输入 | librime 引擎（`C:\inklink-engine\rime-server.exe`，x86 链 `rime.dll`），整句/词组/简拼 |
 | 组合串 | 拼音显示在光标处，←→ 在串内移动，Backspace/Delete 在光标处删 |
-| 候选窗 | 拼音行 + 5 列网格；收起 1×5，展开 5×5（25 个）；**只给选中行标 1-5**，↑↓ 换行、←→ 换列、数字键选当前行 |
+| 候选窗 | 拼音行 + 5 列网格；收起 1×5，展开 5×5（25 个）；**只给选中行标 1-5**，↑↓ 换行、←→ 换列、数字键选当前行；**靠近屏幕底部自动翻到光标上方**，右侧放不下自动左移（`candwin::place`，按显示器可用区算，已扣任务栏） |
 | 翻页 | `-`/`=`（收起态 `-` 是分词符，展开态才是翻页）、PgUp/PgDn |
 | 分词符 | `-`/`_` 留在组合串里、查询前剥离；`xiang-mu` 显示为 `xiang-mu` |
 | 容错 | 拼音打一半也出候选：`zheg`、`zhge`、`xiangm`、`jig`、`shiq` 都能出「这个/项目/几个/事情」（引擎侧 `is_pinyin_code` 允许**一个**音节只打一半）；真英文词（`hello`/`github`/`world`）仍然英文候选排第一 |
@@ -369,6 +369,10 @@ DLL 被加载后无法卸载：脚本每次用**新文件名 + 改注册表**，
   以前会在没光标的地方飘出候选窗。现在 `TextService_Impl::can_compose(pic)` 双向判定
   （`pic` 为空时再问 `ITfThreadMgr::GetFocus()` → `ITfDocumentMgr::GetTop()`），
   不成立就一个键都不认领；候选窗也去掉了 `(200, 200)` 坐标兜底——拿不到可信坐标直接不显示。
+- **候选窗位置要在 DLL 里算，不能只传一个坐标**：只给"光标底边"的话，光标贴着任务栏时候选窗
+  只能往下画，一半跑到屏幕外（用户拿搜狗对比出来的）。现在 `text_ext_pos`/`caret_screen_rect`
+  都返回 `(x, 顶边, 底边)`，`candwin::place_in` 按显示器**可用区**（`GetMonitorInfoW` 的 `rcWork`，
+  已扣任务栏）决定放下方还是上方、左右怎么贴边；翻上去的基准是顶边，用底边会盖住光标那一行。
 - **rime 的 custom.yaml 文件名必须逐字等于真正 deploy 的 schema id**：我们跑的是 `luna_pinyin_simp`，
   早先写的 `luna_pinyin.custom.yaml` 从来没被读过（这是模糊音"改了没效果"的真凶之一）。
 - **改 `speller/algebra` 要整段替换**：`speller/algebra/__append` 是无效写法，正确是
