@@ -28,7 +28,8 @@ mod candwin;
 mod display;
 mod state;
 mod pinyin;
-mod ui_notify;
+mod bar;
+mod menu;
 use windows::core::{GUID, HRESULT, Interface, Ref, implement};
 use windows::core::IUnknownImpl;
 
@@ -479,13 +480,13 @@ impl ITfTextInputProcessor_Impl for TextService_Impl {
     fn Activate(&self, ptim: Ref<ITfThreadMgr>, tid: u32) -> windows::core::Result<()> {
         let r = self.advise_keys(ptim, tid);
         // 输入法被切到前台 —— 让浮条出现（搜狗那种「用的时候才有」）
-        ui_notify::show();
+        bar::show();
         r
     }
 
     fn Deactivate(&self) -> windows::core::Result<()> {
         log_line("deactivate");
-        ui_notify::hide();
+        bar::hide();
         // 切换输入法/焦点时清空状态，否则缓冲会跨会话累积
         self.inner.buffer.lock().unwrap_or_else(|p| p.into_inner()).clear();
         self.inner.cands.lock().unwrap_or_else(|p| p.into_inner()).clear();
@@ -509,7 +510,7 @@ impl ITfTextInputProcessorEx_Impl for TextService_Impl {
     ) -> windows::core::Result<()> {
         log_line("ActivateEx");
         let r = self.advise_keys(ptim, tid);
-        ui_notify::show();
+        bar::show();
         r
     }
 }
@@ -1895,6 +1896,8 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                     state::set_chinese(!cur);
                     log_line(&format!("chinese -> {}", !cur));
                 }
+                // Shift 单击可能切了中英，让浮条跟着重绘（浮条不缓存，paint 现读注册表）
+                bar::refresh();
             }
             self.inner.shift_used.store(false, Ordering::SeqCst);
         }
@@ -2649,7 +2652,7 @@ mod registry {
     }
 
     /// 当前 DLL 路径
-    fn dll_path() -> String {
+    pub(crate) fn dll_path() -> String {
         use windows::Win32::System::LibraryLoader::{
             GetModuleFileNameW, GetModuleHandleExW, GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
         };

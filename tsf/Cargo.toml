@@ -1,6 +1,6 @@
 [package]
 name = "inklink-tsf"
-version = "1.1.9"
+version = "1.1.10"
 edition = "2024"
 description = "inklink 的 TSF 文本服务（薄壳）"
 
@@ -30,6 +30,7 @@ windows-sys = { version = "0.61", features = [
   "Win32_Security",
   "Win32_UI_Input_KeyboardAndMouse",
   "Win32_UI_WindowsAndMessaging",
+  "Win32_UI_HiDpi",
   "Win32_Graphics_Gdi",
 ] }
 

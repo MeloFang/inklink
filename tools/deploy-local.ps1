@@ -43,16 +43,9 @@ if (-not $NoBuild) {
         Write-Host '[构建] x86' -ForegroundColor White
         cargo build --release --lib --target i686-pc-windows-msvc --target-dir target-static
         $rc32 = $LASTEXITCODE
-        Write-Host '[构建] inklink-ui' -ForegroundColor White
-        Push-Location (Join-Path $root 'ui')
-        try {
-            if (Get-Process inklink-ui -ErrorAction SilentlyContinue) { Get-Process inklink-ui | Stop-Process -Force; Start-Sleep -Milliseconds 400 }
-            cargo build --release
-            $rcUI = $LASTEXITCODE
-        } finally { Pop-Location }
     } finally { Pop-Location }
 
-    if ($rc64 -ne 0 -or $rc32 -ne 0 -or $rcUI -ne 0) { throw "构建失败（cargo 退出码 x64=$rc64 x86=$rc32 ui=$rcUI）" }
+    if ($rc64 -ne 0 -or $rc32 -ne 0) { throw "构建失败（cargo 退出码 x64=$rc64 x86=$rc32）" }
     # 产物必须是这次构建写出来的，否则等于把旧 DLL 换个新名字部署
     foreach ($p in @($dll64, $dll32)) {
         if (-not (Test-Path $p)) { throw "没产出：$p" }
@@ -77,20 +70,7 @@ if (Test-Path $ico) { Copy-Item $ico (Join-Path $PF 'inklink.ico') -Force
         $badge = Join-Path $root 'installer\inklink-badge.ico'
         if (Test-Path $badge) { Copy-Item $badge (Join-Path $PF 'inklink-badge.ico') -Force } }
 
-# 常驻 UI 进程（浮条 + 托盘）。它是独立进程，不加载进别人的进程，可以热替换。
-$uiExe = Join-Path $root 'ui\target\release\inklink-ui.exe'
-if (Test-Path $uiExe) {
-    $uiDst = Join-Path $PF 'inklink-ui.exe'
-    if (Get-Process inklink-ui -ErrorAction SilentlyContinue) {
-        Get-Process inklink-ui | Stop-Process -Force
-        Start-Sleep -Milliseconds 400
-    }
-    Copy-Item $uiExe $uiDst -Force
-    Write-Host "  浮条已部署：$uiDst" -ForegroundColor Gray
-} else {
-    Write-Host "  警告：没有 $uiExe，浮条没部署" -ForegroundColor Yellow
-}
-
+# 浮条现在画在 DLL 里（宿主进程内，搜狗那种），不再有独立的 inklink-ui.exe。
 Set-ItemProperty "HKLM:\SOFTWARE\Classes\CLSID\$CLSID\InprocServer32" -Name '(default)' -Value $target64
 Set-ItemProperty "HKLM:\SOFTWARE\Classes\Wow6432Node\CLSID\$CLSID\InprocServer32" -Name '(default)' -Value $target32
 

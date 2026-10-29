@@ -56,12 +56,6 @@ Copy-Item $dll64 (Join-Path $files 'inklink_tsf.dll')   -Force
 Copy-Item $dll32 (Join-Path $files 'inklink_tsf32.dll') -Force
 Copy-Item (Join-Path $root 'installer\inklink.ico') (Join-Path $files 'inklink.ico') -Force
 Copy-Item (Join-Path $root 'installer\inklink-badge.ico') (Join-Path $files 'inklink-badge.ico') -Force
-$uiExe = Join-Path $root 'ui\target\release\inklink-ui.exe'
-if (Test-Path $uiExe) {
-    Copy-Item $uiExe (Join-Path $files 'inklink-ui.exe') -Force
-} else {
-    Write-Host '  警告：没有 ui\target\release\inklink-ui.exe，包里不会有浮条' -ForegroundColor Yellow
-}
 Copy-Item "$ENG\rime-server.exe" $files -Force
 Copy-Item "$ENG\rime.dll"        $files -Force
 Write-Host '  DLL + 引擎 OK'

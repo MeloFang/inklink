@@ -1,12 +1,12 @@
 # AGENTS.md
 
 > 给所有 AI 与人类贡献者：读完这一份就能开工，不必先问基础问题。
-> 最后更新：2026-10-26（TSF 输入法 + librime 引擎已在本机日常使用）
+> 最后更新：2026-10-29（TSF 输入法 + librime 引擎已在本机日常使用；浮条已改进程内，见 ADR-0008）
 
 ## 这是什么
 
 **inklink**：Windows 上开源的中文输入法。装进系统后就是一个正常的 TSF 输入法（Win+Space 切换），
-打拼音 → 候选窗 → 上屏。产品愿景是用个人词库 + Obsidian 语料 + AI 做个性化，目前只到 M0（能打字）。
+打拼音 → 候选窗 → 上屏。产品愿景是用个人词库 + Obsidian 语料 + AI 做个性化，目前 M0/M1 完成、产品化 P0–P1 上线（浮条已改进程内）。
 
 架构（ADR-0006）：`inklink_tsf.dll`（薄壳，装在应用进程里）──命名管道──▶ `rime-server.exe`（x86，链 librime）。
 **为什么分两个进程**：Weasel 分发的 `rime.dll` 只有 32 位，而 TSF DLL 必须 64 位。
@@ -41,13 +41,11 @@ inklink/
 │  ├─ src/display.rs     组合串的下划线（ITfDisplayAttributeProvider + GUID_PROP_ATTRIBUTE）
 │  ├─ src/ipc.rs         命名管道客户端 + 引擎自动拉起
 │  ├─ src/pinyin.rs      402 音节表（贪心最长匹配；算分段上屏吃掉多少字母 + 组合串按音节显示的 `'`）
-│  ├─ src/state.rs       全局状态（注册表 HKCU\Software\inklink\State：中英、中文标点）
-│  ├─ src/ui_notify.rs   让浮条出现/收起（Activate→PostMessageW(WM_APP+12)，Deactivate→+13）
+│  ├─ src/state.rs       全局状态（注册表 HKCU\Software\inklink\State：中英、中文标点；UI 位置）
+│  ├─ src/bar.rs         浮条（宿主进程内自绘，窗口类 inklink-bar；Activate→show、Deactivate→hide）
+│  ├─ src/menu.rs        自绘 ☰ 菜单（不用 TrackPopupMenu，见 ADR-0008）
 │  └─ build.rs           把 VERSION 编进 DLL
-├─ ui/                   常驻 UI 进程（浮条 + 托盘；独立 crate，不加载进别人进程）
-│  ├─ src/main.rs        浮条窗口：中/英方块、标点方块、☰、拖动记忆、按 WM_APP+12/13 显隐
-│  ├─ src/state.rs       注册表读写（State / UI 位置 / 开机自启）
-│  └─ src/tray.rs        托盘图标 + 右键菜单
+├─ ui/                   【已退役，源码留作回退】旧独立浮条进程（1.1.10 起不构建/不部署/不自启，见 ADR-0008）
 ├─ rime-server/          C++ 引擎服务（链 librime，x86）
 │  └─ rime-server.cc     协议 [u8 type] + 查询/选词；个人词库学习层 + --selftest
 ├─ rime-config/          引擎侧配置源
@@ -109,13 +107,9 @@ powershell -ExecutionPolicy Bypass -File tools\release.ps1
 $env:PATH = "$env:USERPROFILE\.cargo\bin;$env:PATH"
 
 cd C:\dsh\work\inklink\tsf
-cargo test --release                       # 54 个单测（按键认领 / 标点 / 引号 / 拼音切分 / 音节分隔显示 / 分词边界 / 分段上屏 / 误选撤回 / 整句上报 / 候选窗摆放与点击 / 注入退格抑制 / 显示属性 / 全局状态缺省值）
+cargo test --release                       # 64 个单测（按键认领 / 标点 / 引号 / 拼音切分 / 音节分隔显示 / 分词边界 / 分段上屏 / 误选撤回 / 整句上报 / 候选窗摆放与点击 / 注入退格抑制 / 显示属性 / 全局状态缺省值 / 浮条与菜单布局）
 cargo build --release --lib --target-dir target-static
 cargo build --release --lib --target i686-pc-windows-msvc --target-dir target-static
-
-# 浮条（独立进程，不加载进别的应用；改完必须重启它才生效）
-cd C:\dsh\work\inklink\ui
-cargo build --release
 ```
 
 引擎是 C++（`rime-server/rime-server.cc`），编译命令写在文件头注释里，需要 32 位 MSVC 环境

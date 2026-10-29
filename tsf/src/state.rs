@@ -31,6 +31,8 @@ pub const KEY_PATH: &str = r"Software\inklink\State";
 pub const VALUE_CHINESE: &str = "Chinese";
 /// 中文标点：1 = 全角转换，0 = 保持半角。
 pub const VALUE_PUNCTUATION: &str = "Punctuation";
+/// 浮条位置记忆的位置（`PosX`/`PosY`，屏幕坐标，缺失就用默认右下角）。
+pub const UI_KEY: &str = r"Software\inklink\UI";
 
 fn wide(s: &str) -> Vec<u16> {
     OsStr::new(s)
@@ -144,12 +146,84 @@ pub fn set_chinese(on: bool) {
     unsafe { write_flag(VALUE_CHINESE, on) }
 }
 
-/// 设置中文标点开关（全局）。
-///
-/// 现在由 UI 进程（浮条 / 设置台）调用；DLL 自己只负责读。
-#[allow(dead_code)]
+/// 设置中文标点开关（全局）。进程内浮条点第二格时调用。
 pub fn set_punctuation(on: bool) {
     unsafe { write_flag(VALUE_PUNCTUATION, on) }
+}
+
+// ─────────────────────────── 浮条位置记忆 ───────────────────────────
+
+unsafe fn open_ui_key(access: u32) -> Option<HKEY> {
+    let path = wide(UI_KEY);
+    let mut key: HKEY = std::ptr::null_mut();
+    let rc = RegOpenKeyExW(HKEY_CURRENT_USER, path.as_ptr(), 0, access, &mut key);
+    if rc == 0 {
+        Some(key)
+    } else {
+        None
+    }
+}
+
+unsafe fn create_ui_key() -> Option<HKEY> {
+    let path = wide(UI_KEY);
+    let mut key: HKEY = std::ptr::null_mut();
+    let mut disposition = 0u32;
+    let rc = RegCreateKeyExW(
+        HKEY_CURRENT_USER,
+        path.as_ptr(),
+        0,
+        std::ptr::null(),
+        REG_OPTION_NON_VOLATILE,
+        KEY_READ | KEY_SET_VALUE,
+        std::ptr::null(),
+        &mut key,
+        &mut disposition,
+    );
+    if rc == 0 {
+        Some(key)
+    } else {
+        None
+    }
+}
+
+/// 浮条上次的屏幕坐标；没存过、或飞出合理范围（换屏/分辨率变小）就当没存过。
+pub fn read_pos() -> Option<(i32, i32)> {
+    unsafe {
+        let Some(key) = open_ui_key(KEY_READ) else {
+            return None;
+        };
+        let x = query_dword(key, "PosX").map(|v| v as i32);
+        let y = query_dword(key, "PosY").map(|v| v as i32);
+        RegCloseKey(key);
+        match (x, y) {
+            (Some(x), Some(y)) if x > -10000 && x < 10000 && y > -10000 && y < 10000 => {
+                Some((x, y))
+            }
+            _ => None,
+        }
+    }
+}
+
+/// 记下浮条位置（拖动结束时）。
+pub fn write_pos(x: i32, y: i32) {
+    unsafe {
+        let Some(key) = create_ui_key() else {
+            return;
+        };
+        for (name, v) in [("PosX", x as u32), ("PosY", y as u32)] {
+            let name_w = wide(name);
+            let data: u32 = v;
+            RegSetValueExW(
+                key,
+                name_w.as_ptr(),
+                0,
+                REG_DWORD,
+                &data as *const u32 as *const u8,
+                std::mem::size_of::<u32>() as u32,
+            );
+        }
+        RegCloseKey(key);
+    }
 }
 
 #[cfg(test)]

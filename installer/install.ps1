@@ -70,12 +70,6 @@ if (Test-Path "$SRC\inklink.ico") { Install-File "$SRC\inklink.ico" "$PF\inklink
 if (Test-Path "$SRC\inklink-badge.ico") { Install-File "$SRC\inklink-badge.ico" "$PF\inklink-badge.ico" | Out-Null }
 Install-File "$SRC\rime-server.exe" "$ENG\rime-server.exe" | Out-Null
 Install-File "$SRC\rime.dll"        "$ENG\rime.dll"        | Out-Null
-# 常驻 UI 进程（浮条 + 托盘）。它不加载进别人的进程，升级可以随时替换。
-$uiDst = $null
-if (Test-Path "$SRC\inklink-ui.exe") {
-    if (Get-Process inklink-ui -ErrorAction SilentlyContinue) { Get-Process inklink-ui | Stop-Process -Force; Start-Sleep -Milliseconds 400 }
-    $uiDst = Install-File "$SRC\inklink-ui.exe" "$PF\inklink-ui.exe"
-}
 if (Test-Path "$SRC\rime\data") { Copy-Item "$SRC\rime\data" "$ENG\rime\" -Recurse -Force }
 if (Test-Path "$SRC\rime\user") { Copy-Item "$SRC\rime\user" "$ENG\rime\" -Recurse -Force }
 Write-Host "    64 位 DLL : $dll64"
@@ -115,13 +109,12 @@ Step 4 '配置引擎路径...'
 New-Item -Path 'HKLM:\SOFTWARE\inklink' -Force | Out-Null
 Set-ItemProperty 'HKLM:\SOFTWARE\inklink' -Name 'EnginePath' -Value "$ENG\rime-server.exe"
 
-# ── 5. 开机自启引擎 + 浮条 ────────────────────────────────────
+# ── 5. 开机自启引擎 ────────────────────────────────────────────
 Write-Host ''
 Step 5 '设置开机自启...'
 $run = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 New-Item -Path $run -Force | Out-Null
 Set-ItemProperty $run -Name 'inklink-engine' -Value "`"$ENG\rime-server.exe`""
-if ($uiDst) { Set-ItemProperty $run -Name 'inklink-ui' -Value "`"$uiDst`"" }
 
 # ── 6. 加入输入法列表 ──────────────────────────────────────────
 # 这一段最容易在「非中文系统 / 精简系统」上失败（Windows.Globalization 模块
@@ -159,18 +152,7 @@ if ($proc) {
     Write-Host '    警告：引擎没能启动（不影响安装，第一次打字时 DLL 会自己拉起它）' -ForegroundColor Yellow
 }
 
-# 浮条：能启动就启动，起不来不算安装失败（不影响打字）
-if ($uiDst -and (Test-Path $uiDst)) {
-    if (-not (Get-Process inklink-ui -ErrorAction SilentlyContinue)) {
-        Start-Process $uiDst -WorkingDirectory $PF
-        Start-Sleep -Seconds 1
-    }
-    if (Get-Process inklink-ui -ErrorAction SilentlyContinue) {
-        Write-Host '    浮条已启动（右下角，可拖动）' -ForegroundColor Green
-    } else {
-        Write-Host '    警告：浮条没起来（不影响打字，可手动运行 inklink-ui.exe）' -ForegroundColor Yellow
-    }
-}
+# 浮条不再独立进程：切到 inklink 输入法时由 DLL 在宿主进程里画（搜狗那种）。
 
 # ── 自检 ───────────────────────────────────────────────────────
 Write-Host ''
@@ -183,8 +165,7 @@ $checks = @(
     @{ Name = 'COM 64 位';  Ok = ((Get-ItemProperty $com64 -ErrorAction SilentlyContinue).'(default)' -eq $dll64) },
     @{ Name = 'COM 32 位';  Ok = ((Get-ItemProperty $com32 -ErrorAction SilentlyContinue).'(default)' -eq $dll32) },
     @{ Name = 'TIP 注册';   Ok = (Test-Path "HKLM:\SOFTWARE\Microsoft\CTF\TIP\$CLSID\LanguageProfile\0x00000804\$PROFILE") },
-    @{ Name = '引擎路径';   Ok = ((Get-ItemProperty 'HKLM:\SOFTWARE\inklink' -ErrorAction SilentlyContinue).EnginePath -ne $null) },
-    @{ Name = '浮条 exe';   Ok = ($uiDst -and (Test-Path $uiDst)) }
+    @{ Name = '引擎路径';   Ok = ((Get-ItemProperty 'HKLM:\SOFTWARE\inklink' -ErrorAction SilentlyContinue).EnginePath -ne $null) }
 )
 $bad = 0
 foreach ($c in $checks) {
