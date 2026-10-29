@@ -727,6 +727,10 @@ Obsidian 语料 + AI 兜底，默认关闭联网（符合项目铁律）。
 
 - **浮条第一格是品牌标记**（2026-10-29，1.1.3，用户要求"像搜狗那样第一个放标"）：`tools\make-icon.py` 额外产出 `installer\inklink-badge.ico` —— 同一个字母 i，**透明底、字形撑满高度**（那一格只有 20~24px，白色方块 + 66% 占比会把笔画缩到看不清；椭圆徽标试过更糊，24px 下就是一坨深蓝）。浮条用 `DrawIconEx` 画在第一格，点它等同点 ☰。窗口宽度 168→204px（多一格 26px）。
 - **点完不会自己消失**（1.1.3）：点浮条会让宿主失活、我们随即收到 `WM_UI_HIDE`，250ms 后就收起来 —— 用户看到的是"点一下就没了"。改成收到 HIDE 时先看**最近 1.5s 内是否点过**（`LAST_TOUCH`）或**鼠标是否还停在浮条上**，是就跳过这一次收起。实测：点完立刻发 HIDE → 日志 `ui hide skipped (sticky)`、窗口仍可见；冷却后再发 HIDE 才 `ui hide`。
+- **☰ 菜单自己画，不用 `TrackPopupMenu`**（2026-10-29，1.1.9，修用户报的"点一下就变一条白带"）：浮条是 `WS_EX_NOACTIVATE` 又拿不到前台，而 `TrackPopupMenu` 要求宿主在前台 —— 实测 `SetForegroundWindow` 返回 0 之后 `TrackPopupMenu` **再也不返回**，模态循环把消息循环一起卡死，界面只剩一条白底 + 被 hover 的那一格；后台日志留的是 `user32.dll` `0xc0000005` / `0xc000041d`。改成 `ui\src\menu.rs` 自绘：独立窗口类 `inklink-menu`（`WS_POPUP` + `TOPMOST|TOOLWINDOW|NOACTIVATE`），配色/字体与浮条同一套（`C_BG`/`C_TEXT`/`C_ACCENT`，`Microsoft YaHei UI` 13px），行高 `26`、分隔线 `9`、勾选列 `20`，长在浮条上方（上面放不下就放下方）。
+  - **交互分工**：菜单内的选中走 `WM_LBUTTONUP`（按下拖动、松开才选中，和系统菜单一致）；`Esc` 与"点菜单外面"交给 10ms 轮询（`GetAsyncKeyState(VK_LBUTTON/VK_ESCAPE)` + `cursor_in()`）—— `SetCapture` 在我们这种窗口上收不到点击，试过两次都不行。
+  - 命中测试 `row_at()`/`menu_size()`/`row_height()` 是纯函数，7 条单测（行高 + 上下内边距必须等于窗口高度、每行上下边界都命中自己、分隔线不算行、灰掉的项仍是行、菜单标题随状态变、宽度下限、最后一项是退出）。
+  - `ui\src\tray.rs` 里原来的 `popup()`（`AppendMenuW`/`TrackPopupMenu`）整段删掉，托盘只留图标。
 
 
 

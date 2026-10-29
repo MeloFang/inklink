@@ -8,6 +8,7 @@
 
 #![windows_subsystem = "windows"]
 
+mod menu;
 mod state;
 mod tray;
 
@@ -26,7 +27,7 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     ChangeWindowMessageFilterEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
     DrawIconEx, GetClientRect, GetCursorPos, GetMessageW, GetWindowRect, IsWindowVisible, KillTimer,
-    LoadCursorW, MoveWindow, PostQuitMessage, RegisterClassW, SetTimer, ShowWindow,
+    LoadCursorW, MoveWindow, PostMessageW, PostQuitMessage, RegisterClassW, SetTimer, ShowWindow,
     SystemParametersInfoW, TranslateMessage, CHANGEFILTERSTRUCT, CS_HREDRAW, CS_VREDRAW, DI_NORMAL,
     IDC_ARROW, MSG, MSGFLT_ALLOW, SPI_GETWORKAREA, SW_HIDE, SW_SHOWNOACTIVATE, WNDCLASSW, WM_APP,
     WM_DESTROY, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_RBUTTONUP, WM_TIMER,
@@ -43,6 +44,11 @@ const HIDE_DELAY_MS: u32 = 250;
 /// 与 `tsf/src/ui_notify.rs` 里的同名常量必须一致。
 const WM_UI_SHOW: u32 = WM_APP + 12;
 const WM_UI_HIDE: u32 = WM_APP + 13;
+/// 弹菜单走这条自投递消息，**不在鼠标消息里直接弹**。
+/// 直接弹会在 `TrackPopupMenu` 的模态循环里重入 wndproc（此时还持着 SetCapture 的收尾），
+/// 实测会崩在 user32 里（0xc0000005 @ user32!0x24702）。投递到队列尾部再弹就干净了。
+const WM_OPEN_MENU: u32 = WM_APP + 20;
+static MENU_OPEN: AtomicBool = AtomicBool::new(false);
 
 static TRAY_ADDED: AtomicBool = AtomicBool::new(false);
 static WRITE_OK: AtomicBool = AtomicBool::new(true);
@@ -117,7 +123,7 @@ static mut DRAG: Option<DragState> = None;
 /// 放 `%LOCALAPPDATA%\inklink\ui.log`（用户目录一定可写；exe 目录在 Program Files 下
 /// 普通用户写不了）。**只写文件，不 spawn 子进程** —— 早期版本在这函数里调 `reg.exe`，
 /// 结果每条日志都创建一次进程，在 wndproc 里直接把消息循环拖死。
-fn log(msg: &str) {
+pub(crate) fn log(msg: &str) {
     use std::io::Write;
     for path in log_paths() {
         if let Ok(mut f) = std::fs::OpenOptions::new()
@@ -129,6 +135,33 @@ fn log(msg: &str) {
             return;
         }
     }
+}
+
+/// 装一个 panic 钩子，把恐慌信息写进日志。
+///
+/// GUI 程序没有控制台，`wndproc` 里一 panic 就直接变成 `0xc000041d`
+/// （user32 捕获到从回调里逃出来的异常）——事件查看器只告诉你
+/// "user32.dll 偏移 0x24702"，一个字的上下文都没有。有了这个钩子至少能看到
+/// 恐慌发生在哪一行。
+pub(crate) fn install_panic_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        let loc = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "<unknown>".to_string());
+        let payload = if let Some(s) = info.payload().downcast_ref::<&str>() {
+            (*s).to_string()
+        } else if let Some(s) = info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "<non-string payload>".to_string()
+        };
+        log(&format!("PANIC at {loc}: {payload}"));
+        let bt = std::backtrace::Backtrace::force_capture();
+        for line in bt.to_string().lines().take(30) {
+            log(&format!("PANIC bt {line}"));
+        }
+    }));
 }
 
 /// 依次尝试的日志落点：用户目录 → exe 目录 → `C:\Users\Public`。
@@ -539,10 +572,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 state::write_pos(wr.left, wr.top);
             } else {
                 match pressed {
-                    // 品牌标：等同点 ☰，把菜单弹出来
+                    // 品牌标：等同点 ☰，把菜单弹出来（投递到队列，不在这里直接弹）
                     0 | 3 => {
-                        let cmd = tray::popup(hwnd, CHINESE.load(Ordering::Relaxed), PUNCT.load(Ordering::Relaxed), state::autostart_enabled());
-                        handle_menu(hwnd, cmd);
+                        unsafe {
+                            PostMessageW(hwnd, WM_OPEN_MENU, 0, 0);
+                        }
                     }
                     1 => toggle_mode(hwnd),
                     2 => toggle_punct(hwnd),
@@ -551,53 +585,64 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             0
         }
-        WM_RBUTTONUP => {
-            let cmd = tray::popup(
-                hwnd,
-                CHINESE.load(Ordering::Relaxed),
-                PUNCT.load(Ordering::Relaxed),
-                state::autostart_enabled(),
-            );
-            handle_menu(hwnd, cmd);
-            0
-        }
-        tray::WM_TRAY => {
-            // 托盘图标的回调：右键弹菜单，左键开关浮条
+        WM_RBUTTONUP | tray::WM_TRAY => {
+            // 托盘右键 / 浮条右键：同样投递到队列，理由见 WM_OPEN_MENU 的注释
             let event = lparam as u32;
             const WM_LBUTTONUP_CB: u32 = 0x0202;
-            const WM_RBUTTONUP_CB: u32 = 0x0205;
-            if event == WM_RBUTTONUP_CB {
-                let cmd = tray::popup(
+            if msg == tray::WM_TRAY && event == WM_LBUTTONUP_CB {
+                let visible = windows_sys::Win32::UI::WindowsAndMessaging::IsWindowVisible(hwnd);
+                ShowWindow(hwnd, if visible != 0 { 0 } else { SW_SHOWNOACTIVATE });
+            } else if msg == WM_RBUTTONUP || event == 0x0205 {
+                unsafe {
+                    PostMessageW(hwnd, WM_OPEN_MENU, 0, 0);
+                }
+            }
+            0
+        }
+        WM_OPEN_MENU => {
+            // 菜单自己跑消息循环（会重入 wndproc），用 MENU_OPEN 挡掉重复弹出
+            if !MENU_OPEN.swap(true, Ordering::SeqCst) {
+                let mut wr: RECT = std::mem::zeroed();
+                GetWindowRect(hwnd, &mut wr);
+                let cmd = menu::popup(
                     hwnd,
+                    wr.left,
+                    wr.top,
                     CHINESE.load(Ordering::Relaxed),
                     PUNCT.load(Ordering::Relaxed),
                     state::autostart_enabled(),
                 );
+                MENU_OPEN.store(false, Ordering::SeqCst);
+                if cmd != 0 {
+                    log(&format!("menu choice {cmd}"));
+                }
                 handle_menu(hwnd, cmd);
-            } else if event == WM_LBUTTONUP_CB {
-                let visible = windows_sys::Win32::UI::WindowsAndMessaging::IsWindowVisible(hwnd);
-                ShowWindow(hwnd, if visible != 0 { 0 } else { SW_SHOWNOACTIVATE });
             }
             0
         }
         WM_DESTROY => {
+            log("wm_destroy");
             tray::remove(hwnd);
             PostQuitMessage(0);
             0
         }
+        // 注意：不要自己写 `WM_CLOSE => ...` 的分支 —— 之前漏了 import，Rust 把
+        // 它当成了**新的绑定变量**（irrefutable pattern），于是每条消息都被当成
+        // 关闭请求、窗口在 WM_NCCREATE 阶段就被 DestroyWindow 掉，CreateWindowExW
+        // 直接失败。DefWindowProcW 对 WM_CLOSE 的默认处理就是 DestroyWindow，够了。
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
     }
 }
 
 fn handle_menu(hwnd: HWND, cmd: u32) {
     match cmd {
-        tray::CMD_TOGGLE_MODE => toggle_mode(hwnd),
-        tray::CMD_TOGGLE_PUNCT => toggle_punct(hwnd),
-        tray::CMD_TOGGLE_AUTOSTART => {
+        menu::CMD_TOGGLE_MODE => toggle_mode(hwnd),
+        menu::CMD_TOGGLE_PUNCT => toggle_punct(hwnd),
+        menu::CMD_TOGGLE_AUTOSTART => {
             let on = !state::autostart_enabled();
             state::set_autostart(on);
         }
-        tray::CMD_QUIT => unsafe {
+        menu::CMD_QUIT => unsafe {
             DestroyWindow(hwnd);
         },
         _ => {}
@@ -605,17 +650,7 @@ fn handle_menu(hwnd: HWND, cmd: u32) {
 }
 
 fn main() {
-    let panic_dir = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-        .unwrap_or_else(std::env::temp_dir);
-    std::panic::set_hook(Box::new(move |info| {
-        use std::io::Write;
-        let p = panic_dir.join("inklink-ui-panic.log");
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
-            let _ = writeln!(f, "{info}");
-        }
-    }));
+    install_panic_hook();
     log("main enter");
     // 每显示器 DPI 感知：不声明的话 Windows 会把窗口按 125%/150% 拉伸（字发虚），
     // 而且我们拿到的坐标是逻辑坐标、截屏是物理像素，排查时对不上。

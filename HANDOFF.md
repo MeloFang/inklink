@@ -266,6 +266,7 @@ C:\inklink-engine\
 
 - **浮条第一格放品牌标记**（1.1.3）：`installer\inklink-badge.ico`（透明底、字形撑满的字母 i），点它等同点 ☰；窗口 168→204px。
 - **点浮条不会立刻消失**（1.1.3）：`Deactivate` 的收起请求会被"最近 1.5s 点过 / 鼠标还在浮条上"挡掉一次，否则点一下就没。
+- **☰ 菜单是自绘的**（1.1.9，修"点一下变一条白带"）：`ui\src\menu.rs`，窗口类 `inklink-menu`。系统的 `TrackPopupMenu` 在我们这种拿不到前台的 `WS_EX_NOACTIVATE` 窗口上会**永不返回**（模态循环卡死消息循环，随后 `user32.dll` 里 `0xc0000005`/`0xc000041d`）。菜单内选中走 `WM_LBUTTONUP`，`Esc`/点外面走 10ms 轮询；`row_at()`/`menu_size()` 有 7 条单测。
 > 所有应用同时切换；杀进程不影响打字（状态在注册表里，DLL 每键现读）。
 > 显隐由 TSF 的 `Activate`/`Deactivate` 驱动（`tsf\src\ui_notify.rs` 发 `WM_APP+12/13`）——
 > 切到这个输入法才出现，切走自动收起，不再一直挂在角落。
