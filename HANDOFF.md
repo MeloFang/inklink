@@ -262,8 +262,10 @@ C:\inklink-engine\
 | 5 | M3 AI（离线）/ T5e 个人云 | 词库体检、润色/续写/翻译，原始愿景，最后做；AI 配置也放设置台 |
 
 > **全局状态已就位（1.0.17）**：`HKCU\Software\inklink\State` 的 `Chinese` / `Punctuation`。
-> **浮条已就位（1.1.0）**：`C:\Program Files\inklink\inklink-ui.exe`，右下角可拖动，点「中/英」和「，。」两个方块，
+> **浮条已就位（1.1.0，1.1.1 起"用时才出现"）**：`C:\Program Files\inklink\inklink-ui.exe`，右下角可拖动，点「中/英」和「，。」两个方块，
 > 所有应用同时切换；杀进程不影响打字（状态在注册表里，DLL 每键现读）。
+> 显隐由 TSF 的 `Activate`/`Deactivate` 驱动（`tsf\src\ui_notify.rs` 发 `WM_APP+12/13`）——
+> 切到这个输入法才出现，切走自动收起，不再一直挂在角落。
 
 ### M1 个人词库学习（已实现，2026-10-27）
 

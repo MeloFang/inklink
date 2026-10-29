@@ -28,6 +28,7 @@ mod candwin;
 mod display;
 mod state;
 mod pinyin;
+mod ui_notify;
 use windows::core::{GUID, HRESULT, Interface, Ref, implement};
 use windows::core::IUnknownImpl;
 
@@ -476,11 +477,15 @@ fn take_injected_backspace() -> bool {
 
 impl ITfTextInputProcessor_Impl for TextService_Impl {
     fn Activate(&self, ptim: Ref<ITfThreadMgr>, tid: u32) -> windows::core::Result<()> {
-        self.advise_keys(ptim, tid)
+        let r = self.advise_keys(ptim, tid);
+        // 输入法被切到前台 —— 让浮条出现（搜狗那种「用的时候才有」）
+        ui_notify::show();
+        r
     }
 
     fn Deactivate(&self) -> windows::core::Result<()> {
         log_line("deactivate");
+        ui_notify::hide();
         // 切换输入法/焦点时清空状态，否则缓冲会跨会话累积
         self.inner.buffer.lock().unwrap_or_else(|p| p.into_inner()).clear();
         self.inner.cands.lock().unwrap_or_else(|p| p.into_inner()).clear();
@@ -503,7 +508,9 @@ impl ITfTextInputProcessorEx_Impl for TextService_Impl {
         _flags: u32,
     ) -> windows::core::Result<()> {
         log_line("ActivateEx");
-        self.advise_keys(ptim, tid)
+        let r = self.advise_keys(ptim, tid);
+        ui_notify::show();
+        r
     }
 }
 

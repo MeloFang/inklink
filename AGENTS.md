@@ -42,9 +42,10 @@ inklink/
 │  ├─ src/ipc.rs         命名管道客户端 + 引擎自动拉起
 │  ├─ src/pinyin.rs      402 音节表（贪心最长匹配；算分段上屏吃掉多少字母 + 组合串按音节显示的 `'`）
 │  ├─ src/state.rs       全局状态（注册表 HKCU\Software\inklink\State：中英、中文标点）
+│  ├─ src/ui_notify.rs   让浮条出现/收起（Activate→PostMessageW(WM_APP+12)，Deactivate→+13）
 │  └─ build.rs           把 VERSION 编进 DLL
 ├─ ui/                   常驻 UI 进程（浮条 + 托盘；独立 crate，不加载进别人进程）
-│  ├─ src/main.rs        浮条窗口：中/英方块、标点方块、☰、拖动记忆
+│  ├─ src/main.rs        浮条窗口：中/英方块、标点方块、☰、拖动记忆、按 WM_APP+12/13 显隐
 │  ├─ src/state.rs       注册表读写（State / UI 位置 / 开机自启）
 │  └─ src/tray.rs        托盘图标 + 右键菜单
 ├─ rime-server/          C++ 引擎服务（链 librime，x86）

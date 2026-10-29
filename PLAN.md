@@ -721,7 +721,8 @@ Obsidian 语料 + AI 兜底，默认关闭联网（符合项目铁律）。
 - 默认位置：工作区右下角再上移 44px（本机搜狗浮条 `SoPY_Status` 正好占着右下角，压在它下面点都点不到）；拖动后写 `HKCU\Software\inklink\UI` 的 `X`/`Y`。
 - **写注册表失败时的降级**：第一次失败就置 `WRITE_OK=false`，之后不再用注册表回灌 UI（否则用户点一下、400ms 又被改回去）。真实用户（安装器/自启/双击）是正常令牌，能写；本机 DSH 会话的子进程是**受限令牌**，`RegCreateKeyExW` 恒 `rc=5`，属环境限制。
 - 托盘：`NIM_ADD` 在 exe 找不到 `inklink.ico` 时会失败 → 退回 `IDI_APPLICATION`；仍失败则 `WM_TIMER` 里重试 5 次后放弃（不影响浮条与打字）。
-- 已知限制：☰ 菜单里的「设置…」是灰的（P2 才做）；浮条不跟随光标（P3 可选项）。
+- **只在用这个输入法时出现**（2026-10-29，1.1.1，用户要求"像搜狗那样"）：`tsf\src\ui_notify.rs` 在 `Activate`/`ActivateEx` 里 `PostMessageW(浮条窗口, WM_APP+12)`、`Deactivate` 里 `WM_APP+13`；浮条启动时**不显示**，收到 SHOW 才 `ShowWindow`，收到 HIDE 后延迟 250ms 收起（连续切两个应用时 `Deactivate`/`Activate` 成对到达，立刻收会闪）。用窗口消息而不是管道：单向、偶发、无返回值，`PostMessageW` 异步，不会卡住应用 UI 线程。两处常量必须一致（`tsf\src\ui_notify.rs` ↔ `ui\src\main.rs`）。
+- 已知限制：☰ 菜单里的「设置…」是灰的（P2 才做）；浮条不跟随光标（P3 可选项）；宿主进程崩溃时 `Deactivate` 不会来，浮条会留在屏幕上（再切一次输入法就好）。
 
 
 

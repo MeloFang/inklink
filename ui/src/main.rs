@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
     BeginPaint, CreateFontW, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint, FillRect,
-    InvalidateRect, RoundRect, SelectObject, SetBkMode, SetTextColor, UpdateWindow, DT_CENTER,
+    InvalidateRect, RoundRect, SelectObject, SetBkMode, SetTextColor, DT_CENTER,
     DT_SINGLELINE, DT_VCENTER, HBRUSH, HDC, HGDIOBJ, PAINTSTRUCT, TRANSPARENT,
 };
 use windows_sys::Win32::UI::HiDpi::{
@@ -24,16 +24,23 @@ use windows_sys::Win32::UI::HiDpi::{
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect, GetCursorPos,
-    GetMessageW, GetWindowRect, LoadCursorW, MoveWindow, PostQuitMessage,
+    GetMessageW, GetWindowRect, IsWindowVisible, KillTimer, LoadCursorW, MoveWindow, PostQuitMessage,
     RegisterClassW, SetTimer, ShowWindow, SystemParametersInfoW, TranslateMessage, CS_HREDRAW,
-    CS_VREDRAW, IDC_ARROW, MSG, SPI_GETWORKAREA, SW_SHOWNOACTIVATE, WNDCLASSW, WM_DESTROY,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_RBUTTONUP, WM_TIMER,
+    CS_VREDRAW, IDC_ARROW, MSG, SPI_GETWORKAREA, SW_HIDE, SW_SHOWNOACTIVATE, WNDCLASSW, WM_APP,
+    WM_DESTROY, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_RBUTTONUP, WM_TIMER,
     WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
 const WINDOW_CLASS: &str = "inklink-ui-bar";
 const TIMER_POLL: usize = 1;
 const POLL_MS: u32 = 400;
+/// 收起浮条的延迟：连续在两个应用之间切换时 `Deactivate`/`Activate` 会成对到达，
+/// 立刻隐藏会闪一下，所以等一会儿再收，期间又收到 SHOW 就取消。
+const TIMER_HIDE: usize = 2;
+const HIDE_DELAY_MS: u32 = 250;
+/// 与 `tsf/src/ui_notify.rs` 里的同名常量必须一致。
+const WM_UI_SHOW: u32 = WM_APP + 12;
+const WM_UI_HIDE: u32 = WM_APP + 13;
 
 static TRAY_ADDED: AtomicBool = AtomicBool::new(false);
 static WRITE_OK: AtomicBool = AtomicBool::new(true);
@@ -313,12 +320,36 @@ fn sync_from_registry(hwnd: HWND) {
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
+        // 输入法被切到前台：出现（像搜狗那样，用的时候才有）
+        WM_UI_SHOW => {
+            unsafe { KillTimer(hwnd, TIMER_HIDE) };
+            if unsafe { IsWindowVisible(hwnd) } == 0 {
+                unsafe { ShowWindow(hwnd, SW_SHOWNOACTIVATE) };
+                unsafe { InvalidateRect(hwnd, std::ptr::null(), 0) };
+                log("ui show");
+            }
+            0
+        }
+        // 输入法被切走：延迟收起，避免 A→B 连续切换时闪一下
+        WM_UI_HIDE => {
+            unsafe { SetTimer(hwnd, TIMER_HIDE, HIDE_DELAY_MS, None) };
+            0
+        }
         WM_PAINT => {
             log("paint");
             paint(hwnd);
             0
         }
         WM_TIMER => {
+            if wparam == TIMER_HIDE {
+                unsafe {
+                    KillTimer(hwnd, TIMER_HIDE);
+                    if IsWindowVisible(hwnd) != 0 {
+                        ShowWindow(hwnd, SW_HIDE);
+                        log("ui hide");
+                    }
+                }
+            }
             if wparam == TIMER_POLL {
                 // 托盘图标延迟到消息循环起来之后再加：`Shell_NotifyIconW` 会同步问一次
                 // 任务栏，Explorer 忙的时候能把调用方卡住（本机实测过一次，卡在启动路径上
@@ -540,9 +571,9 @@ fn main() {
         PUNCT.store(state::read_flag("Punctuation"), Ordering::Relaxed);
 
         log("before show");
-        ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-        log("after show");
-        UpdateWindow(hwnd);
+        // 启动时**不显示**：浮条要等输入法真正被切到前台（DLL 的 `Activate` 发消息）才出来。
+        // 想立刻看一眼可以用托盘图标左键。
+        log("start hidden (wait for IME activation)");
         // 托盘**不在启动路径上**做：`Shell_NotifyIconW` 会同步问一次任务栏，Explorer 忙的时候
         // 能把整个启动卡住（本机实测过一次）。放到定时器第一个 tick 里加，失败了下一个 tick 再试。
         SetTimer(hwnd, TIMER_POLL, POLL_MS, None);
