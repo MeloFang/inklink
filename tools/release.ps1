@@ -35,8 +35,11 @@ if (Test-Path $out) { Remove-Item $out -Recurse -Force }
 New-Item -ItemType Directory -Force $files | Out-Null
 
 # ── 1. 安装脚本（替换版本号占位符） ────────────────────────────
+# 只处理文本文件：installer\ 里还有 inklink.ico / inklink.png 这类二进制，
+# 之前用 ReadAllText 逐个"改写"会把图标写成乱码（压缩包里出现 73KB 的坏 ico）。
 $inst = Join-Path $root 'installer'
-foreach ($f in (Get-ChildItem $inst -File)) {
+$textExt = @('.cmd', '.ps1', '.txt', '.md')
+foreach ($f in (Get-ChildItem $inst -File | Where-Object { $textExt -contains $_.Extension })) {
     $text = [System.IO.File]::ReadAllText($f.FullName)
     $text = $text.Replace('__INKLINK_VERSION__', $version)
     # .cmd 保持纯 ASCII + CRLF（cmd.exe 按 OEM 代码页读文件）；.ps1 带 BOM；.txt 无 BOM

@@ -1,91 +1,106 @@
-# -*- coding: utf-8 -*-
-"""生成 inklink 的输入法图标（多尺寸 .ico）。
+#!/usr/bin/env python3
+"""从品牌图形生成产品图标（inklink.ico + 预览图）。
 
-用法：
-    python tools/make-icon.py
+输入：docs/brand/variants/ink-script.png（`ink` 手写体，透明底）
+输出：
+  installer/inklink.ico            多尺寸图标（16/20/24/32/40/48/64/256）
+  installer/inklink.png            512 预览（文档/通知用）
+  docs/brand/_probe-icon-sizes.png 各尺寸在白底与深底上的对照（检查用，不进 git）
 
-产出：
-    installer/inklink.ico   （安装时复制到 C:\\Program Files\\inklink\\inklink.ico）
-    installer/inklink.png   （512×512，文档/商店用）
+为什么裁到字母 i：整套 `ink` 在小尺寸下会糊成一团，只留 `i` + 墨点才认得出。
+画布是白色圆角方块（满幅），这样深色任务栏上也能看清——图形本身仍是品牌规定的
+"深蓝字 + 白底"，没有改色、没有重绘。
 
-设计：品牌橙圆角方块 + 白色「墨」。为什么是「墨」——inklink 的 ink 就是墨，
-而且输入法列表里微软是「拼」、搜狗是「S」，一个汉字在小尺寸下最好认。
-
-小尺寸（<24px）换成白色「i」：16/20px 上「墨」会糊成一块橙色，语言栏里认不出来。
-这是唯一一处按尺寸换字形的地方，其余尺寸保持同一套品牌。
+用法：python tools/make-icon.py
 """
 import os
-from PIL import Image, ImageDraw, ImageFont
+import sys
 
-# 品牌色：和候选窗高亮同色（#FF6600）
-BRAND = (0xFF, 0x66, 0x00, 0xFF)
-WHITE = (0xFF, 0xFF, 0xFF, 0xFF)
+from PIL import Image, ImageDraw
 
-GLYPH = "墨"
-SMALL_GLYPH = "i"      # < 24px 用这个
-SMALL_LIMIT = 24
-FONT_CANDIDATES = [
-    r"C:\Windows\Fonts\msyhbd.ttc",   # 微软雅黑 Bold
-    r"C:\Windows\Fonts\msyh.ttc",     # 微软雅黑
-    r"C:\Windows\Fonts\simhei.ttf",   # 黑体
-]
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
+SRC = os.path.join(ROOT, "docs", "brand", "variants", "ink-script.png")
+OUT_ICO = os.path.join(ROOT, "installer", "inklink.ico")
+OUT_PNG = os.path.join(ROOT, "installer", "inklink.png")
+OUT_PROBE = os.path.join(ROOT, "docs", "brand", "_probe-icon-sizes.png")
 
+MASTER = 1024               # 母版边长
+TILE_RADIUS_RATIO = 0.22    # 圆角半径 / 边长
+MARK_WIDTH_RATIO = 0.66     # 字形占画布宽度的比例（四周留白）
+CROP = (110, 0, 300, 332)   # 在 ink-script.png 里截取字母 i（含墨点与起笔；右边界 300 刚好切在 i 的收笔处，避免带上 n 的起笔变成"il"）
 
-def load_font(size: int) -> ImageFont.FreeTypeFont:
-    for path in FONT_CANDIDATES:
-        if os.path.exists(path):
-            try:
-                return ImageFont.truetype(path, size)
-            except OSError:
-                continue
-    raise SystemExit("找不到可用的中文字体（微软雅黑/黑体）")
+SIZES = [16, 20, 24, 32, 40, 48, 64, 256]
+BG = (255, 255, 255, 255)   # 白底（品牌规定：图形只能放白底）
 
 
-def render(size: int = 1024, glyph: str = GLYPH, ratio: float = 0.62) -> Image.Image:
-    """按 size 画，最后用 LANCZOS 缩小，边缘才干净。"""
-    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-    d = ImageDraw.Draw(img)
-
-    # 圆角方块：留 4% 边距，圆角半径 22%
-    pad = int(size * 0.04)
-    radius = int(size * 0.22)
-    d.rounded_rectangle([pad, pad, size - pad, size - pad], radius=radius, fill=BRAND)
-
-    # 居中：用字形的实际包围盒（汉字基线不等于视觉中心）
-    font = load_font(int(size * ratio))
-    box = d.textbbox((0, 0), glyph, font=font)
-    tw, th = box[2] - box[0], box[3] - box[1]
-    x = (size - tw) / 2 - box[0]
-    y = (size - th) / 2 - box[1]
-    d.text((x, y), glyph, font=font, fill=WHITE)
-    return img
+def load_mark():
+    im = Image.open(SRC).convert("RGBA")
+    mark = im.crop(CROP)
+    bbox = mark.getbbox()          # 去掉裁切带来的多余透明边，让字形自己占满
+    return mark.crop(bbox) if bbox else mark
 
 
-def main() -> None:
-    here = os.path.dirname(os.path.abspath(__file__))
-    out_dir = os.path.join(os.path.dirname(here), "installer")
-    os.makedirs(out_dir, exist_ok=True)
+def build_master(mark):
+    side = MASTER
+    tile = Image.new("RGBA", (side, side), (0, 0, 0, 0))
+    d = ImageDraw.Draw(tile)
+    r = int(side * TILE_RADIUS_RATIO)
+    d.rounded_rectangle([0, 0, side - 1, side - 1], radius=r, fill=BG)
 
-    master = render(1024)
-    master.resize((512, 512), Image.LANCZOS).save(os.path.join(out_dir, "inklink.png"))
+    target_w = int(side * MARK_WIDTH_RATIO)
+    scale = target_w / mark.size[0]
+    target_h = max(1, round(mark.size[1] * scale))
+    if target_h > side * 0.86:                       # 太高就按高度反算
+        target_h = int(side * 0.86)
+        target_w = max(1, round(mark.size[0] * target_h / mark.size[1]))
+    small = mark.resize((target_w, target_h), Image.LANCZOS)
+    tile.alpha_composite(small, ((side - target_w) // 2, (side - target_h) // 2))
+    return tile
 
-    # Windows 需要的尺寸：16/20/24/32/40/48/64/256
-    sizes = [16, 20, 24, 32, 40, 48, 64, 256]
-    frames = []
-    for s in sizes:
-        if s < SMALL_LIMIT:
-            frames.append(render(1024, SMALL_GLYPH, 0.72).resize((s, s), Image.LANCZOS))
-        else:
-            frames.append(master.resize((s, s), Image.LANCZOS))
 
-    ico_path = os.path.join(out_dir, "inklink.ico")
-    frames[-1].save(ico_path, format="ICO", sizes=[(s, s) for s in sizes], append_images=frames[:-1])
+def build_sizes(master):
+    return {s: master.resize((s, s), Image.LANCZOS) for s in SIZES}
 
-    for s, frame in zip(sizes, frames):
-        frame.save(os.path.join(out_dir, f"preview-{s}.png"))
 
-    print(f"已生成 {ico_path}")
-    print(f"已生成 {os.path.join(out_dir, 'inklink.png')}")
+def main():
+    if not os.path.exists(SRC):
+        sys.exit(f"缺少品牌图形：{SRC}")
+
+    mark = load_mark()
+    master = build_master(mark)
+    sizes = build_sizes(master)
+
+    master.resize((512, 512), Image.LANCZOS).save(OUT_PNG)
+    sizes[256].save(
+        OUT_ICO,
+        format="ICO",
+        sizes=[(s, s) for s in SIZES],
+        append_images=[sizes[s] for s in SIZES if s != 256],
+    )
+
+    # 检查图：白底与深底各一行，按尺寸从小到大
+    pad, gap = 16, 18
+    cols = SIZES
+    w = sum(s + pad * 2 for s in cols) + gap * (len(cols) + 1)
+    h = (256 + pad * 2) * 2 + gap * 3
+    sheet = Image.new("RGB", (w, h), (245, 245, 245))
+    y = gap
+    for bg in [(255, 255, 255), (18, 18, 20)]:
+        x = gap
+        for s in cols:
+            cell = Image.new("RGBA", (s + pad * 2, s + pad * 2), bg + (255,))
+            cell.alpha_composite(sizes[s], (pad, pad))
+            sheet.paste(cell.convert("RGB"), (x, y + (256 - s) // 2 + pad))
+            x += s + pad * 2
+        y += 256 + pad * 2 + gap
+    sheet.save(OUT_PROBE)
+
+    print(f"mark      : {mark.size[0]}x{mark.size[1]}（裁自 {os.path.relpath(SRC, ROOT)} {CROP}）")
+    print(f"母版      : {master.size[0]}x{master.size[1]}")
+    print(f"ico       : {os.path.relpath(OUT_ICO, ROOT)}  {os.path.getsize(OUT_ICO)} 字节  {SIZES}")
+    print(f"png       : {os.path.relpath(OUT_PNG, ROOT)}  {os.path.getsize(OUT_PNG)} 字节")
+    print(f"检查图    : {os.path.relpath(OUT_PROBE, ROOT)}")
 
 
 if __name__ == "__main__":

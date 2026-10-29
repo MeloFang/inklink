@@ -403,6 +403,9 @@ DLL 被加载后无法卸载：脚本每次用**新文件名 + 改注册表**，
 
 ### 踩过的坑（本阶段新增）
 
+- **`release.ps1` 别把 `installer\` 里的二进制当文本改写**：它原本遍历整个 `installer\` 做版本号替换，
+  图标 `inklink.ico`/`inklink.png` 也被 `ReadAllText` + `WriteAllText` 过了一遍，结果包内出现 73 KB 的
+  坏 ico、168 KB 的坏 png。现在只遍历 `.cmd/.ps1/.txt/.md`，二进制由 `Copy-Item` 单独拷。
 - `git commit -m` 带中文多行会被 PowerShell 拆坏（`error: unknown switch /`）→ 用 `git commit -F msg.txt`，文件 UTF-8 无 BOM。
 - **`argv` 是 ANSI 编码**（中文系统上是 GBK），命令行传中文（`--forget <码> <词>`）会匹配不上
   UTF-8 存的词 → 用 `argv_to_utf8()` 转换（`MultiByteToWideChar(CP_ACP)` + `WideCharToMultiByte(CP_UTF8)`）。

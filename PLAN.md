@@ -723,6 +723,7 @@ Obsidian 语料 + AI 兜底，默认关闭联网（符合项目铁律）。
 - 托盘：`NIM_ADD` 在 exe 找不到 `inklink.ico` 时会失败 → 退回 `IDI_APPLICATION`；仍失败则 `WM_TIMER` 里重试 5 次后放弃（不影响浮条与打字）。
 - **只在用这个输入法时出现**（2026-10-29，1.1.1，用户要求"像搜狗那样"）：`tsf\src\ui_notify.rs` 在 `Activate`/`ActivateEx` 里 `PostMessageW(浮条窗口, WM_APP+12)`、`Deactivate` 里 `WM_APP+13`；浮条启动时**不显示**，收到 SHOW 才 `ShowWindow`，收到 HIDE 后延迟 250ms 收起（连续切两个应用时 `Deactivate`/`Activate` 成对到达，立刻收会闪）。用窗口消息而不是管道：单向、偶发、无返回值，`PostMessageW` 异步，不会卡住应用 UI 线程。两处常量必须一致（`tsf\src\ui_notify.rs` ↔ `ui\src\main.rs`）。
 - 已知限制：☰ 菜单里的「设置…」是灰的（P2 才做）；浮条不跟随光标（P3 可选项）；宿主进程崩溃时 `Deactivate` 不会来，浮条会留在屏幕上（再切一次输入法就好）。
+- **产品图标**（1.1.2）：换成品牌 i 标记 —— 从 docs/brand/variants/ink-script.png 裁 x 110–300 的字母 i（只裁切，未重绘），贴白色圆角方块（半径 22%、字形占宽 66%），输出 16/20/24/32/40/48/64/256 八档 installer\inklink.ico；	ools\make-icon.py 改为从品牌图形生成。
 
 
 
