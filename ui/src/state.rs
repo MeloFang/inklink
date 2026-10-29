@@ -92,6 +92,14 @@ pub fn read_flag(name: &str) -> bool {
     read_dword(STATE_KEY, name) != Some(0)
 }
 
+/// 读 DLL 写的显隐序号（`HKCU\Software\inklink\UI`）。读不到就当 0。
+pub fn read_seq(name: &str) -> i32 {
+    match read_dword(UI_KEY, name) {
+        Some(v) => v as i32,
+        None => 0,
+    }
+}
+
 pub fn write_flag(name: &str, on: bool) -> u32 {
     write_dword(STATE_KEY, name, if on { 1 } else { 0 })
 }
@@ -179,14 +187,26 @@ pub fn exe_dir() -> String {
 
 /// 单实例：已经有一个浮条在跑就别再开第二个（否则托盘会出现两个图标）。
 ///
-/// 返回 false 表示"建不出互斥体"——那时宁可多开一个，也别开不了。
+/// 两道闸，缺一不可：
+///   1. **窗口类**：屏幕上已经有 `inklink-ui-bar` 就说明有实例在跑。这一条不依赖
+///      任何内核对象权限，受限令牌下也照样有效。
+///   2. **互斥体**：兜住"上一个实例刚创建、窗口还没建出来"这种窄窗口。
+///
+/// 只用互斥体是不够的：`CreateMutexW` 在受限令牌下会返回 NULL（ERROR_ACCESS_DENIED），
+/// 那时旧实现返回 false（"没在跑"），于是每启动一次就多一个浮条 —— 实测见过 5 个同时跑。
 pub fn already_running() -> bool {
     use windows_sys::Win32::System::Threading::CreateMutexW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::FindWindowW;
     const ERROR_ALREADY_EXISTS: u32 = 183;
-    let name = wide("Local\\inklink-ui-singleton");
     unsafe {
+        let class = wide("inklink-ui-bar");
+        if !FindWindowW(class.as_ptr(), std::ptr::null()).is_null() {
+            return true;
+        }
+        let name = wide("Local\\inklink-ui-singleton");
         let h = CreateMutexW(std::ptr::null_mut(), 0, name.as_ptr());
         if h.is_null() {
+            // 建不出互斥体（受限令牌）—— 窗口那一道闸已经查过了，放行
             return false;
         }
         windows_sys::Win32::Foundation::GetLastError() == ERROR_ALREADY_EXISTS

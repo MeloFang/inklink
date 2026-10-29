@@ -25,7 +25,8 @@ use windows_sys::Win32::Graphics::Gdi::{
     DT_VCENTER, PAINTSTRUCT, PS_SOLID, TRANSPARENT,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, GetClientRect, RegisterClassW, SetWindowPos, ShowWindow,
+    CreateWindowExW, DefWindowProcW, GetClientRect, IsWindowVisible, RegisterClassW, SetWindowPos,
+    ShowWindow,
     CW_USEDEFAULT, MA_NOACTIVATE, SWP_NOACTIVATE, SWP_NOZORDER, SW_HIDE, SW_SHOWNOACTIVATE,
     WM_ERASEBKGND, WM_LBUTTONDOWN, WM_MOUSEACTIVATE, WM_PAINT, WNDCLASSW, WS_EX_NOACTIVATE,
     WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
@@ -122,6 +123,20 @@ pub fn show(
         SetWindowRgn(hwnd as HWND, region, 1);
         ShowWindow(hwnd as HWND, SW_SHOWNOACTIVATE);
         InvalidateRect(hwnd as HWND, std::ptr::null(), 1);
+        // 排障用：位置/尺寸/可见性都记一行，用户报"候选窗不出来"时能直接看出是
+        // 没算对位置、还是 ShowWindow 没生效。
+        crate::log_line(&format!(
+            "cand show {}x{} at {},{} caret=({},{},{}) n={} visible={}",
+            w,
+            h,
+            x,
+            y,
+            caret.0,
+            caret.1,
+            caret.2,
+            candidates.len(),
+            IsWindowVisible(hwnd as HWND)
+        ));
     }
 }
 
@@ -208,6 +223,10 @@ pub fn hide() {
     unsafe {
         let hwnd = HWND_CELL.load(Ordering::SeqCst);
         if hwnd != 0 {
+            // 只在真的可见时才记一行，否则每次按键都刷一条
+            if IsWindowVisible(hwnd as HWND) != 0 {
+                crate::log_line("cand hide");
+            }
             ShowWindow(hwnd as HWND, SW_HIDE);
         }
     }

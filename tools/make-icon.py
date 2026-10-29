@@ -1,39 +1,45 @@
 #!/usr/bin/env python3
-"""从品牌图形生成产品图标（inklink.ico + 预览图）。
+"""从品牌图形生成产品图标。
 
 输入：docs/brand/variants/ink-script.png（`ink` 手写体，透明底）
 输出：
   installer/inklink.ico            多尺寸图标（16/20/24/32/40/48/64/256）
   installer/inklink.png            512 预览（文档/通知用）
+  installer/inklink-badge.ico      浮条第一格用的标记（透明底、字形撑满）
   docs/brand/_probe-icon-sizes.png 各尺寸在白底与深底上的对照（检查用，不进 git）
 
-为什么裁到字母 i：整套 `ink` 在小尺寸下会糊成一团，只留 `i` + 墨点才认得出。
-画布是白色圆角方块（满幅），这样深色任务栏上也能看清——图形本身仍是品牌规定的
-"深蓝字 + 白底"，没有改色、没有重绘。
+为什认到字母 i：整套 `ink` 在小尺寸下会糊成一团，只留 `i` + 墨点才认得出。
 
-用法：python tools/make-icon.py
+两种底板，各有各的理由：
+  - 产品图标：**深蓝圆角方块 + 白色字形**。白底版本在 16/20px 上只剩几根细线，
+    语言列表里看着就是一团灰；反过来（深蓝底 + 白字）和品牌徽标同构，
+    小尺寸下对比度高得多，深色任务栏上也显眼。
+  - 浮条第一格：透明底、字形撑满高度。那一格只有 20~24px，套一层方块等于把
+    笔画再缩一圈。
+
+只做裁切与反色，不改字形、不重绘。
 """
 import os
 import sys
 
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFilter
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 SRC = os.path.join(ROOT, "docs", "brand", "variants", "ink-script.png")
 OUT_ICO = os.path.join(ROOT, "installer", "inklink.ico")
 OUT_PNG = os.path.join(ROOT, "installer", "inklink.png")
-OUT_PROBE = os.path.join(ROOT, "docs", "brand", "_probe-icon-sizes.png")
-BADGE_SRC = os.path.join(ROOT, "docs", "brand", "variants", "ink-badge.png")
 OUT_BADGE = os.path.join(ROOT, "installer", "inklink-badge.ico")
+OUT_PROBE = os.path.join(ROOT, "docs", "brand", "_probe-icon-sizes.png")
 
-MASTER = 1024               # 母版边长
-TILE_RADIUS_RATIO = 0.22    # 圆角半径 / 边长
-MARK_WIDTH_RATIO = 0.66     # 字形占画布宽度的比例（四周留白）
+MASTER = 1024               # 预览用母版边长
+TILE_RADIUS_RATIO = 0.24    # 圆角半径 / 边长
+MARK_WIDTH_RATIO = 0.78     # 字形占画布宽度的比例（四周留白）
+MARK_MAX_HEIGHT = 0.92      # 字形最高占画布的多少
 CROP = (110, 0, 300, 332)   # 在 ink-script.png 里截取字母 i（含墨点与起笔；右边界 300 刚好切在 i 的收笔处，避免带上 n 的起笔变成"il"）
 
 SIZES = [16, 20, 24, 32, 40, 48, 64, 256]
-BG = (255, 255, 255, 255)   # 白底（品牌规定：图形只能放白底）
+NAVY = (6, 38, 87, 255)     # 品牌深蓝 #062657（取自徽标椭圆底色）
 
 
 def load_mark():
@@ -43,26 +49,55 @@ def load_mark():
     return mark.crop(bbox) if bbox else mark
 
 
-def build_master(mark):
-    side = MASTER
-    tile = Image.new("RGBA", (side, side), (0, 0, 0, 0))
-    d = ImageDraw.Draw(tile)
-    r = int(side * TILE_RADIUS_RATIO)
-    d.rounded_rectangle([0, 0, side - 1, side - 1], radius=r, fill=BG)
-
-    target_w = int(side * MARK_WIDTH_RATIO)
-    scale = target_w / mark.size[0]
-    target_h = max(1, round(mark.size[1] * scale))
-    if target_h > side * 0.86:                       # 太高就按高度反算
-        target_h = int(side * 0.86)
-        target_w = max(1, round(mark.size[0] * target_h / mark.size[1]))
-    small = mark.resize((target_w, target_h), Image.LANCZOS)
-    tile.alpha_composite(small, ((side - target_w) // 2, (side - target_h) // 2))
-    return tile
+def white_mark(mark):
+    """把字形反色成纯白：只换颜色，形状完全来自 alpha 通道。"""
+    solid = Image.new("RGBA", mark.size, (255, 255, 255, 255))
+    solid.putalpha(mark.split()[3])
+    return solid
 
 
-def build_sizes(master):
-    return {s: master.resize((s, s), Image.LANCZOS) for s in SIZES}
+def fit(mark, side, ratio, max_height):
+    tw = max(1, int(side * ratio))
+    th = max(1, round(mark.size[1] * tw / mark.size[0]))
+    if th > side * max_height:
+        th = int(side * max_height)
+        tw = max(1, round(mark.size[0] * th / mark.size[1]))
+    return tw, th
+
+
+def tile_icon(mark, side):
+    """深蓝圆角方块 + 白色字形。直接从源字形缩到这个尺寸，不用 1024 母版再缩，
+    少一次重采样，小尺寸的笔画会硬一点。"""
+    tw, th = fit(mark, side, MARK_WIDTH_RATIO, MARK_MAX_HEIGHT)
+    glyph = mark.resize((tw, th), Image.LANCZOS)
+    if side <= 48:                              # 小尺寸补一点锐度，抵消缩放糊
+        glyph = glyph.filter(ImageFilter.UnsharpMask(radius=0.6, percent=90, threshold=0))
+    canvas = Image.new("RGBA", (side, side), (0, 0, 0, 0))
+    d = ImageDraw.Draw(canvas)
+    d.rounded_rectangle([0, 0, side - 1, side - 1], radius=int(side * TILE_RADIUS_RATIO), fill=NAVY)
+    canvas.alpha_composite(glyph, ((side - tw) // 2, (side - th) // 2))
+    return canvas
+
+
+def bar_mark(mark, side):
+    """浮条第一格：透明底、字形撑满高度。"""
+    th = max(1, int(side * 0.96))
+    tw = max(1, round(mark.size[0] * th / mark.size[1]))
+    if tw > side:
+        tw = side
+        th = max(1, round(mark.size[1] * tw / mark.size[0]))
+    canvas = Image.new("RGBA", (side, side), (0, 0, 0, 0))
+    canvas.alpha_composite(mark.resize((tw, th), Image.LANCZOS), ((side - tw) // 2, (side - th) // 2))
+    return canvas
+
+
+def save_ico(squares, path):
+    squares[256].save(
+        path,
+        format="ICO",
+        sizes=[(s, s) for s in SIZES],
+        append_images=[squares[s] for s in SIZES if s != 256],
+    )
 
 
 def main():
@@ -70,63 +105,36 @@ def main():
         sys.exit(f"缺少品牌图形：{SRC}")
 
     mark = load_mark()
-    master = build_master(mark)
-    sizes = build_sizes(master)
+    white = white_mark(mark)
 
-    master.resize((512, 512), Image.LANCZOS).save(OUT_PNG)
-    sizes[256].save(
-        OUT_ICO,
-        format="ICO",
-        sizes=[(s, s) for s in SIZES],
-        append_images=[sizes[s] for s in SIZES if s != 256],
-    )
+    icons = {s: tile_icon(white, s) for s in SIZES}
+    save_ico(icons, OUT_ICO)
+    icons[256].resize((512, 512), Image.LANCZOS).save(OUT_PNG)
 
-    # 检查图：白底与深底各一行，按尺寸从小到大
+    badges = {s: bar_mark(mark, s) for s in SIZES}
+    save_ico(badges, OUT_BADGE)
+
+    # 检查图：白底与深底各一行
     pad, gap = 16, 18
-    cols = SIZES
-    w = sum(s + pad * 2 for s in cols) + gap * (len(cols) + 1)
+    w = sum(s + pad * 2 for s in SIZES) + gap * (len(SIZES) + 1)
     h = (256 + pad * 2) * 2 + gap * 3
     sheet = Image.new("RGB", (w, h), (245, 245, 245))
     y = gap
     for bg in [(255, 255, 255), (18, 18, 20)]:
         x = gap
-        for s in cols:
+        for s in SIZES:
             cell = Image.new("RGBA", (s + pad * 2, s + pad * 2), bg + (255,))
-            cell.alpha_composite(sizes[s], (pad, pad))
+            cell.alpha_composite(icons[s], (pad, pad))
             sheet.paste(cell.convert("RGB"), (x, y + (256 - s) // 2 + pad))
             x += s + pad * 2
         y += 256 + pad * 2 + gap
     sheet.save(OUT_PROBE)
 
     print(f"mark      : {mark.size[0]}x{mark.size[1]}（裁自 {os.path.relpath(SRC, ROOT)} {CROP}）")
-    print(f"母版      : {master.size[0]}x{master.size[1]}")
     print(f"ico       : {os.path.relpath(OUT_ICO, ROOT)}  {os.path.getsize(OUT_ICO)} 字节  {SIZES}")
     print(f"png       : {os.path.relpath(OUT_PNG, ROOT)}  {os.path.getsize(OUT_PNG)} 字节")
-    print(f"检查图    : {os.path.relpath(OUT_PROBE, ROOT)}")
-
-    # 浮条第一格用的标记：与产品图标同一个图形（白底圆角方块 + 深蓝 i），
-    # 只是把字形占比调大到 0.86 —— 那一格只有 20~24px，0.70 的笔画会细到看不清。
-    # （椭圆徽标试过：24px 下糊成一团深蓝，看不清是字，所以没用它。）
-    # 透明底、字形撑满高度：那一格只有 20~24px，再套一层白色方块等于把笔画又缩了一圈。
-    squares = {}
-    for s in SIZES:
-        th = int(s * 0.96)
-        tw = max(1, round(mark.size[0] * th / mark.size[1]))
-        if tw > s:
-            tw = s
-            th = max(1, round(mark.size[1] * tw / mark.size[0]))
-        canvas = Image.new("RGBA", (s, s), (0, 0, 0, 0))
-        canvas.alpha_composite(
-            mark.resize((tw, th), Image.LANCZOS), ((s - tw) // 2, (s - th) // 2)
-        )
-        squares[s] = canvas
-    squares[256].save(
-        OUT_BADGE,
-        format="ICO",
-        sizes=[(s, s) for s in SIZES],
-        append_images=[squares[s] for s in SIZES if s != 256],
-    )
     print(f"浮条标记  : {os.path.relpath(OUT_BADGE, ROOT)}  {os.path.getsize(OUT_BADGE)} 字节")
+    print(f"检查图    : {os.path.relpath(OUT_PROBE, ROOT)}")
 
 
 if __name__ == "__main__":

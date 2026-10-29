@@ -24,12 +24,13 @@ use windows_sys::Win32::UI::HiDpi::{
 use windows_sys::Win32::System::SystemInformation::GetTickCount64;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, DrawIconEx, GetClientRect,
-    GetCursorPos, GetMessageW, GetWindowRect, IsWindowVisible, KillTimer, LoadCursorW, MoveWindow,
-    PostQuitMessage, RegisterClassW, SetTimer, ShowWindow, SystemParametersInfoW, TranslateMessage,
-    CS_HREDRAW, CS_VREDRAW, DI_NORMAL, IDC_ARROW, MSG, SPI_GETWORKAREA, SW_HIDE, SW_SHOWNOACTIVATE,
-    WNDCLASSW, WM_APP, WM_DESTROY, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT,
-    WM_RBUTTONUP, WM_TIMER, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    ChangeWindowMessageFilterEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
+    DrawIconEx, GetClientRect, GetCursorPos, GetMessageW, GetWindowRect, IsWindowVisible, KillTimer,
+    LoadCursorW, MoveWindow, PostQuitMessage, RegisterClassW, SetTimer, ShowWindow,
+    SystemParametersInfoW, TranslateMessage, CHANGEFILTERSTRUCT, CS_HREDRAW, CS_VREDRAW, DI_NORMAL,
+    IDC_ARROW, MSG, MSGFLT_ALLOW, SPI_GETWORKAREA, SW_HIDE, SW_SHOWNOACTIVATE, WNDCLASSW, WM_APP,
+    WM_DESTROY, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_RBUTTONUP, WM_TIMER,
+    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
 const WINDOW_CLASS: &str = "inklink-ui-bar";
@@ -238,9 +239,9 @@ static BADGE: AtomicIsize = AtomicIsize::new(0);
 unsafe fn draw_badge(hdc: HDC, r: &RECT) {
     let mut h = BADGE.load(Ordering::Relaxed);
     if h == 0 {
-        // 第一格是品牌标记（白底圆角方块 + 深蓝 i），由 make-icon.py 按 0.86 的
-        // 视觉占比单独出一份：这一格只有 20~24px，产品图标那个占比会细到看不清。
-        let icon = tray::load_badge();
+        // 第一格直接用产品图标（深蓝圆角方块 + 白色 i）：和任务栏、语言列表里
+        // 那一枚是同一张图，24px 下也比透明底的字形清楚得多。
+        let icon = tray::load_icon();
         if icon.is_null() {
             return;
         }
@@ -390,6 +391,35 @@ fn sync_from_registry(hwnd: HWND) {
     }
 }
 
+/// 轮询 DLL 写的显隐序号（UIPI 兜底通道）。
+///
+/// 用窗口消息通知是首选，但 `PostMessageW` 从普通权限进程发到管理员权限的窗口会被
+/// UIPI 静默丢弃 —— 而浮条通常正是安装器以管理员身份拉起来的。注册表两边都够权限，
+/// 所以 DLL 每次启停都 +1，这里 400ms 看一眼，谁更新就执行谁。
+static LAST_SHOW_SEQ: AtomicI32 = AtomicI32::new(0);
+static LAST_HIDE_SEQ: AtomicI32 = AtomicI32::new(0);
+
+fn poll_activation(hwnd: HWND) {
+    let show_seq = state::read_seq("ShowSeq");
+    let hide_seq = state::read_seq("HideSeq");
+    let show_changed = show_seq != LAST_SHOW_SEQ.load(Ordering::Relaxed);
+    let hide_changed = hide_seq != LAST_HIDE_SEQ.load(Ordering::Relaxed);
+    LAST_SHOW_SEQ.store(show_seq, Ordering::Relaxed);
+    LAST_HIDE_SEQ.store(hide_seq, Ordering::Relaxed);
+    if show_changed {
+        unsafe {
+            KillTimer(hwnd, TIMER_HIDE);
+            if IsWindowVisible(hwnd) == 0 {
+                ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                InvalidateRect(hwnd, std::ptr::null(), 0);
+                log("ui show (poll)");
+            }
+        }
+    } else if hide_changed {
+        unsafe { SetTimer(hwnd, TIMER_HIDE, HIDE_DELAY_MS, None) };
+    }
+}
+
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
         // 输入法被切到前台：出现（像搜狗那样，用的时候才有）
@@ -442,6 +472,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     }
                 }
                 sync_from_registry(hwnd);
+                poll_activation(hwnd);
             }
             0
         }
@@ -635,8 +666,25 @@ fn main() {
         }
         log("window created");
 
+        // UIPI：浮条通常是安装器（管理员）拉起来的，而打字的应用是普通权限。
+        // 普通权限进程 `PostMessageW` 到高完整性窗口会被**静默丢弃**，表现就是
+        // "切到输入法了但浮条从来不出现"。`WM_APP+12/13` 属于 `WM_USER` 以上，
+        // 必须显式放开，否则这条消息永远收不到。
+        for msg in [WM_UI_SHOW, WM_UI_HIDE] {
+            let mut cf = CHANGEFILTERSTRUCT {
+                cbSize: std::mem::size_of::<CHANGEFILTERSTRUCT>() as u32,
+                ExtStatus: 0,
+            };
+            let ok = ChangeWindowMessageFilterEx(hwnd, msg, MSGFLT_ALLOW, &mut cf);
+            log(&format!("msg filter {msg:#x} -> {ok}"));
+        }
+
         let (w, h) = window_size(hwnd);
         log(&format!("size = {w}x{h}"));
+        // 先把当前序号记下来：否则第一条 400ms 轮询就会把"历史上的某次激活"当成新事件，
+        // 开机后浮条会自己冒出来（用户要的是"切到输入法才出现"）。
+        LAST_SHOW_SEQ.store(state::read_seq("ShowSeq"), Ordering::Relaxed);
+        LAST_HIDE_SEQ.store(state::read_seq("HideSeq"), Ordering::Relaxed);
         let (x, y) = state::read_pos().unwrap_or_else(|| default_position(hwnd));
         log(&format!("pos = {x},{y}"));
         MoveWindow(hwnd, x, y, w, h, 0);
