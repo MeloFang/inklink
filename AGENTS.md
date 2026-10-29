@@ -59,7 +59,7 @@ inklink/
 │  ├─ apply-fuzzy.ps1    按 fuzzy.yaml 生成 rime custom.yaml 并重启引擎验证
 │  ├─ engine-pipe.ps1    命名管道客户端（诊断/验证，可 dot-source）
 │  ├─ probe-legacy-select.ps1  回归探针：老协议选词不会让引擎死锁
-│  ├─ make-icon.py       生成 installer\inklink.ico（品牌图形 ink-script 裁出字母 i，贴在白色圆角方块上）
+│  ├─ make-icon.py       从品牌图形生成 installer\inklink.ico（产品图标）+ inklink-badge.ico（浮条第一格）
 │  └─ release.ps1        打 dist\inklink-<版本>.zip
 ├─ dist/                 发布产物（**不进 git**）
 ├─ docs/                 架构、ADR、阶段记录

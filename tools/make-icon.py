@@ -24,6 +24,8 @@ SRC = os.path.join(ROOT, "docs", "brand", "variants", "ink-script.png")
 OUT_ICO = os.path.join(ROOT, "installer", "inklink.ico")
 OUT_PNG = os.path.join(ROOT, "installer", "inklink.png")
 OUT_PROBE = os.path.join(ROOT, "docs", "brand", "_probe-icon-sizes.png")
+BADGE_SRC = os.path.join(ROOT, "docs", "brand", "variants", "ink-badge.png")
+OUT_BADGE = os.path.join(ROOT, "installer", "inklink-badge.ico")
 
 MASTER = 1024               # 母版边长
 TILE_RADIUS_RATIO = 0.22    # 圆角半径 / 边长
@@ -101,6 +103,30 @@ def main():
     print(f"ico       : {os.path.relpath(OUT_ICO, ROOT)}  {os.path.getsize(OUT_ICO)} 字节  {SIZES}")
     print(f"png       : {os.path.relpath(OUT_PNG, ROOT)}  {os.path.getsize(OUT_PNG)} 字节")
     print(f"检查图    : {os.path.relpath(OUT_PROBE, ROOT)}")
+
+    # 浮条第一格用的标记：与产品图标同一个图形（白底圆角方块 + 深蓝 i），
+    # 只是把字形占比调大到 0.86 —— 那一格只有 20~24px，0.70 的笔画会细到看不清。
+    # （椭圆徽标试过：24px 下糊成一团深蓝，看不清是字，所以没用它。）
+    # 透明底、字形撑满高度：那一格只有 20~24px，再套一层白色方块等于把笔画又缩了一圈。
+    squares = {}
+    for s in SIZES:
+        th = int(s * 0.96)
+        tw = max(1, round(mark.size[0] * th / mark.size[1]))
+        if tw > s:
+            tw = s
+            th = max(1, round(mark.size[1] * tw / mark.size[0]))
+        canvas = Image.new("RGBA", (s, s), (0, 0, 0, 0))
+        canvas.alpha_composite(
+            mark.resize((tw, th), Image.LANCZOS), ((s - tw) // 2, (s - th) // 2)
+        )
+        squares[s] = canvas
+    squares[256].save(
+        OUT_BADGE,
+        format="ICO",
+        sizes=[(s, s) for s in SIZES],
+        append_images=[squares[s] for s in SIZES if s != 256],
+    )
+    print(f"浮条标记  : {os.path.relpath(OUT_BADGE, ROOT)}  {os.path.getsize(OUT_BADGE)} 字节")
 
 
 if __name__ == "__main__":

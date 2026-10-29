@@ -55,6 +55,7 @@ Write-Host '  安装脚本 OK'
 Copy-Item $dll64 (Join-Path $files 'inklink_tsf.dll')   -Force
 Copy-Item $dll32 (Join-Path $files 'inklink_tsf32.dll') -Force
 Copy-Item (Join-Path $root 'installer\inklink.ico') (Join-Path $files 'inklink.ico') -Force
+Copy-Item (Join-Path $root 'installer\inklink-badge.ico') (Join-Path $files 'inklink-badge.ico') -Force
 $uiExe = Join-Path $root 'ui\target\release\inklink-ui.exe'
 if (Test-Path $uiExe) {
     Copy-Item $uiExe (Join-Path $files 'inklink-ui.exe') -Force

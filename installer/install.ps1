@@ -67,6 +67,7 @@ $dll64 = Install-File "$SRC\inklink_tsf.dll"   "$PF\inklink_tsf.dll"
 $dll32 = Install-File "$SRC\inklink_tsf32.dll" "$PF\inklink_tsf32.dll"
 # 语言列表里那一行的图标：DllRegisterServer 按 DLL 同目录的 inklink.ico 找它
 if (Test-Path "$SRC\inklink.ico") { Install-File "$SRC\inklink.ico" "$PF\inklink.ico" | Out-Null }
+if (Test-Path "$SRC\inklink-badge.ico") { Install-File "$SRC\inklink-badge.ico" "$PF\inklink-badge.ico" | Out-Null }
 Install-File "$SRC\rime-server.exe" "$ENG\rime-server.exe" | Out-Null
 Install-File "$SRC\rime.dll"        "$ENG\rime.dll"        | Out-Null
 # 常驻 UI 进程（浮条 + 托盘）。它不加载进别人的进程，升级可以随时替换。

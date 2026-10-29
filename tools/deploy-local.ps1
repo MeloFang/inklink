@@ -73,7 +73,9 @@ Copy-Item $dll32 $target32 -Force
 
 # 语言列表里那一行的图标（DllRegisterServer 会按 DLL 同目录的 inklink.ico 找它）
 $ico = Join-Path $root 'installer\inklink.ico'
-if (Test-Path $ico) { Copy-Item $ico (Join-Path $PF 'inklink.ico') -Force }
+if (Test-Path $ico) { Copy-Item $ico (Join-Path $PF 'inklink.ico') -Force
+        $badge = Join-Path $root 'installer\inklink-badge.ico'
+        if (Test-Path $badge) { Copy-Item $badge (Join-Path $PF 'inklink-badge.ico') -Force } }
 
 # 常驻 UI 进程（浮条 + 托盘）。它是独立进程，不加载进别人的进程，可以热替换。
 $uiExe = Join-Path $root 'ui\target\release\inklink-ui.exe'

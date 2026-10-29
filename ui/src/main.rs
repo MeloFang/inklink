@@ -11,7 +11,7 @@
 mod state;
 mod tray;
 
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicIsize, Ordering};
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
     BeginPaint, CreateFontW, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint, FillRect,
@@ -21,14 +21,15 @@ use windows_sys::Win32::Graphics::Gdi::{
 use windows_sys::Win32::UI::HiDpi::{
     GetDpiForWindow, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
+use windows_sys::Win32::System::SystemInformation::GetTickCount64;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect, GetCursorPos,
-    GetMessageW, GetWindowRect, IsWindowVisible, KillTimer, LoadCursorW, MoveWindow, PostQuitMessage,
-    RegisterClassW, SetTimer, ShowWindow, SystemParametersInfoW, TranslateMessage, CS_HREDRAW,
-    CS_VREDRAW, IDC_ARROW, MSG, SPI_GETWORKAREA, SW_HIDE, SW_SHOWNOACTIVATE, WNDCLASSW, WM_APP,
-    WM_DESTROY, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_RBUTTONUP, WM_TIMER,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, DrawIconEx, GetClientRect,
+    GetCursorPos, GetMessageW, GetWindowRect, IsWindowVisible, KillTimer, LoadCursorW, MoveWindow,
+    PostQuitMessage, RegisterClassW, SetTimer, ShowWindow, SystemParametersInfoW, TranslateMessage,
+    CS_HREDRAW, CS_VREDRAW, DI_NORMAL, IDC_ARROW, MSG, SPI_GETWORKAREA, SW_HIDE, SW_SHOWNOACTIVATE,
+    WNDCLASSW, WM_APP, WM_DESTROY, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT,
+    WM_RBUTTONUP, WM_TIMER, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
 const WINDOW_CLASS: &str = "inklink-ui-bar";
@@ -51,9 +52,15 @@ const PAD: i32 = 3;
 const ITEM_H: i32 = 24;
 const RADIUS: i32 = 6;
 const GAP: i32 = 2;
+/// 第一格是品牌标（深蓝椭圆 + 白 ink），点它等同点 ☰。
+const W_BRAND: i32 = 26;
 const W_MODE: i32 = 46;
 const W_PUNCT: i32 = 46;
 const W_MENU: i32 = 30;
+
+/// 点完浮条后这段时间内不收起：点一下会顺带让 IME 失活（宿主把焦点交给浮条），
+/// 于是 250ms 后照常隐藏 —— 用户看到的就是"点一下就没了"。这里让它钉住一会儿。
+const STICKY_MS: u64 = 1500;
 
 // COLORREF 是 0x00BBGGRR
 const C_ORANGE: u32 = 0x00_00_66_FF;
@@ -68,6 +75,33 @@ static PUNCT: AtomicBool = AtomicBool::new(true);
 static HOVER: AtomicI32 = AtomicI32::new(-1);
 static DRAG_ARMED: AtomicBool = AtomicBool::new(false);
 static DRAGGING: AtomicBool = AtomicBool::new(false);
+
+/// 最近一次与浮条交互的时刻（`GetTickCount64`，毫秒）。用来推迟"自己消失"。
+static LAST_TOUCH: AtomicI64 = AtomicI64::new(0);
+
+fn touch() {
+    LAST_TOUCH.store(unsafe { GetTickCount64() } as i64, Ordering::Relaxed);
+}
+
+fn recently_touched() -> bool {
+    let t = LAST_TOUCH.load(Ordering::Relaxed);
+    if t == 0 {
+        return false;
+    }
+    let now = unsafe { GetTickCount64() } as i64;
+    now.saturating_sub(t) < STICKY_MS as i64
+}
+
+/// 鼠标现在是否停在浮条上（`XP`/`YP` 都是屏幕坐标）。
+fn cursor_inside(hwnd: HWND) -> bool {
+    let mut pt: POINT = unsafe { std::mem::zeroed() };
+    let mut wr: RECT = unsafe { std::mem::zeroed() };
+    unsafe {
+        GetCursorPos(&mut pt);
+        GetWindowRect(hwnd, &mut wr);
+    }
+    pt.x >= wr.left && pt.x < wr.right && pt.y >= wr.top && pt.y < wr.bottom
+}
 
 struct DragState {
     cursor: POINT,
@@ -123,12 +157,13 @@ fn dpi_scale(hwnd: HWND, v: i32) -> i32 {
     (v * dpi + 48) / 96
 }
 
-/// 三个可点的地方：中文/英文、中文标点/半角、菜单。
-fn item_rects(hwnd: HWND) -> [RECT; 3] {
+/// 四个可点的地方：品牌标、中文/英文、中文标点/半角、菜单。
+fn item_rects(hwnd: HWND) -> [RECT; 4] {
     let pad = dpi_scale(hwnd, PAD);
     let gap = dpi_scale(hwnd, GAP);
     let h = dpi_scale(hwnd, ITEM_H);
     let widths = [
+        dpi_scale(hwnd, W_BRAND),
         dpi_scale(hwnd, W_MODE),
         dpi_scale(hwnd, W_PUNCT),
         dpi_scale(hwnd, W_MENU),
@@ -138,7 +173,7 @@ fn item_rects(hwnd: HWND) -> [RECT; 3] {
         top: 0,
         right: 0,
         bottom: 0,
-    }; 3];
+    }; 4];
     let mut x = pad;
     for (i, w) in widths.iter().enumerate() {
         rects[i] = RECT {
@@ -153,7 +188,7 @@ fn item_rects(hwnd: HWND) -> [RECT; 3] {
 }
 
 fn window_size(hwnd: HWND) -> (i32, i32) {
-    let last = item_rects(hwnd)[2];
+    let last = item_rects(hwnd)[3];
     let pad = dpi_scale(hwnd, PAD);
     (last.right + pad, last.bottom + pad)
 }
@@ -197,6 +232,37 @@ unsafe fn draw_item(
     SelectObject(hdc, old_font);
 }
 
+/// 第一格里的品牌标。图标只加载一次（`LoadImageW` 会读盘），之后一直复用。
+static BADGE: AtomicIsize = AtomicIsize::new(0);
+
+unsafe fn draw_badge(hdc: HDC, r: &RECT) {
+    let mut h = BADGE.load(Ordering::Relaxed);
+    if h == 0 {
+        // 第一格是品牌标记（白底圆角方块 + 深蓝 i），由 make-icon.py 按 0.86 的
+        // 视觉占比单独出一份：这一格只有 20~24px，产品图标那个占比会细到看不清。
+        let icon = tray::load_badge();
+        if icon.is_null() {
+            return;
+        }
+        h = icon as isize;
+        BADGE.store(h, Ordering::Relaxed);
+    }
+    let side = (r.bottom - r.top).min(r.right - r.left);
+    let x = r.left + (r.right - r.left - side) / 2;
+    let y = r.top + (r.bottom - r.top - side) / 2;
+    DrawIconEx(
+        hdc,
+        x,
+        y,
+        h as windows_sys::Win32::UI::WindowsAndMessaging::HICON,
+        side,
+        side,
+        0,
+        std::ptr::null_mut(),
+        DI_NORMAL,
+    );
+}
+
 unsafe fn paint(hwnd: HWND) {
     let mut ps: PAINTSTRUCT = std::mem::zeroed();
     let hdc = BeginPaint(hwnd, &mut ps);
@@ -233,23 +299,29 @@ unsafe fn paint(hwnd: HWND) {
     let punct = PUNCT.load(Ordering::Relaxed);
     let hover = HOVER.load(Ordering::Relaxed);
 
+    // 第一格：品牌标（不带底色，直接画图标）
+    if hover == 0 {
+        draw_item(hdc, &rects[0], "", C_ITEM_HOVER, C_TEXT, font, radius);
+    }
+    draw_badge(hdc, &rects[0]);
+
     let mode_text = if chinese { "中" } else { "英" };
     let (mode_bg, mode_fg) = if chinese {
         (C_ORANGE, C_WHITE)
-    } else if hover == 0 {
+    } else if hover == 1 {
         (C_ITEM_HOVER, C_TEXT)
     } else {
         (C_ITEM, C_TEXT)
     };
-    draw_item(hdc, &rects[0], mode_text, mode_bg, mode_fg, font, radius);
+    draw_item(hdc, &rects[1], mode_text, mode_bg, mode_fg, font, radius);
 
     let punct_text = if punct { "，。" } else { ",." };
-    let punct_bg = if hover == 1 { C_ITEM_HOVER } else { C_ITEM };
+    let punct_bg = if hover == 2 { C_ITEM_HOVER } else { C_ITEM };
     let punct_fg = if punct { C_ORANGE } else { C_TEXT };
-    draw_item(hdc, &rects[1], punct_text, punct_bg, punct_fg, font, radius);
+    draw_item(hdc, &rects[2], punct_text, punct_bg, punct_fg, font, radius);
 
-    let menu_bg = if hover == 2 { C_ITEM_HOVER } else { C_ITEM };
-    draw_item(hdc, &rects[2], "☰", menu_bg, C_TEXT, font, radius);
+    let menu_bg = if hover == 3 { C_ITEM_HOVER } else { C_ITEM };
+    draw_item(hdc, &rects[3], "☰", menu_bg, C_TEXT, font, radius);
 
     DeleteObject(font as HGDIOBJ);
     EndPaint(hwnd, &ps);
@@ -344,7 +416,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             if wparam == TIMER_HIDE {
                 unsafe {
                     KillTimer(hwnd, TIMER_HIDE);
-                    if IsWindowVisible(hwnd) != 0 {
+                    // 刚点过、或者鼠标还停在浮条上就先不收起：点一下会让宿主失活、
+                    // 我们随即收到 WM_UI_HIDE，用户看到的就是"点一下就没了"。
+                    if recently_touched() || cursor_inside(hwnd) {
+                        log("ui hide skipped (sticky)");
+                    } else if IsWindowVisible(hwnd) != 0 {
                         ShowWindow(hwnd, SW_HIDE);
                         log("ui hide");
                     }
@@ -400,6 +476,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let x = (lparam & 0xFFFF) as i16 as i32;
             let y = ((lparam >> 16) & 0xFFFF) as i16 as i32;
             log(&format!("LBUTTONDOWN x={x} y={y} hit={}", hit_test(hwnd, x, y)));
+            touch();
             let mut cursor: POINT = std::mem::zeroed();
             let mut wr: RECT = std::mem::zeroed();
             GetCursorPos(&mut cursor);
@@ -431,15 +508,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 state::write_pos(wr.left, wr.top);
             } else {
                 match pressed {
-                    0 => toggle_mode(hwnd),
-                    1 => toggle_punct(hwnd),
-                    2 => {
-                        let mut wr: RECT = std::mem::zeroed();
-                        GetWindowRect(hwnd, &mut wr);
+                    // 品牌标：等同点 ☰，把菜单弹出来
+                    0 | 3 => {
                         let cmd = tray::popup(hwnd, CHINESE.load(Ordering::Relaxed), PUNCT.load(Ordering::Relaxed), state::autostart_enabled());
-                        let _ = wr;
                         handle_menu(hwnd, cmd);
                     }
+                    1 => toggle_mode(hwnd),
+                    2 => toggle_punct(hwnd),
                     _ => {}
                 }
             }

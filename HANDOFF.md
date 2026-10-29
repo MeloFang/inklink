@@ -263,6 +263,9 @@ C:\inklink-engine\
 
 > **全局状态已就位（1.0.17）**：`HKCU\Software\inklink\State` 的 `Chinese` / `Punctuation`。
 > **浮条已就位（1.1.0，1.1.1 起"用时才出现"）**：`C:\Program Files\inklink\inklink-ui.exe`，右下角可拖动，点「中/英」和「，。」两个方块，
+
+- **浮条第一格放品牌标记**（1.1.3）：`installer\inklink-badge.ico`（透明底、字形撑满的字母 i），点它等同点 ☰；窗口 168→204px。
+- **点浮条不会立刻消失**（1.1.3）：`Deactivate` 的收起请求会被"最近 1.5s 点过 / 鼠标还在浮条上"挡掉一次，否则点一下就没。
 > 所有应用同时切换；杀进程不影响打字（状态在注册表里，DLL 每键现读）。
 > 显隐由 TSF 的 `Activate`/`Deactivate` 驱动（`tsf\src\ui_notify.rs` 发 `WM_APP+12/13`）——
 > 切到这个输入法才出现，切走自动收起，不再一直挂在角落。

@@ -29,7 +29,7 @@ fn wide(s: &str) -> Vec<u16> {
 
 /// 优先用 exe 旁边的 `inklink.ico`（安装后一定在），开发时（`target\release`）没有这个文件，
 /// 就退回系统默认应用图标 —— 否则 `hIcon` 为 null，`Shell_NotifyIconW` 会失败，托盘上什么都不出现。
-fn load_icon() -> HICON {
+pub fn load_icon() -> HICON {
     let dir = crate::state::exe_dir();
     let path = wide(&format!("{dir}\\inklink.ico"));
     let h = unsafe {
@@ -46,6 +46,27 @@ fn load_icon() -> HICON {
         return h as HICON;
     }
     unsafe { LoadIconW(std::ptr::null_mut(), IDI_APPLICATION) as HICON }
+}
+
+/// 浮条最左边那一格要显示的品牌标（深蓝椭圆 + 白 `ink`）。
+/// 安装后与 `inklink.ico` 一起躺在 exe 旁边；开发目录里没有就退回产品图标。
+pub fn load_badge() -> HICON {
+    let dir = crate::state::exe_dir();
+    let path = wide(&format!("{dir}\\inklink-badge.ico"));
+    let h = unsafe {
+        LoadImageW(
+            std::ptr::null_mut(),
+            path.as_ptr(),
+            IMAGE_ICON,
+            0,
+            0,
+            LR_LOADFROMFILE,
+        )
+    };
+    if !h.is_null() {
+        return h as HICON;
+    }
+    load_icon()
 }
 
 fn data(hwnd: HWND) -> NOTIFYICONDATAW {
