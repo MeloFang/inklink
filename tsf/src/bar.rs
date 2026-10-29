@@ -20,9 +20,9 @@ use std::sync::Mutex;
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
-    BeginPaint, CreateFontW, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint, FillRect,
-    InvalidateRect, RoundRect, SelectObject, SetBkMode, SetTextColor, DT_CENTER, DT_SINGLELINE,
-    DT_VCENTER, HBRUSH, HDC, HGDIOBJ, PAINTSTRUCT, TRANSPARENT,
+    BeginPaint, CreateFontW, CreateRoundRectRgn, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint,
+    FillRect, InvalidateRect, RoundRect, SelectObject, SetBkMode, SetTextColor, SetWindowRgn,
+    DT_CENTER, DT_SINGLELINE, DT_VCENTER, HBRUSH, HDC, HGDIOBJ, PAINTSTRUCT, TRANSPARENT,
 };
 use windows_sys::Win32::UI::HiDpi::GetDpiForSystem;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
@@ -48,25 +48,36 @@ static HOVER: AtomicI32 = AtomicI32::new(-1);
 static DRAG_ARMED: AtomicBool = AtomicBool::new(false);
 static DRAGGING: AtomicBool = AtomicBool::new(false);
 static FONT: AtomicIsize = AtomicIsize::new(0);
+/// 标点格单独一个字号：全角标点的墨迹都压在字框底部，小字号时那两个点看不清。
+static FONT_PUNCT: AtomicIsize = AtomicIsize::new(0);
 
 // 96 DPI 下的设计尺寸，实际按 DPI 缩放
-const PAD: i32 = 3;
-const ITEM_H: i32 = 24;
-const RADIUS: i32 = 6;
+const PAD: i32 = 4;
+const ITEM_H: i32 = 26;
+const RADIUS: i32 = 7;
 const GAP: i32 = 2;
 /// 第一格是品牌标（深蓝圆角方块 + 白色 i），点它等同点 ☰。
 const W_BRAND: i32 = 26;
-const W_MODE: i32 = 46;
-const W_PUNCT: i32 = 46;
-const W_MENU: i32 = 30;
+/// 品牌标和状态之间那道竖线（和搜狗一样），两边各留 5。
+const SEP_GAP: i32 = 5;
+const SEP_W: i32 = 1;
+const W_MODE: i32 = 40;
+const W_PUNCT: i32 = 44;
+const W_MENU: i32 = 32;
 
-// COLORREF 是 0x00BBGGRR
-const C_ORANGE: u32 = 0x00_00_66_FF;
-const C_BG: u32 = 0x00_FA_FA_FA;
-const C_ITEM: u32 = 0x00_EC_EC_EC;
-const C_ITEM_HOVER: u32 = 0x00_E0_E0_E0;
-const C_TEXT: u32 = 0x00_20_20_20;
-const C_WHITE: u32 = 0x00_FF_FF_FF;
+// COLORREF 是 0x00BBGGRR（低字节是红）
+/// 整条是一块白底，不再给每格画独立的灰方块 —— 那样四坨色块很笨重。
+const C_BG: u32 = 0x00_FF_FF_FF;
+/// 描边 #DCDCE2：白底浮条放到白色窗口上，没有一条清楚的边界就"化"进去了。
+const C_BORDER: u32 = 0x00_E2_DC_DC;
+/// 悬停垫底 #F0F0F5。
+const C_HOVER: u32 = 0x00_F5_F0_F0;
+/// 常态文字 #333336。
+const C_TEXT: u32 = 0x00_36_33_33;
+/// 关闭/未激活的文字 #8A8A8E（比常态浅，一眼能分出开和关）。
+const C_DIM: u32 = 0x00_8E_8A_8A;
+/// 激活色 = 品牌深蓝 #062657（原来是搜狗那种橙，2026-10-29 按用户要求换掉）。
+const C_ACCENT: u32 = 0x00_57_26_06;
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
@@ -79,10 +90,14 @@ fn scale(v: i32) -> i32 {
 }
 
 /// 四个可点的地方：品牌标、中文/英文、中文标点/半角、菜单。纯函数，可单测。
+///
+/// 品牌标和第一格状态之间多留一道竖线（`SEP_W` 宽，两边各 `SEP_GAP`），
+/// 和搜狗浮条一样给"品牌 | 状态"一个视觉分隔。竖线本身不是可点区域。
 fn item_rects() -> [RECT; 4] {
     let pad = scale(PAD);
     let gap = scale(GAP);
     let h = scale(ITEM_H);
+    let sep_total = scale(SEP_GAP) * 2 + scale(SEP_W);
     let widths = [
         scale(W_BRAND),
         scale(W_MODE),
@@ -104,6 +119,9 @@ fn item_rects() -> [RECT; 4] {
             bottom: pad + h,
         };
         x += w + gap;
+        if i == 0 {
+            x += sep_total;
+        }
     }
     rects
 }
@@ -219,7 +237,21 @@ fn ensure_window() {
             let (w, h) = window_size();
             let (x, y) = crate::state::read_pos().unwrap_or_else(default_position);
             MoveWindow(hwnd, x, y, w, h, 0);
+            apply_region(hwnd);
             crate::log_line(&format!("bar: created {w}x{h} at {x},{y}"));
+        }
+    }
+}
+
+/// 把窗口裁成圆角：`WS_POPUP` 是矩形，不裁的话四角会露出一块白（深色背景上很显眼）。
+/// 区域归系统所有，`SetWindowRgn` 之后不要再删它。
+fn apply_region(hwnd: HWND) {
+    let (w, h) = window_size();
+    let r = scale(RADIUS);
+    unsafe {
+        let rgn = CreateRoundRectRgn(0, 0, w + 1, h + 1, r * 2, r * 2);
+        if !rgn.is_null() {
+            SetWindowRgn(hwnd, rgn, 1);
         }
     }
 }
@@ -272,7 +304,9 @@ unsafe fn draw_badge(hdc: HDC, r: &RECT) {
         h = icon as isize;
         BADGE.store(h, Ordering::Relaxed);
     }
-    let side = (r.bottom - r.top).min(r.right - r.left);
+    // 图标比格子小一圈，留出边距；尺寸取整数倍 DPI，尽量命中 ICO 里的 20/24/32 帧，
+    // 避免 `DrawIconEx` 从 32 帧往下重采样（那是"图标糊"的主要来源）。
+    let side = scale(W_BRAND - 6);
     let x = r.left + (r.right - r.left - side) / 2;
     let y = r.top + (r.bottom - r.top - side) / 2;
     DrawIconEx(
@@ -288,36 +322,42 @@ unsafe fn draw_badge(hdc: HDC, r: &RECT) {
     );
 }
 
-unsafe fn draw_item(
-    hdc: HDC,
-    r: &RECT,
-    text: &str,
-    bg: u32,
-    fg: u32,
-    font: HGDIOBJ,
-    radius: i32,
-) {
-    let brush: HBRUSH = CreateSolidBrush(bg);
-    let old_brush = SelectObject(hdc, brush);
-    RoundRect(hdc, r.left, r.top, r.right, r.bottom, radius * 2, radius * 2);
-    SelectObject(hdc, old_brush);
-    DeleteObject(brush as HGDIOBJ);
+fn inset(r: &RECT, d: i32) -> RECT {
+    RECT {
+        left: r.left + d,
+        top: r.top + d,
+        right: r.right - d,
+        bottom: r.bottom - d,
+    }
+}
 
+/// 圆角实心块。整条底色、悬停垫底都走这里。
+unsafe fn fill_round(hdc: HDC, r: &RECT, color: u32, radius: i32) {
+    let brush: HBRUSH = CreateSolidBrush(color);
+    let old = SelectObject(hdc, brush);
+    RoundRect(hdc, r.left, r.top, r.right, r.bottom, radius * 2, radius * 2);
+    SelectObject(hdc, old);
+    DeleteObject(brush as HGDIOBJ);
+}
+
+/// 直角实心块（分隔竖线、☰ 的三道横线）。
+unsafe fn fill_rect(hdc: HDC, r: &RECT, color: u32) {
+    let brush: HBRUSH = CreateSolidBrush(color);
+    FillRect(hdc, r, brush);
+    DeleteObject(brush as HGDIOBJ);
+}
+
+unsafe fn draw_text_centered(hdc: HDC, r: &RECT, text: &str, fg: u32, font: HGDIOBJ) {
     let old_font = SelectObject(hdc, font);
     SetBkMode(hdc, TRANSPARENT as i32);
     SetTextColor(hdc, fg);
     // **必须补 NUL 再传 `len-1`**：空字符串时 `encode_utf16().collect()` 出来的是零长
     // `Vec`，`as_ptr()` 是悬垂指针（值恰好是 2 = align_of::<u16>()）。以前这里直接传
-    // `buf.as_ptr()` + `len`，悬停第 0 格（品牌格用空串）时 `DrawTextW` 会去读 0x2，
+    // `buf.as_ptr()` + `len`，`DrawTextW` 即使 `cchText == 0` 也会去读 0x2，
     // 宿主进程就地 AV：`c0000005`，`ExceptionInformation[1] = 0x2`，
     // 报在 `user32.dll+0x24702`，从窗口回调逃出去就成了 `c000041d`。
-    // 见 `C:\Users\Administrator\AppData\Local\CrashDumps\inklink-ui.exe.2004.dmp`。
-    // **必须补 NUL 再传 `len-1`**：空字符串时 `encode_utf16().collect()` 出来的是零长
-    // `Vec`，`as_ptr()` 是悬垂指针（值恰好是 2 = align_of::<u16>()）。以前这里直接传
-    // `buf.as_ptr()` + `len`，悬停第 0 格（品牌格用空串）时 `DrawTextW` 会去读 0x2，
-    // 宿主进程就地 AV：`c0000005`，`ExceptionInformation[1] = 0x2`，
-    // 报在 `user32.dll+0x24702`，从窗口回调逃出去就成了 `c000041d`。
-    // 见 `C:\Users\Administrator\AppData\Local\CrashDumps\inklink-ui.exe.2004.dmp`。
+    // 见 `C:\Users\Administrator\AppData\Local\CrashDumps\inklink-ui.exe.2004.dmp`
+    // 与 `HANDOFF.md`「踩过的坑」。
     let buf: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
     let mut tr = *r;
     DrawTextW(
@@ -330,15 +370,43 @@ unsafe fn draw_item(
     SelectObject(hdc, old_font);
 }
 
+/// 菜单格的三道横线。不用 `☰` 字形：字体缺字会画成豆腐块，手画的永远一样清楚。
+unsafe fn draw_menu_glyph(hdc: HDC, r: &RECT) {
+    let w = scale(13);
+    let th = scale(2).max(1);
+    let gap = scale(4);
+    let cx = (r.left + r.right) / 2;
+    let total = th * 3 + gap * 2;
+    let y0 = r.top + (r.bottom - r.top - total) / 2;
+    for i in 0..3 {
+        let y = y0 + i * (th + gap);
+        let bar = RECT {
+            left: cx - w / 2,
+            top: y,
+            right: cx - w / 2 + w,
+            bottom: y + th,
+        };
+        fill_rect(hdc, &bar, C_TEXT);
+    }
+}
+
 fn get_font() -> HGDIOBJ {
+    make_font(&FONT, 15)
+}
+
+fn get_punct_font() -> HGDIOBJ {
+    make_font(&FONT_PUNCT, 21)
+}
+
+fn make_font(slot: &AtomicIsize, px: i32) -> HGDIOBJ {
     unsafe {
-        let existing = FONT.load(Ordering::SeqCst);
+        let existing = slot.load(Ordering::SeqCst);
         if existing != 0 {
             return existing as HGDIOBJ;
         }
         let face = wide("Microsoft YaHei UI");
         let f = CreateFontW(
-            -scale(13),
+            -scale(px),
             0,
             0,
             0,
@@ -353,9 +421,65 @@ fn get_font() -> HGDIOBJ {
             0,
             face.as_ptr(),
         );
-        FONT.store(f as isize, Ordering::SeqCst);
+        slot.store(f as isize, Ordering::SeqCst);
         f as HGDIOBJ
     }
+}
+
+/// 把整条画出来。**不碰窗口**，只吃一个 HDC —— 这样测试能把同一份绘制代码
+/// 渲进内存位图（`渲染预览图`），改配色改布局不用先部署到宿主里看。
+unsafe fn paint_frame(hdc: HDC, client: &RECT) {
+    let radius = scale(RADIUS);
+
+    // 一条白底 + 1px 描边：先整块画描边色，再往里缩 1px 画白色，
+    // 圆角靠窗口区域（`SetWindowRgn`）裁，四角不会露出桌面。
+    fill_round(hdc, client, C_BORDER, radius);
+    let inner = inset(client, 1);
+    fill_round(hdc, &inner, C_BG, (radius - 1).max(0));
+
+    let font = get_font();
+    let rects = item_rects();
+    // 每次现读：Shift 在别的动作里切了中英，这里立刻反映；不缓存。
+    let (chinese, punct) = crate::state::snapshot();
+    let hover = HOVER.load(Ordering::Relaxed);
+
+    // 悬停只在当前格后面垫一层浅色圆角，不改文字颜色。
+    if (0..4).contains(&hover) {
+        let r = inset(&rects[hover as usize], scale(2));
+        fill_round(hdc, &r, C_HOVER, scale(5));
+    }
+
+    // 品牌标和状态之间的分隔竖线。
+    let sep_x = rects[0].right + scale(SEP_GAP);
+    let sep = RECT {
+        left: sep_x,
+        top: rects[0].top + scale(7),
+        right: sep_x + scale(SEP_W),
+        bottom: rects[0].bottom - scale(7),
+    };
+    fill_rect(hdc, &sep, C_BORDER);
+
+    // 第一格：品牌标（浮条里唯一一个"重"的元素，和搜狗那个橙色 S 一个位置）
+    draw_badge(hdc, &rects[0]);
+
+    // 第二格：中/英。开=品牌深蓝，关=浅灰。
+    let (mode_text, mode_fg) = if chinese {
+        ("中", C_ACCENT)
+    } else {
+        ("英", C_DIM)
+    };
+    draw_text_centered(hdc, &rects[1], mode_text, mode_fg, font);
+
+    // 第三格：中文标点 / 半角。全角标点的墨迹压在字框底部，得单独给个大字号。
+    let (punct_text, punct_fg) = if punct {
+        ("，。", C_ACCENT)
+    } else {
+        (",.", C_DIM)
+    };
+    draw_text_centered(hdc, &rects[2], punct_text, punct_fg, get_punct_font());
+
+    // 第四格：菜单。
+    draw_menu_glyph(hdc, &rects[3]);
 }
 
 unsafe fn paint(hwnd: HWND) {
@@ -363,42 +487,7 @@ unsafe fn paint(hwnd: HWND) {
     let hdc = BeginPaint(hwnd, &mut ps);
     let mut client: RECT = std::mem::zeroed();
     GetClientRect(hwnd, &mut client);
-
-    let bg = CreateSolidBrush(C_BG);
-    FillRect(hdc, &client, bg);
-    DeleteObject(bg as HGDIOBJ);
-
-    let font = get_font();
-    let rects = item_rects();
-    let radius = scale(RADIUS);
-    // 每次现读：Shift 在别的动作里切了中英，这里立刻反映；不缓存。
-    let (chinese, punct) = crate::state::snapshot();
-    let hover = HOVER.load(Ordering::Relaxed);
-
-    // 第一格：品牌标（不带底色，直接画图标）
-    if hover == 0 {
-        draw_item(hdc, &rects[0], "", C_ITEM_HOVER, C_TEXT, font, radius);
-    }
-    draw_badge(hdc, &rects[0]);
-
-    let mode_text = if chinese { "中" } else { "英" };
-    let (mode_bg, mode_fg) = if chinese {
-        (C_ORANGE, C_WHITE)
-    } else if hover == 1 {
-        (C_ITEM_HOVER, C_TEXT)
-    } else {
-        (C_ITEM, C_TEXT)
-    };
-    draw_item(hdc, &rects[1], mode_text, mode_bg, mode_fg, font, radius);
-
-    let punct_text = if punct { "，。" } else { ",." };
-    let punct_bg = if hover == 2 { C_ITEM_HOVER } else { C_ITEM };
-    let punct_fg = if punct { C_ORANGE } else { C_TEXT };
-    draw_item(hdc, &rects[2], punct_text, punct_bg, punct_fg, font, radius);
-
-    let menu_bg = if hover == 3 { C_ITEM_HOVER } else { C_ITEM };
-    draw_item(hdc, &rects[3], "☰", menu_bg, C_TEXT, font, radius);
-
+    paint_frame(hdc, &client);
     EndPaint(hwnd, &ps);
 }
 
@@ -603,5 +692,83 @@ mod tests {
         assert_ne!(unsafe { IsWindowVisible(hwnd) }, 0, "show() 之后窗口应该可见");
         hide();
         assert_eq!(unsafe { IsWindowVisible(hwnd) }, 0, "hide() 之后窗口应该不可见");
+    }
+
+    /// 把 `paint_frame` 渲进一张内存位图，存成 `tsf/target/bar-preview.bmp`。
+    /// 改配色/布局时先看这张图，不用部署到宿主进程里等它出现。
+    #[test]
+    fn 渲染预览图() {
+        use std::ffi::c_void;
+        use windows_sys::Win32::Graphics::Gdi::{
+            CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC, ReleaseDC,
+            SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, RGBQUAD,
+        };
+
+        let (w, h) = window_size();
+        unsafe {
+            let bmi = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: w,
+                    biHeight: -h, // 负数 = 自上而下，写 BMP 时不用再翻
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB,
+                    ..std::mem::zeroed()
+                },
+                bmiColors: [RGBQUAD {
+                    rgbBlue: 0,
+                    rgbGreen: 0,
+                    rgbRed: 0,
+                    rgbReserved: 0,
+                }],
+            };
+            let screen = GetDC(std::ptr::null_mut());
+            let dc = CreateCompatibleDC(screen);
+            let mut bits: *mut c_void = std::ptr::null_mut();
+            let dib = CreateDIBSection(dc, &bmi, DIB_RGB_COLORS, &mut bits, std::ptr::null_mut(), 0);
+            assert!(!dib.is_null(), "DIB 创建失败");
+            let old = SelectObject(dc, dib as _);
+
+            let client = RECT {
+                left: 0,
+                top: 0,
+                right: w,
+                bottom: h,
+            };
+            paint_frame(dc, &client);
+
+            let stride = (w as usize) * 4;
+            let size = stride * (h as usize);
+            let pixels = std::slice::from_raw_parts(bits as *const u8, size);
+            let mut out: Vec<u8> = Vec::with_capacity(54 + size);
+            out.extend_from_slice(b"BM");
+            out.extend_from_slice(&((54 + size) as u32).to_le_bytes());
+            out.extend_from_slice(&0u32.to_le_bytes());
+            out.extend_from_slice(&54u32.to_le_bytes());
+            out.extend_from_slice(&40u32.to_le_bytes());
+            out.extend_from_slice(&w.to_le_bytes());
+            out.extend_from_slice(&(-h).to_le_bytes());
+            out.extend_from_slice(&1u16.to_le_bytes());
+            out.extend_from_slice(&32u16.to_le_bytes());
+            out.extend_from_slice(&0u32.to_le_bytes());
+            out.extend_from_slice(&(size as u32).to_le_bytes());
+            out.extend_from_slice(&2835i32.to_le_bytes());
+            out.extend_from_slice(&2835i32.to_le_bytes());
+            out.extend_from_slice(&0u32.to_le_bytes());
+            out.extend_from_slice(&0u32.to_le_bytes());
+            out.extend_from_slice(pixels);
+
+            // 固定写到 crate 的 target 下：`temp_dir()` 在特权/受限环境里未必可写。
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("target")
+                .join("bar-preview.bmp");
+            std::fs::write(&path, &out).expect("预览图写入失败");
+
+            SelectObject(dc, old);
+            DeleteObject(dib as _);
+            DeleteDC(dc);
+            ReleaseDC(std::ptr::null_mut(), screen);
+        }
     }
 }

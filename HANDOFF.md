@@ -422,6 +422,18 @@ DLL 被加载后无法卸载：脚本每次用**新文件名 + 改注册表**，
   测试全绿但宿主一悬停就死；回归测试必须先 `InvalidateRect` 再 `UpdateWindow`。
 - **`MoveWindow` 的 `nWidth/nHeight` 是新尺寸，传 0 会把窗口缩成 0x0**（浮条"拖一下就不见了"）。
   拖动时要原样传回 `window_size()`。
+- **绝对不要用 PowerShell 的 `Get-Content`/`Set-Content` 改中文源码**（本阶段真把 `tsf/src/bar.rs`
+  整份毁掉过一次）。PS 5.1 的 `Get-Content` 按 ANSI(GB18030) 解码 UTF-8，中文全变 `娴潯锛?`，
+  有些字节序列还会把紧跟的换行一起吃掉，于是文件里两行并成一行、cargo 报
+  `error: unexpected closing delimiter: '}'`。只改代码就用 `edit`/`write` 工具；
+  万一手滑了，`git checkout -- <file>` 回到上次提交再逐条重做，比修乱码快。
+  附带坑：`[IO.File]::ReadAllBytes('相对路径')` 用的是 .NET 的 CWD（`C:\dsh\work`），
+  不是 PowerShell 的 `cd` 目录 —— 一律传绝对路径。
+- **`tools\deploy-local.ps1` 不能对 stderr 做任何重定向**（`2>&1`、`2>$null` 都不行）。
+  脚本第 16 行是 `$ErrorActionPreference = 'Stop'`，而对脚本调用做 stderr 重定向后，
+  `cargo` 写到 stderr 的 `Compiling …` 会被包成 `ErrorRecord` → 升级成终止错误 →
+  脚本在 `cargo test` 那一行 exit 1（看起来像测试失败，其实测试根本没跑完）。
+  只接 stdout：`& .\tools\deploy-local.ps1 -NoBump | Select-Object -Last 22`。
 - **`release.ps1` 别把 `installer\` 里的二进制当文本改写**：它原本遍历整个 `installer\` 做版本号替换，
   图标 `inklink.ico`/`inklink.png` 也被 `ReadAllText` + `WriteAllText` 过了一遍，结果包内出现 73 KB 的
   坏 ico、168 KB 的坏 png。现在只遍历 `.cmd/.ps1/.txt/.md`，二进制由 `Copy-Item` 单独拷。
