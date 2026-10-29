@@ -74,3 +74,5 @@ msg.txt
 /ui/target/
 /ui/shot-*.png
 /ui/*.log
+# 品牌检查用的对照图（不是交付物）
+/docs/brand/_probe-*.png
