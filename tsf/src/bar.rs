@@ -560,4 +560,24 @@ mod tests {
         let last = rects[3];
         assert_eq!(hit_test(last.right + 5, last.top + 1), -1, "越过最后一格不该命中");
     }
+
+    #[test]
+    fn 浮条能创建显示并绘制() {
+        use windows_sys::Win32::Foundation::HWND;
+        use windows_sys::Win32::Graphics::Gdi::UpdateWindow;
+        use windows_sys::Win32::UI::WindowsAndMessaging::IsWindowVisible;
+
+        show();
+        let raw = HWND_CELL.load(std::sync::atomic::Ordering::SeqCst);
+        assert_ne!(raw, 0, "show() 之后应该有窗口句柄");
+        let hwnd = raw as HWND;
+
+        // 同步触发一次 WM_PAINT，跑完整条 paint() 路径（BeginPaint→画四格→EndPaint），
+        // 任何 GDI 误用或 panic 都会在这里现形。
+        unsafe { UpdateWindow(hwnd) };
+
+        assert_ne!(unsafe { IsWindowVisible(hwnd) }, 0, "show() 之后窗口应该可见");
+        hide();
+        assert_eq!(unsafe { IsWindowVisible(hwnd) }, 0, "hide() 之后窗口应该不可见");
+    }
 }
