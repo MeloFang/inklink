@@ -306,12 +306,24 @@ unsafe fn draw_item(
     let old_font = SelectObject(hdc, font);
     SetBkMode(hdc, TRANSPARENT as i32);
     SetTextColor(hdc, fg);
-    let buf: Vec<u16> = text.encode_utf16().collect();
+    // **必须补 NUL 再传 `len-1`**：空字符串时 `encode_utf16().collect()` 出来的是零长
+    // `Vec`，`as_ptr()` 是悬垂指针（值恰好是 2 = align_of::<u16>()）。以前这里直接传
+    // `buf.as_ptr()` + `len`，悬停第 0 格（品牌格用空串）时 `DrawTextW` 会去读 0x2，
+    // 宿主进程就地 AV：`c0000005`，`ExceptionInformation[1] = 0x2`，
+    // 报在 `user32.dll+0x24702`，从窗口回调逃出去就成了 `c000041d`。
+    // 见 `C:\Users\Administrator\AppData\Local\CrashDumps\inklink-ui.exe.2004.dmp`。
+    // **必须补 NUL 再传 `len-1`**：空字符串时 `encode_utf16().collect()` 出来的是零长
+    // `Vec`，`as_ptr()` 是悬垂指针（值恰好是 2 = align_of::<u16>()）。以前这里直接传
+    // `buf.as_ptr()` + `len`，悬停第 0 格（品牌格用空串）时 `DrawTextW` 会去读 0x2，
+    // 宿主进程就地 AV：`c0000005`，`ExceptionInformation[1] = 0x2`，
+    // 报在 `user32.dll+0x24702`，从窗口回调逃出去就成了 `c000041d`。
+    // 见 `C:\Users\Administrator\AppData\Local\CrashDumps\inklink-ui.exe.2004.dmp`。
+    let buf: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
     let mut tr = *r;
     DrawTextW(
         hdc,
         buf.as_ptr(),
-        buf.len() as i32,
+        (buf.len() - 1) as i32,
         &mut tr,
         DT_CENTER | DT_VCENTER | DT_SINGLELINE,
     );
@@ -448,8 +460,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     HOVER.store(-1, Ordering::Relaxed);
                 }
                 if DRAGGING.load(Ordering::Relaxed) {
+                    // 尺寸必须**原样传回**：`MoveWindow` 的 nWidth/nHeight 是新尺寸，
+                    // 传 0 会把窗口缩成 0x0（浮条"拖一下就不见了"）。
+                    let (w, h) = window_size();
                     if let Some(d) = DRAG.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
-                        MoveWindow(hwnd, d.window.x + dx, d.window.y + dy, 0, 0, 0);
+                        MoveWindow(hwnd, d.window.x + dx, d.window.y + dy, w, h, 0);
                     }
                 }
             }
@@ -572,9 +587,18 @@ mod tests {
         assert_ne!(raw, 0, "show() 之后应该有窗口句柄");
         let hwnd = raw as HWND;
 
-        // 同步触发一次 WM_PAINT，跑完整条 paint() 路径（BeginPaint→画四格→EndPaint），
-        // 任何 GDI 误用或 panic 都会在这里现形。
-        unsafe { UpdateWindow(hwnd) };
+        // 0..=3 每个格子的 hover 状态都画一遍：悬停会走「给该格画高亮底」的分支
+        // （第 0 格那条会用**空字符串**调 draw_item），这条分支在宿主里 AV 崩过，必须覆盖。
+        //
+        // 注意：`UpdateWindow` 只在窗口**有无效区域**时才同步发 WM_PAINT。上一次
+        // `BeginPaint` 已经把区域验证掉了，所以不先 `invalidate` 这里的循环是空转——
+        // 当初就是这么漏掉这个崩溃的（测试全绿，宿主一悬停就死）。
+        for h in -1..=3 {
+            HOVER.store(h, std::sync::atomic::Ordering::Relaxed);
+            invalidate(hwnd);
+            unsafe { UpdateWindow(hwnd) };
+        }
+        HOVER.store(-1, std::sync::atomic::Ordering::Relaxed);
 
         assert_ne!(unsafe { IsWindowVisible(hwnd) }, 0, "show() 之后窗口应该可见");
         hide();

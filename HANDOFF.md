@@ -407,6 +407,21 @@ DLL 被加载后无法卸载：脚本每次用**新文件名 + 改注册表**，
 
 ### 踩过的坑（本阶段新增）
 
+- **空字符串的 `Vec::as_ptr()` 是悬垂指针（值 = 2），`DrawTextW` 会真去读它 → 宿主进程 AV**
+  （1.1.11 修）。`text.encode_utf16().collect::<Vec<u16>>()` 在空串时是零长 `Vec`，
+  `as_ptr()` 返回 `align_of::<u16>() = 2`；`DrawTextW(hdc, ptr, 0, …)` **并不会**因为
+  `cchText == 0` 就不碰指针，它读 `0x2` 就 AV：`c0000005`、`ExceptionInformation[1] = 0x2`、
+  报在 `user32.dll+0x24702`，从窗口回调逃出去升级成 `c000041d`（= `STATUS_FATAL_USER_CALLBACK_EXCEPTION`）。
+  浮条第 0 格（品牌格）画的是图标，hover 时用**空串**调 `draw_item` 画高亮底 → 一悬停就崩，
+  用户看到的是"白条 + 一个灰方块"（背景和第一格画完了，后面的没画）。
+  修法：`encode_utf16().chain(once(0)).collect()` 再传 `len-1`（`menu.rs` 的 `wide()` 一直是对的）。
+  **取证方法**：`%LOCALAPPDATA%\CrashDumps\*.dmp` 用 `tools\parse-dump.py` 解析，
+  异常流的 `ExceptionInformation[1]` 直接给出访问的坏地址 —— 比猜"哪个 API 崩了"快得多。
+  **另一个更隐蔽的坑**：`UpdateWindow` 只在窗口有无效区域时才同步发 `WM_PAINT`，
+  上一次 `BeginPaint` 已经把区域验证掉了，所以"改状态 → `UpdateWindow`"的循环是空转的，
+  测试全绿但宿主一悬停就死；回归测试必须先 `InvalidateRect` 再 `UpdateWindow`。
+- **`MoveWindow` 的 `nWidth/nHeight` 是新尺寸，传 0 会把窗口缩成 0x0**（浮条"拖一下就不见了"）。
+  拖动时要原样传回 `window_size()`。
 - **`release.ps1` 别把 `installer\` 里的二进制当文本改写**：它原本遍历整个 `installer\` 做版本号替换，
   图标 `inklink.ico`/`inklink.png` 也被 `ReadAllText` + `WriteAllText` 过了一遍，结果包内出现 73 KB 的
   坏 ico、168 KB 的坏 png。现在只遍历 `.cmd/.ps1/.txt/.md`，二进制由 `Copy-Item` 单独拷。
