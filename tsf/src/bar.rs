@@ -1,4 +1,4 @@
-//! 浮条：宿主进程内的四格状态条（品牌标 | 中/英 | ，。 | ☰）。
+//! 浮条：宿主进程内的四格状态条（品牌标 | 中/英 | 上下叠放的 。和， | ☰）。
 //!
 //! 为什么在 DLL 里画、而不是独立进程（用户拍板 m09409「走A」，见对话与 ADR）：
 //! - 搜狗、微软拼音都把状态条画在**宿主进程里**（每个宿主各一份 `SoPY_Status` 窗口），
@@ -14,26 +14,40 @@
 //! - 点击先写注册表、再靠消息循环重绘；状态每次 `paint` 现读 `state::snapshot()`，
 //!   不缓存 —— 用 Shift 在应用里切了中英，浮条下次重绘就是最新的；
 //! - 命中测试 / 尺寸是纯函数，可单测。
+//!
+//! ## 一个进程里可能有好几条（2026-10-30 修）
+//!
+//! TSF 是**按线程**激活的：一个进程里几条线程各自 `Activate` 一次，就各自建一个窗口。
+//! 之前窗口句柄存在进程级全局里，只记得最后一个 → 别的线程的窗口没人 `Deactivate`，
+//! 于是屏幕上叠出好几条浮条。现在句柄放 `thread_local`，谁建谁关。
+//!
+//! 另外 `Deactivate` 只在"这条线程不用这个输入法了"时才来，用户 Alt+Tab 切到别的程序
+//! 并不会触发 —— 所以还有一个 600ms 的 `WM_TIMER` 看门狗：本进程不是前台就自动收起，
+//! 回到前台再自动放出来（只在"自动收起过"时才放，用户手动关掉输入法不会被它复活）。
 
+use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, Ordering};
 use std::sync::Mutex;
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
-    BeginPaint, CreateFontW, CreateRoundRectRgn, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint,
-    FillRect, InvalidateRect, RoundRect, SelectObject, SetBkMode, SetTextColor, SetWindowRgn,
-    DT_CENTER, DT_SINGLELINE, DT_VCENTER, HBRUSH, HDC, HGDIOBJ, PAINTSTRUCT, TRANSPARENT,
+    BeginPaint, CreateFontW, CreatePen, CreateRoundRectRgn, CreateSolidBrush, DeleteObject,
+    DrawTextW, Ellipse, EndPaint, FillRect, GetStockObject, InvalidateRect, Polygon, RoundRect,
+    SelectObject, SetBkMode, SetTextColor, SetWindowRgn, DT_CENTER, DT_SINGLELINE, DT_VCENTER,
+    HBRUSH, HDC, HGDIOBJ, NULL_BRUSH, PAINTSTRUCT, TRANSPARENT,
 };
+use windows_sys::Win32::System::Threading::GetCurrentProcessId;
 use windows_sys::Win32::UI::HiDpi::GetDpiForSystem;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DrawIconEx, GetClientRect, GetCursorPos, GetWindowRect,
-    IsWindowVisible, LoadCursorW, LoadIconW, LoadImageW, MoveWindow, PostMessageW, RegisterClassW,
-    ShowWindow, SystemParametersInfoW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, DI_NORMAL, HICON,
-    IDC_ARROW, IDI_APPLICATION, IMAGE_ICON, LR_LOADFROMFILE, MA_NOACTIVATE, SPI_GETWORKAREA,
-    SW_HIDE, SW_SHOWNOACTIVATE, WNDCLASSW, WM_APP, WM_ERASEBKGND, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_PAINT, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-    WS_POPUP,
+    CreateWindowExW, DefWindowProcW, DrawIconEx, EnumWindows, GetClassNameW, GetClientRect,
+    GetCursorPos, GetForegroundWindow, GetWindowRect, GetWindowThreadProcessId, IsWindowVisible,
+    KillTimer, LoadCursorW, LoadIconW, LoadImageW, MoveWindow, PostMessageW, RegisterClassW,
+    SetTimer, ShowWindow, SystemParametersInfoW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, DI_NORMAL,
+    HICON, IDC_ARROW, IDI_APPLICATION, IMAGE_ICON, LR_LOADFROMFILE, MA_NOACTIVATE,
+    SPI_GETWORKAREA, SW_HIDE, SW_SHOWNOACTIVATE, WNDCLASSW, WM_APP, WM_ERASEBKGND, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_PAINT, WM_TIMER, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
 const CLASS_NAME: &str = "inklink-bar";
@@ -42,18 +56,33 @@ const CLASS_NAME: &str = "inklink-bar";
 const WM_OPEN_MENU: u32 = WM_APP + 20;
 static MENU_OPEN: AtomicBool = AtomicBool::new(false);
 
-static HWND_CELL: AtomicIsize = AtomicIsize::new(0);
+/// 看门狗的定时器 ID（`WM_TIMER` 的 wParam）。
+const TIMER_WATCH: usize = 1;
+/// 看门狗周期：600ms。再快没必要，再慢切走程序后能明显看到浮条赖着不走。
+const WATCH_MS: u32 = 600;
+
+// 本线程的浮条窗口。**必须是 thread_local**：TSF 按线程激活，一个进程里可能有好几条
+// 线程各建一个窗口；放进程级全局只记得最后一个，其余窗口就永远没人关（叠出好几条）。
+thread_local! {
+    static HWND_CELL: Cell<isize> = const { Cell::new(0) };
+}
 static REGISTERED: AtomicBool = AtomicBool::new(false);
 static HOVER: AtomicI32 = AtomicI32::new(-1);
 static DRAG_ARMED: AtomicBool = AtomicBool::new(false);
 static DRAGGING: AtomicBool = AtomicBool::new(false);
+/// 是不是被看门狗**自动**收起来的。用户自己关掉输入法（`Deactivate`）不会被复活。
+static AUTO_HIDDEN: AtomicBool = AtomicBool::new(false);
+/// 这条线程的输入法是不是"开着"（`Activate` 置真、`Deactivate` 置假）。
+/// 看门狗只复活 `WANTED` 的浮条 —— 用户手动关掉输入法后不该被它弹回来。
+static WANTED: AtomicBool = AtomicBool::new(false);
+/// `EnumWindows` 回调的临时结果：进程里还有没有别的可见浮条。
+static ANY_BAR: AtomicBool = AtomicBool::new(false);
 static FONT: AtomicIsize = AtomicIsize::new(0);
-/// 标点格单独一个字号：全角标点的墨迹都压在字框底部，小字号时那两个点看不清。
-static FONT_PUNCT: AtomicIsize = AtomicIsize::new(0);
 
 // 96 DPI 下的设计尺寸，实际按 DPI 缩放
 const PAD: i32 = 4;
-const ITEM_H: i32 = 26;
+/// 30 而不是 26：标点格里「。」「，」要上下叠两行。
+const ITEM_H: i32 = 30;
 const RADIUS: i32 = 7;
 const GAP: i32 = 2;
 /// 第一格是品牌标（深蓝圆角方块 + 白色 i），点它等同点 ☰。
@@ -147,53 +176,124 @@ fn invalidate(hwnd: HWND) {
     }
 }
 
+fn our_hwnd() -> HWND {
+    HWND_CELL.with(|c| c.get()) as HWND
+}
+
+fn set_our_hwnd(hwnd: HWND) {
+    HWND_CELL.with(|c| c.set(hwnd as isize));
+}
+
+/// 前台窗口是不是我们自己这个进程的窗口。
+fn foreground_is_self() -> bool {
+    unsafe {
+        let fg = GetForegroundWindow();
+        if (fg as isize) == 0 {
+            return false;
+        }
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(fg, &mut pid);
+        pid == GetCurrentProcessId()
+    }
+}
+
+/// 这个窗口的类名是不是我们的浮条。
+fn is_our_class(hwnd: HWND) -> bool {
+    unsafe {
+        let mut buf = [0u16; 48];
+        let n = GetClassNameW(hwnd, buf.as_mut_ptr(), buf.len() as i32);
+        if n <= 0 {
+            return false;
+        }
+        buf[..n as usize].iter().copied().eq(CLASS_NAME.encode_utf16())
+    }
+}
+
+unsafe extern "system" fn on_find_bar(hwnd: HWND, lparam: LPARAM) -> i32 {
+    let me = lparam as HWND;
+    if hwnd == me || !is_our_class(hwnd) {
+        return 1;
+    }
+    if IsWindowVisible(hwnd) != 0 {
+        ANY_BAR.store(true, Ordering::Relaxed);
+        return 0;
+    }
+    1
+}
+
+unsafe extern "system" fn on_hide_bar(hwnd: HWND, lparam: LPARAM) -> i32 {
+    let me = lparam as HWND;
+    if hwnd != me && is_our_class(hwnd) && IsWindowVisible(hwnd) != 0 {
+        ShowWindow(hwnd, SW_HIDE);
+    }
+    1
+}
+
+/// 进程里是否已经有别的浮条在显示。同一个程序可能有好几条 TSF 线程、各建一个窗口，
+/// 屏幕上只能留一条 —— 后建的让位给已经在显示的，别叠成一堆。
+fn any_other_bar_visible(me: HWND) -> bool {
+    ANY_BAR.store(false, Ordering::Relaxed);
+    unsafe { EnumWindows(Some(on_find_bar), me as LPARAM) };
+    ANY_BAR.load(Ordering::Relaxed)
+}
+
+/// 先把自己以外的浮条收起来（同一个程序里只留一条）。
+fn hide_other_bars(me: HWND) {
+    unsafe { EnumWindows(Some(on_hide_bar), me as LPARAM) };
+}
+
 /// 浮条出现（`Activate` 时由 lib.rs 调，在宿主 UI 线程上，直接 ShowWindow 即可）。
 pub fn show() {
     unsafe {
         ensure_window();
-        let raw = HWND_CELL.load(Ordering::SeqCst);
-        if raw == 0 {
+        let hwnd = our_hwnd();
+        if (hwnd as isize) == 0 {
             return;
         }
-        let hwnd = raw as HWND;
+        WANTED.store(true, Ordering::SeqCst);
+        AUTO_HIDDEN.store(false, Ordering::SeqCst);
+        hide_other_bars(hwnd);
         if IsWindowVisible(hwnd) == 0 {
             ShowWindow(hwnd, SW_SHOWNOACTIVATE);
             invalidate(hwnd);
             crate::log_line("bar show");
         }
+        // 看门狗只在窗口存在期间跑；进程切到后台就靠它把浮条收走。
+        SetTimer(hwnd, TIMER_WATCH, WATCH_MS, None);
     }
 }
 
-/// 浮条消失（`Deactivate` 时调）。
+/// 浮条消失（`Deactivate` 时调，也就是用户真的把这个输入法关了）。
 pub fn hide() {
     unsafe {
-        let raw = HWND_CELL.load(Ordering::SeqCst);
-        if raw == 0 {
+        let hwnd = our_hwnd();
+        if (hwnd as isize) == 0 {
             return;
         }
-        let hwnd = raw as HWND;
+        WANTED.store(false, Ordering::SeqCst);
+        AUTO_HIDDEN.store(false, Ordering::SeqCst);
         if IsWindowVisible(hwnd) != 0 {
             ShowWindow(hwnd, SW_HIDE);
             crate::log_line("bar hide");
         }
+        KillTimer(hwnd, TIMER_WATCH);
     }
 }
 
 /// 重绘（Shift 在应用里切了中英之后，lib.rs 调这个让浮条跟一下）。
 pub fn refresh() {
     unsafe {
-        let raw = HWND_CELL.load(Ordering::SeqCst);
-        if raw == 0 {
+        let hwnd = our_hwnd();
+        if (hwnd as isize) == 0 {
             return;
         }
-        let hwnd = raw as HWND;
         if IsWindowVisible(hwnd) != 0 {
             invalidate(hwnd);
         }
     }
 }
 
-/// 注册窗口类 + 创建窗口（幂等）。位置只取一次：拖动之后窗口一直在，下次 show 不重读。
+/// 注册窗口类 + 创建窗口（幂等，按线程）。位置只取一次：拖动之后窗口一直在，下次 show 不重读。
 fn ensure_window() {
     unsafe {
         if !REGISTERED.swap(true, Ordering::SeqCst) {
@@ -213,7 +313,7 @@ fn ensure_window() {
             let _ = RegisterClassW(&wc);
         }
 
-        if HWND_CELL.load(Ordering::SeqCst) == 0 {
+        if (our_hwnd() as isize) == 0 {
             let name = wide(CLASS_NAME);
             let hwnd = CreateWindowExW(
                 WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
@@ -233,7 +333,7 @@ fn ensure_window() {
                 crate::log_line("bar: CreateWindowExW failed");
                 return;
             }
-            HWND_CELL.store(hwnd as isize, Ordering::SeqCst);
+            set_our_hwnd(hwnd);
             let (w, h) = window_size();
             let (x, y) = crate::state::read_pos().unwrap_or_else(default_position);
             MoveWindow(hwnd, x, y, w, h, 0);
@@ -394,10 +494,6 @@ fn get_font() -> HGDIOBJ {
     make_font(&FONT, 15)
 }
 
-fn get_punct_font() -> HGDIOBJ {
-    make_font(&FONT_PUNCT, 21)
-}
-
 fn make_font(slot: &AtomicIsize, px: i32) -> HGDIOBJ {
     unsafe {
         let existing = slot.load(Ordering::SeqCst);
@@ -428,6 +524,34 @@ fn make_font(slot: &AtomicIsize, px: i32) -> HGDIOBJ {
 
 /// 把整条画出来。**不碰窗口**，只吃一个 HDC —— 这样测试能把同一份绘制代码
 /// 渲进内存位图（`渲染预览图`），改配色改布局不用先部署到宿主里看。
+/// 画「。」：一个空心圆环。全角句号的墨迹只占字框底部几个像素，用 15px 字体画出来
+/// 只是一粒灰点；直接用 GDI 画环更清楚，也不依赖字体里有没有这个字（和 ☰ 同理）。
+unsafe fn draw_ring(hdc: HDC, cx: i32, cy: i32, r: i32, color: u32) {
+    let pen = CreatePen(0, (r / 3).max(1), color);
+    let old_pen = SelectObject(hdc, pen as HGDIOBJ);
+    let old_brush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
+    Ellipse(hdc, cx - r, cy - r, cx + r + 1, cy + r + 1);
+    SelectObject(hdc, old_brush);
+    SelectObject(hdc, old_pen);
+    DeleteObject(pen as HGDIOBJ);
+}
+
+/// 画「，」：一个小圆点加一条往左下拖的尾。同样是自己画，不用字体。
+unsafe fn draw_comma(hdc: HDC, cx: i32, cy: i32, color: u32) {
+    let brush: HBRUSH = CreateSolidBrush(color);
+    let old_brush = SelectObject(hdc, brush);
+    let s = scale(2);
+    Ellipse(hdc, cx - s, cy - s, cx + s + 1, cy + s + 1);
+    let tail = [
+        POINT { x: cx - s, y: cy + 1 },
+        POINT { x: cx + s, y: cy + 1 },
+        POINT { x: cx - s + 1, y: cy + scale(6) },
+    ];
+    Polygon(hdc, tail.as_ptr(), tail.len() as i32);
+    SelectObject(hdc, old_brush);
+    DeleteObject(brush as HGDIOBJ);
+}
+
 unsafe fn paint_frame(hdc: HDC, client: &RECT) {
     let radius = scale(RADIUS);
 
@@ -470,13 +594,28 @@ unsafe fn paint_frame(hdc: HDC, client: &RECT) {
     };
     draw_text_centered(hdc, &rects[1], mode_text, mode_fg, font);
 
-    // 第三格：中文标点 / 半角。全角标点的墨迹压在字框底部，得单独给个大字号。
-    let (punct_text, punct_fg) = if punct {
-        ("，。", C_ACCENT)
+    // 第三格：中文标点 / 半角。像搜狗那样**上下叠放**（上句号、下逗号）。
+    // 两个符号都用 GDI 画形状而不是打字体 —— 15px 字号下全角标点只剩一粒灰点。
+    let cell = rects[2];
+    let cx = (cell.left + cell.right) / 2;
+    let mid = cell.top + (cell.bottom - cell.top) / 2;
+    let punct_fg = if punct { C_ACCENT } else { C_DIM };
+    let upper_cy = mid - scale(6);
+    let lower_cy = mid + scale(6);
+    if punct {
+        // 中文：空心圈 + 逗号
+        draw_ring(hdc, cx, upper_cy, scale(4), punct_fg);
+        draw_comma(hdc, cx - scale(1), lower_cy - scale(1), punct_fg);
     } else {
-        (",.", C_DIM)
-    };
-    draw_text_centered(hdc, &rects[2], punct_text, punct_fg, get_punct_font());
+        // 半角：实心小点 + 逗号（点更小，一眼能分出这是半角）
+        let brush: HBRUSH = CreateSolidBrush(punct_fg);
+        let old = SelectObject(hdc, brush);
+        let d = scale(2);
+        Ellipse(hdc, cx - d, upper_cy - d, cx + d + 1, upper_cy + d + 1);
+        SelectObject(hdc, old);
+        DeleteObject(brush as HGDIOBJ);
+        draw_comma(hdc, cx - scale(1), lower_cy - scale(1), punct_fg);
+    }
 
     // 第四格：菜单。
     draw_menu_glyph(hdc, &rects[3]);
@@ -623,6 +762,31 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             0
         }
+        WM_TIMER => {
+            // 看门狗：本进程不是前台就把浮条收走（`Deactivate` 在 Alt+Tab 切程序时不会来），
+            // 回到前台再放出来 —— 但只复活"被自动收起的"，用户手动关掉输入法不该被它弹回来。
+            if wparam == TIMER_WATCH && WANTED.load(Ordering::SeqCst) {
+                let self_front = foreground_is_self();
+                let visible = IsWindowVisible(hwnd) != 0;
+                if !self_front {
+                    if visible {
+                        ShowWindow(hwnd, SW_HIDE);
+                    }
+                    AUTO_HIDDEN.store(true, Ordering::SeqCst);
+                } else if !visible {
+                    // 切回前台要复活；同一个程序里已经有别的浮条在显示时就不用抢了
+                    // （几条 TSF 线程各有一条，屏幕上只该有一条）。
+                    let revive =
+                        AUTO_HIDDEN.load(Ordering::SeqCst) || !any_other_bar_visible(hwnd);
+                    if revive {
+                        ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                        invalidate(hwnd);
+                        AUTO_HIDDEN.store(false, Ordering::SeqCst);
+                    }
+                }
+            }
+            0
+        }
         // 注意：不要自己写 `WM_CLOSE => ...` 的分支 —— 之前漏了 import，Rust 把
         // 它当成了**新的绑定变量**（irrefutable pattern），于是每条消息都被当成
         // 关闭请求、窗口在 WM_NCCREATE 阶段就被 DestroyWindow 掉。DefWindowProcW
@@ -672,7 +836,7 @@ mod tests {
         use windows_sys::Win32::UI::WindowsAndMessaging::IsWindowVisible;
 
         show();
-        let raw = HWND_CELL.load(std::sync::atomic::Ordering::SeqCst);
+        let raw = HWND_CELL.with(|c| c.get());
         assert_ne!(raw, 0, "show() 之后应该有窗口句柄");
         let hwnd = raw as HWND;
 

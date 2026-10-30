@@ -268,6 +268,13 @@ C:\inklink-engine\
 - **点浮条不会立刻消失**（1.1.3）：`Deactivate` 的收起请求会被"最近 1.5s 点过 / 鼠标还在浮条上"挡掉一次，否则点一下就没。
 - **☰ 菜单是自绘的**（1.1.9，修"点一下变一条白带"）：窗口类 `inklink-menu`。系统的 `TrackPopupMenu` 在我们这种拿不到前台的 `WS_EX_NOACTIVATE` 窗口上会**永不返回**（模态循环卡死消息循环，随后 `user32.dll` 里 `0xc0000005`/`0xc000041d`）。菜单内选中走 `WM_LBUTTONUP`，`Esc`/点外面走 10ms 轮询；`row_at()`/`menu_size()` 有单测。
 - **浮条改进程内**（1.1.10，ADR-0008）：`tsf\src\bar.rs`（`inklink-bar`）+ `tsf\src\menu.rs`，删掉 `tsf\src\ui_notify.rs` 与整个 `ui\` exe。`Activate`/`ActivateEx` → `bar::show()`、`Deactivate` → `bar::hide()`。菜单去「开机自启」「退出浮条」；`panic="abort"` 下必须 panic-free，菜单 `popup()` 的 `PeekMessageW` 只按菜单 hwnd 过滤、无 `std::process::exit`。
+- **进程内浮条不能"一个进程一条"**（1.1.14，修"桌面上并排三条浮条"）：TSF 是**按线程**激活的，
+  一个进程里几条线程各 `Activate` 一次就各建一个窗口；而 `Deactivate` 只在"这条线程不再用这个输入法"时来，
+  用户 Alt+Tab 切程序**不会**触发它。两个修法：① 窗口句柄放 `thread_local!`（每条线程只看得见自己那条）；
+  ② 600ms 看门狗（`TIMER_WATCH`）：不在前台就自己收起，回到前台且没有别的浮动条可见时再显示，
+  同进程内 `EnumWindows` 只留可见的那一条。
+- **浮条标点格上下叠放、符号自己画**（1.1.14）：像搜狗那样上面句号、下面逗号；全角标点的墨迹只占字框底部，
+  15px 字体画出来是一粒灰点，所以 `draw_ring`/`draw_comma` 用 GDI 圆/多边形直接画（和 ☰ 同一个思路，不依赖字体）。
 > 所有应用同时切换（状态在注册表里，DLL 每键现读）。
 > 显隐由 TSF 的 `Activate`/`Deactivate` 驱动——切到这个输入法才出现，切走自动收起，不再一直挂在角落。
 
