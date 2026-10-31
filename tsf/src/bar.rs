@@ -79,6 +79,12 @@ static WANTED: AtomicBool = AtomicBool::new(false);
 static ANY_BAR: AtomicBool = AtomicBool::new(false);
 static FONT: AtomicIsize = AtomicIsize::new(0);
 
+// 上一次画出来的状态。看门狗拿它跟注册表比，不一样就重画 ——
+// 状态是全局的，别的程序里点了中/英或标点，这条浮条也得跟着变。
+static PAINTED_VALID: AtomicBool = AtomicBool::new(false);
+static PAINTED_CHINESE: AtomicBool = AtomicBool::new(true);
+static PAINTED_PUNCT: AtomicBool = AtomicBool::new(true);
+
 // 96 DPI 下的设计尺寸，实际按 DPI 缩放
 const PAD: i32 = 4;
 /// 30 而不是 26：标点格里「。」「，」要上下叠两行。
@@ -565,6 +571,9 @@ unsafe fn paint_frame(hdc: HDC, client: &RECT) {
     let rects = item_rects();
     // 每次现读：Shift 在别的动作里切了中英，这里立刻反映；不缓存。
     let (chinese, punct) = crate::state::snapshot();
+    PAINTED_CHINESE.store(chinese, Ordering::Relaxed);
+    PAINTED_PUNCT.store(punct, Ordering::Relaxed);
+    PAINTED_VALID.store(true, Ordering::Relaxed);
     let hover = HOVER.load(Ordering::Relaxed);
 
     // 悬停只在当前格后面垫一层浅色圆角，不改文字颜色。
@@ -783,6 +792,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         invalidate(hwnd);
                         AUTO_HIDDEN.store(false, Ordering::SeqCst);
                     }
+                }
+                // 状态是全局的（注册表）：别的程序里点了中/英或标点，这一条也要跟着变，
+                // 否则同一时刻不同窗口里的浮条会显示不同的状态。
+                let (chinese, punct) = crate::state::snapshot();
+                if !PAINTED_VALID.load(Ordering::Relaxed)
+                    || chinese != PAINTED_CHINESE.load(Ordering::Relaxed)
+                    || punct != PAINTED_PUNCT.load(Ordering::Relaxed)
+                {
+                    invalidate(hwnd);
                 }
             }
             0
