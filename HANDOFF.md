@@ -414,6 +414,11 @@ DLL 被加载后无法卸载：脚本每次用**新文件名 + 改注册表**，
 
 ### 踩过的坑（本阶段新增）
 
+- **小字号彩色文字不要用 `CLEARTYPE_QUALITY`**（1.1.16 修）：`CreateFontW` 传 `5`（ClearType，
+  子像素抗锯齿）时，17px 的「中」「英」在笔画边缘会拉出橙/蓝色边，用户的原话是"字发花、很脏"。
+  改成 `ANTIALIASED_QUALITY = 4`（灰度抗锯齿）后立刻干净。ClearType 适合白底黑字的大段文本，
+  **不适合十来像素、还带颜色的界面文字**。标点格同理 —— 想过用字体画「。」「，」，
+  14px 下就是两粒看不见的灰点，最后是 GDI 直接画形状（`draw_ring`/`draw_comma`），和 ☰ 一样不依赖字体。
 - **空字符串的 `Vec::as_ptr()` 是悬垂指针（值 = 2），`DrawTextW` 会真去读它 → 宿主进程 AV**
   （1.1.11 修）。`text.encode_utf16().collect::<Vec<u16>>()` 在空串时是零长 `Vec`，
   `as_ptr()` 返回 `align_of::<u16>() = 2`；`DrawTextW(hdc, ptr, 0, …)` **并不会**因为
