@@ -85,32 +85,33 @@ static PAINTED_VALID: AtomicBool = AtomicBool::new(false);
 static PAINTED_CHINESE: AtomicBool = AtomicBool::new(true);
 static PAINTED_PUNCT: AtomicBool = AtomicBool::new(true);
 
-// 96 DPI 下的设计尺寸，实际按 DPI 缩放
-const PAD: i32 = 4;
-/// 30 而不是 26：标点格里「。」「，」要上下叠两行。
-const ITEM_H: i32 = 30;
-const RADIUS: i32 = 7;
-const GAP: i32 = 2;
+// 96 DPI 下的设计尺寸，实际按 DPI 缩放。
+// 整体节奏照搜狗那条浮条：44px 高、留白大、四格等距，不做逐格色块。
+const PAD: i32 = 6;
+/// 32 而不是 26：标点格里「。」「，」要上下叠两行，还要留出呼吸空间。
+const ITEM_H: i32 = 32;
+const RADIUS: i32 = 10;
+const GAP: i32 = 4;
 /// 第一格是品牌标（深蓝圆角方块 + 白色 i），点它等同点 ☰。
-const W_BRAND: i32 = 26;
-/// 品牌标和状态之间那道竖线（和搜狗一样），两边各留 5。
-const SEP_GAP: i32 = 5;
+const W_BRAND: i32 = 30;
+/// 品牌标和状态之间那道竖线（和搜狗一样），两边各留 6。
+const SEP_GAP: i32 = 6;
 const SEP_W: i32 = 1;
-const W_MODE: i32 = 40;
-const W_PUNCT: i32 = 44;
-const W_MENU: i32 = 32;
+const W_MODE: i32 = 34;
+const W_PUNCT: i32 = 34;
+const W_MENU: i32 = 30;
 
 // COLORREF 是 0x00BBGGRR（低字节是红）
 /// 整条是一块白底，不再给每格画独立的灰方块 —— 那样四坨色块很笨重。
 const C_BG: u32 = 0x00_FF_FF_FF;
-/// 描边 #DCDCE2：白底浮条放到白色窗口上，没有一条清楚的边界就"化"进去了。
-const C_BORDER: u32 = 0x00_E2_DC_DC;
-/// 悬停垫底 #F0F0F5。
-const C_HOVER: u32 = 0x00_F5_F0_F0;
-/// 常态文字 #333336。
-const C_TEXT: u32 = 0x00_36_33_33;
-/// 关闭/未激活的文字 #8A8A8E（比常态浅，一眼能分出开和关）。
-const C_DIM: u32 = 0x00_8E_8A_8A;
+/// 描边 #E2E2E8：白底浮条放到白色窗口上，没有一条清楚的边界就"化"进去了。
+const C_BORDER: u32 = 0x00_E8_E2_E2;
+/// 悬停垫底 #F2F2F6（比原来更淡，只做"鼠标在这儿"的暗示，不抢视觉）。
+const C_HOVER: u32 = 0x00_F6_F2_F2;
+/// 常态文字/图形 #3A3A3E。
+const C_TEXT: u32 = 0x00_3E_3A_3A;
+/// 关闭/未激活 #A2A2A8（比常态浅，一眼能分出开和关）。
+const C_DIM: u32 = 0x00_A8_A2_A2;
 /// 激活色 = 品牌深蓝 #062657（原来是搜狗那种橙，2026-10-29 按用户要求换掉）。
 const C_ACCENT: u32 = 0x00_57_26_06;
 
@@ -478,7 +479,7 @@ unsafe fn draw_text_centered(hdc: HDC, r: &RECT, text: &str, fg: u32, font: HGDI
 
 /// 菜单格的三道横线。不用 `☰` 字形：字体缺字会画成豆腐块，手画的永远一样清楚。
 unsafe fn draw_menu_glyph(hdc: HDC, r: &RECT) {
-    let w = scale(13);
+    let w = scale(12);
     let th = scale(2).max(1);
     let gap = scale(4);
     let cx = (r.left + r.right) / 2;
@@ -497,7 +498,7 @@ unsafe fn draw_menu_glyph(hdc: HDC, r: &RECT) {
 }
 
 fn get_font() -> HGDIOBJ {
-    make_font(&FONT, 15)
+    make_font(&FONT, 17)
 }
 
 fn make_font(slot: &AtomicIsize, px: i32) -> HGDIOBJ {
@@ -512,14 +513,17 @@ fn make_font(slot: &AtomicIsize, px: i32) -> HGDIOBJ {
             0,
             0,
             0,
-            500,
+            600,
             0,
             0,
             0,
             1, // DEFAULT_CHARSET
             0,
             0,
-            5, // CLEARTYPE_QUALITY
+            // 4 = ANTIALIASED_QUALITY（灰度抗锯齿）。
+            // 不用 5 = CLEARTYPE：小字号 + 彩色文字时 ClearType 会在笔画边缘拉出
+            // 橙/蓝色边（用户看到的"字发花、脏"就是这个），灰度 AA 在浮条这种小控件上更干净。
+            4,
             0,
             face.as_ptr(),
         );
@@ -542,16 +546,19 @@ unsafe fn draw_ring(hdc: HDC, cx: i32, cy: i32, r: i32, color: u32) {
     DeleteObject(pen as HGDIOBJ);
 }
 
-/// 画「，」：一个小圆点加一条往左下拖的尾。同样是自己画，不用字体。
+/// 画「，」：一个圆点加一条往**左下**收的尾。不用字体（同上）。
 unsafe fn draw_comma(hdc: HDC, cx: i32, cy: i32, color: u32) {
     let brush: HBRUSH = CreateSolidBrush(color);
     let old_brush = SelectObject(hdc, brush);
     let s = scale(2);
+    // 圆头比句号小一圈（句号 r=4，这里 r=2），层次才出来
     Ellipse(hdc, cx - s, cy - s, cx + s + 1, cy + s + 1);
+    // 尾巴做成细长四边形而不是三角形：三角形的尖在 8px 尺寸下看着像"钉子"
     let tail = [
         POINT { x: cx - s, y: cy + 1 },
         POINT { x: cx + s, y: cy + 1 },
-        POINT { x: cx - s + 1, y: cy + scale(6) },
+        POINT { x: cx + 1, y: cy + scale(4) },
+        POINT { x: cx - s - scale(1), y: cy + scale(6) },
     ];
     Polygon(hdc, tail.as_ptr(), tail.len() as i32);
     SelectObject(hdc, old_brush);
@@ -578,17 +585,17 @@ unsafe fn paint_frame(hdc: HDC, client: &RECT) {
 
     // 悬停只在当前格后面垫一层浅色圆角，不改文字颜色。
     if (0..4).contains(&hover) {
-        let r = inset(&rects[hover as usize], scale(2));
-        fill_round(hdc, &r, C_HOVER, scale(5));
+        let r = inset(&rects[hover as usize], scale(3));
+        fill_round(hdc, &r, C_HOVER, scale(7));
     }
 
     // 品牌标和状态之间的分隔竖线。
     let sep_x = rects[0].right + scale(SEP_GAP);
     let sep = RECT {
         left: sep_x,
-        top: rects[0].top + scale(7),
+        top: rects[0].top + scale(8),
         right: sep_x + scale(SEP_W),
-        bottom: rects[0].bottom - scale(7),
+        bottom: rects[0].bottom - scale(8),
     };
     fill_rect(hdc, &sep, C_BORDER);
 
@@ -609,12 +616,13 @@ unsafe fn paint_frame(hdc: HDC, client: &RECT) {
     let cx = (cell.left + cell.right) / 2;
     let mid = cell.top + (cell.bottom - cell.top) / 2;
     let punct_fg = if punct { C_ACCENT } else { C_DIM };
-    let upper_cy = mid - scale(6);
-    let lower_cy = mid + scale(6);
+    // 上下叠放：上句号、下逗号（和搜狗那条一样）。两个符号都用 GDI 画形状，
+    // 不用字体 —— 14px 的全角标点墨迹只有 2~3px，打出来是一粒灰点。
+    let upper_cy = mid - scale(5);
+    let lower_cy = mid + scale(5);
     if punct {
-        // 中文：空心圈 + 逗号
         draw_ring(hdc, cx, upper_cy, scale(4), punct_fg);
-        draw_comma(hdc, cx - scale(1), lower_cy - scale(1), punct_fg);
+        draw_comma(hdc, cx, lower_cy, punct_fg);
     } else {
         // 半角：实心小点 + 逗号（点更小，一眼能分出这是半角）
         let brush: HBRUSH = CreateSolidBrush(punct_fg);
@@ -623,7 +631,7 @@ unsafe fn paint_frame(hdc: HDC, client: &RECT) {
         Ellipse(hdc, cx - d, upper_cy - d, cx + d + 1, upper_cy + d + 1);
         SelectObject(hdc, old);
         DeleteObject(brush as HGDIOBJ);
-        draw_comma(hdc, cx - scale(1), lower_cy - scale(1), punct_fg);
+        draw_comma(hdc, cx, lower_cy, punct_fg);
     }
 
     // 第四格：菜单。
