@@ -125,12 +125,15 @@ pub fn punctuation() -> bool {
 }
 
 unsafe fn write_flag(name: &str, on: bool) {
+    // 写失败必须留下痕迹：浮条点一下"没反应"十有八九是这里没写成
+    // （宿主进程没有 HKCU 写权限，例如以另一个账户/受限令牌运行）。
     let Some(key) = create_key() else {
+        crate::log_line(&format!("state write {name}={} failed: open key", u32::from(on)));
         return;
     };
     let name_w = wide(name);
     let data: u32 = u32::from(on);
-    RegSetValueExW(
+    let rc = RegSetValueExW(
         key,
         name_w.as_ptr(),
         0,
@@ -139,6 +142,9 @@ unsafe fn write_flag(name: &str, on: bool) {
         std::mem::size_of::<u32>() as u32,
     );
     RegCloseKey(key);
+    if rc != 0 {
+        crate::log_line(&format!("state write {name}={} failed: rc={rc}", u32::from(on)));
+    }
 }
 
 /// 切换/设置中英模式（全局，所有进程下一次按键就生效）。
