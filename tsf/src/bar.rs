@@ -31,10 +31,11 @@ use std::sync::Mutex;
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
-    BeginPaint, CreateFontW, CreatePen, CreateRoundRectRgn, CreateSolidBrush, DeleteObject,
-    DrawTextW, Ellipse, EndPaint, FillRect, GetStockObject, InvalidateRect, Polygon, RoundRect,
-    SelectObject, SetBkMode, SetTextColor, SetWindowRgn, DT_CENTER, DT_SINGLELINE, DT_VCENTER,
-    HBRUSH, HDC, HGDIOBJ, NULL_BRUSH, PAINTSTRUCT, TRANSPARENT,
+    AlphaBlend, BeginPaint, CreateCompatibleDC, CreateDIBSection, CreateFontW,
+    CreateRoundRectRgn, CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, EndPaint, FillRect,
+    InvalidateRect, RoundRect, SelectObject, SetBkMode, SetTextColor, SetWindowRgn, AC_SRC_ALPHA,
+    AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION, DIB_RGB_COLORS, DT_CENTER,
+    DT_SINGLELINE, DT_VCENTER, HBRUSH, HDC, HGDIOBJ, PAINTSTRUCT, TRANSPARENT,
 };
 use windows_sys::Win32::System::Threading::GetCurrentProcessId;
 use windows_sys::Win32::UI::HiDpi::GetDpiForSystem;
@@ -377,7 +378,27 @@ fn default_position() -> (i32, i32) {
 /// 第一格里的品牌标。图标只加载一次（`LoadImageW` 会读盘），之后一直复用。
 static BADGE: AtomicIsize = AtomicIsize::new(0);
 
-fn load_badge() -> HICON {
+/// `installer\inklink.ico` 里有的帧（`tools\draw-logo.py` 每档按自己的尺寸原生渲染）。
+const BADGE_FRAMES: [i32; 7] = [16, 20, 24, 32, 40, 48, 64];
+
+/// 品牌标画多大：取 ICO 里**现成的**、不超过设计尺寸的最大一帧。
+/// 100% → 24，125% → 24，150% → 32，200% → 48。宁可小一两像素，也不让系统重采样。
+fn badge_side() -> i32 {
+    pick_frame(scale(W_BRAND - 6))
+}
+
+/// `badge_side()` 的纯函数部分（不读 DPI，方便单测）：
+/// 在 `BADGE_FRAMES` 里挑一个不超过 `want` 的最大帧，一个都不满足就用最小帧。
+fn pick_frame(want: i32) -> i32 {
+    BADGE_FRAMES
+        .iter()
+        .copied()
+        .filter(|&s| s <= want)
+        .max()
+        .unwrap_or(BADGE_FRAMES[0])
+}
+
+fn load_badge(side: i32) -> HICON {
     // 用 DLL 同目录下的 `inklink.ico`（安装器一定拷过去），没有就退回系统默认图标。
     let dll = crate::registry::dll_path();
     let dir = std::path::Path::new(&dll)
@@ -385,13 +406,15 @@ fn load_badge() -> HICON {
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default();
     let path = wide(&format!("{dir}\\inklink.ico"));
+    // **必须按要画的尺寸要帧**：原来传 `0, 0`，`LoadImageW` 拿的是文件里第一帧（16×16），
+    // 再由 `DrawIconEx` 拉到 24 —— 浮条上的品牌标糊成一团就是这么来的。
     let h = unsafe {
         LoadImageW(
             std::ptr::null_mut(),
             path.as_ptr(),
             IMAGE_ICON,
-            0,
-            0,
+            side,
+            side,
             LR_LOADFROMFILE,
         )
     };
@@ -402,18 +425,17 @@ fn load_badge() -> HICON {
 }
 
 unsafe fn draw_badge(hdc: HDC, r: &RECT) {
+    // 图标比格子小一圈，留出边距；尺寸正好是 ICO 里的某一帧，1:1 贴上去，不经过缩放。
+    let side = badge_side();
     let mut h = BADGE.load(Ordering::Relaxed);
     if h == 0 {
-        let icon = load_badge();
+        let icon = load_badge(side);
         if icon.is_null() {
             return;
         }
         h = icon as isize;
         BADGE.store(h, Ordering::Relaxed);
     }
-    // 图标比格子小一圈，留出边距；尺寸取整数倍 DPI，尽量命中 ICO 里的 20/24/32 帧，
-    // 避免 `DrawIconEx` 从 32 帧往下重采样（那是"图标糊"的主要来源）。
-    let side = scale(W_BRAND - 6);
     let x = r.left + (r.right - r.left - side) / 2;
     let y = r.top + (r.bottom - r.top - side) / 2;
     DrawIconEx(
@@ -532,37 +554,145 @@ fn make_font(slot: &AtomicIsize, px: i32) -> HGDIOBJ {
     }
 }
 
-/// 把整条画出来。**不碰窗口**，只吃一个 HDC —— 这样测试能把同一份绘制代码
-/// 渲进内存位图（`渲染预览图`），改配色改布局不用先部署到宿主里看。
-/// 画「。」：一个空心圆环。全角句号的墨迹只占字框底部几个像素，用 15px 字体画出来
-/// 只是一粒灰点；直接用 GDI 画环更清楚，也不依赖字体里有没有这个字（和 ☰ 同理）。
-unsafe fn draw_ring(hdc: HDC, cx: i32, cy: i32, r: i32, color: u32) {
-    let pen = CreatePen(0, (r / 3).max(1), color);
-    let old_pen = SelectObject(hdc, pen as HGDIOBJ);
-    let old_brush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
-    Ellipse(hdc, cx - r, cy - r, cx + r + 1, cy + r + 1);
-    SelectObject(hdc, old_brush);
-    SelectObject(hdc, old_pen);
-    DeleteObject(pen as HGDIOBJ);
+// ── 标点格的符号：抗锯齿自绘 ─────────────────────────────────────────────────
+//
+// GDI 的 `Ellipse`/`Polygon` 没有抗锯齿：句号圈只有 1px 的硬线、逗号尾巴一圈台阶，
+// 用户的原话是"太单薄、一条线、边缘很粗糙"。字体也不行（全角标点在 14px 下只剩一粒灰点）。
+// 所以这里按**有向距离场**自己算每个像素的覆盖率：距离 < -0.5px 全涂、> 0.5px 不涂，
+// 中间线性过渡 —— 就是一个像素宽的抗锯齿边。算好后放进 32 位预乘 alpha 的 DIB，
+// `AlphaBlend` 叠到底色上（白底或悬停底都对）。纯计算 + GDI，不起线程、不碰 COM。
+
+/// 句号/逗号的形状，坐标单位是**像素**（已经按 DPI 缩放）。
+#[derive(Clone, Copy)]
+enum Glyph {
+    /// 空心圆环：圆心、环中线半径、半个线宽。
+    Ring { cx: f32, cy: f32, r: f32, hw: f32 },
+    /// 实心圆点。
+    Dot { cx: f32, cy: f32, r: f32 },
+    /// 逗号：圆头 + 一条往左下收尖的弯尾。`(cx, cy)` 是圆头中心，`k` 是 DPI 缩放。
+    Comma { cx: f32, cy: f32, k: f32 },
 }
 
-/// 画「，」：一个圆点加一条往**左下**收的尾。不用字体（同上）。
-unsafe fn draw_comma(hdc: HDC, cx: i32, cy: i32, color: u32) {
-    let brush: HBRUSH = CreateSolidBrush(color);
-    let old_brush = SelectObject(hdc, brush);
-    let s = scale(2);
-    // 圆头比句号小一圈（句号 r=4，这里 r=2），层次才出来
-    Ellipse(hdc, cx - s, cy - s, cx + s + 1, cy + s + 1);
-    // 尾巴做成细长四边形而不是三角形：三角形的尖在 8px 尺寸下看着像"钉子"
-    let tail = [
-        POINT { x: cx - s, y: cy + 1 },
-        POINT { x: cx + s, y: cy + 1 },
-        POINT { x: cx + 1, y: cy + scale(4) },
-        POINT { x: cx - s - scale(1), y: cy + scale(6) },
-    ];
-    Polygon(hdc, tail.as_ptr(), tail.len() as i32);
-    SelectObject(hdc, old_brush);
-    DeleteObject(brush as HGDIOBJ);
+fn dist(ax: f32, ay: f32, bx: f32, by: f32) -> f32 {
+    ((ax - bx) * (ax - bx) + (ay - by) * (ay - by)).sqrt()
+}
+
+/// 从 a（半径 ra）到 b（半径 rb）、半径线性变化的一段笔画的近似距离场。
+fn taper(px: f32, py: f32, a: (f32, f32, f32), b: (f32, f32, f32)) -> f32 {
+    let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+    let len2 = dx * dx + dy * dy;
+    let t = if len2 > 0.0 {
+        (((px - a.0) * dx + (py - a.1) * dy) / len2).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    dist(px, py, a.0 + dx * t, a.1 + dy * t) - (a.2 + (b.2 - a.2) * t)
+}
+
+/// 有向距离（像素）：< 0 在形状里面。纯函数，可单测。
+fn glyph_sdf(g: Glyph, px: f32, py: f32) -> f32 {
+    match g {
+        Glyph::Ring { cx, cy, r, hw } => (dist(px, py, cx, cy) - r).abs() - hw,
+        Glyph::Dot { cx, cy, r } => dist(px, py, cx, cy) - r,
+        Glyph::Comma { cx, cy, k } => {
+            // 96 DPI 下的设计：圆头 r=2.3；尾巴从圆头右下起笔、垂直落下再往左下甩出去，
+            // 三段半径 1.7 → 1.15 → 0.45，收成尖但不是"钉子"。
+            let p = |x: f32, y: f32, r: f32| (cx + x * k, cy + y * k, r * k);
+            let head = dist(px, py, cx, cy) - 2.3 * k;
+            let a = p(0.7, 0.6, 1.7);
+            let b = p(0.9, 3.4, 1.15);
+            let c = p(-1.6, 6.4, 0.45);
+            head.min(taper(px, py, a, b)).min(taper(px, py, b, c))
+        }
+    }
+}
+
+/// 把若干形状按覆盖率画进 `area`（预乘 alpha + `AlphaBlend`），颜色是 COLORREF。
+unsafe fn draw_glyphs_aa(hdc: HDC, area: &RECT, glyphs: &[Glyph], color: u32) {
+    let w = area.right - area.left;
+    let h = area.bottom - area.top;
+    if w <= 0 || h <= 0 || w > 512 || h > 512 {
+        return;
+    }
+    let bmi = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: w,
+            biHeight: -h, // 自上而下
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB,
+            ..std::mem::zeroed()
+        },
+        bmiColors: [std::mem::zeroed()],
+    };
+    let mem = CreateCompatibleDC(hdc);
+    if mem.is_null() {
+        return;
+    }
+    let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
+    let dib = CreateDIBSection(mem, &bmi, DIB_RGB_COLORS, &mut bits, std::ptr::null_mut(), 0);
+    if dib.is_null() || bits.is_null() {
+        DeleteDC(mem);
+        return;
+    }
+    let old = SelectObject(mem, dib as HGDIOBJ);
+
+    let (r, g, b) = (color & 0xFF, (color >> 8) & 0xFF, (color >> 16) & 0xFF);
+    let px = std::slice::from_raw_parts_mut(bits as *mut u32, (w * h) as usize);
+    for y in 0..h {
+        for x in 0..w {
+            // 像素中心，换回 hdc 坐标
+            let fx = (area.left + x) as f32 + 0.5;
+            let fy = (area.top + y) as f32 + 0.5;
+            let d = glyphs
+                .iter()
+                .map(|&gl| glyph_sdf(gl, fx, fy))
+                .fold(f32::INFINITY, f32::min);
+            let cov = (0.5 - d).clamp(0.0, 1.0);
+            let a = (cov * 255.0 + 0.5) as u32;
+            // 预乘：颜色分量 × alpha / 255
+            let pr = (r * a + 127) / 255;
+            let pg = (g * a + 127) / 255;
+            let pb = (b * a + 127) / 255;
+            px[(y * w + x) as usize] = (a << 24) | (pr << 16) | (pg << 8) | pb;
+        }
+    }
+
+    let blend = BLENDFUNCTION {
+        BlendOp: AC_SRC_OVER as u8,
+        BlendFlags: 0,
+        SourceConstantAlpha: 255,
+        AlphaFormat: AC_SRC_ALPHA as u8,
+    };
+    AlphaBlend(hdc, area.left, area.top, w, h, mem, 0, 0, w, h, blend);
+    SelectObject(mem, old);
+    DeleteObject(dib as HGDIOBJ);
+    DeleteDC(mem);
+}
+
+/// 标点格的两个符号，上下叠放（上句号、下逗号，和搜狗那条一样）。
+///
+/// 中文标点：空心圈「。」，线宽 1.9px（原来 1px 硬线，看着单薄）；
+/// 半角：实心小点「.」—— 一眼能分出是哪种。逗号两种状态一样。
+fn punct_glyphs(cell: &RECT, chinese_punct: bool) -> [Glyph; 2] {
+    let k = dpi_k();
+    let cx = (cell.left + cell.right) as f32 / 2.0;
+    let mid = (cell.top + cell.bottom) as f32 / 2.0;
+    // 逗号的尾巴比圈往下多伸 ~6px，整体往上提 0.4 让视觉重心落在格子正中。
+    let upper = mid - 5.4 * k;
+    let lower = mid + 3.6 * k;
+    let top = if chinese_punct {
+        Glyph::Ring { cx, cy: upper, r: 3.4 * k, hw: 0.95 * k }
+    } else {
+        Glyph::Dot { cx, cy: upper, r: 2.1 * k }
+    };
+    [top, Glyph::Comma { cx, cy: lower, k }]
+}
+
+/// DPI 缩放系数（96 DPI = 1.0），给浮点几何用。
+fn dpi_k() -> f32 {
+    scale(96) as f32 / 96.0
 }
 
 unsafe fn paint_frame(hdc: HDC, client: &RECT) {
@@ -613,26 +743,8 @@ unsafe fn paint_frame(hdc: HDC, client: &RECT) {
     // 第三格：中文标点 / 半角。像搜狗那样**上下叠放**（上句号、下逗号）。
     // 两个符号都用 GDI 画形状而不是打字体 —— 15px 字号下全角标点只剩一粒灰点。
     let cell = rects[2];
-    let cx = (cell.left + cell.right) / 2;
-    let mid = cell.top + (cell.bottom - cell.top) / 2;
     let punct_fg = if punct { C_ACCENT } else { C_DIM };
-    // 上下叠放：上句号、下逗号（和搜狗那条一样）。两个符号都用 GDI 画形状，
-    // 不用字体 —— 14px 的全角标点墨迹只有 2~3px，打出来是一粒灰点。
-    let upper_cy = mid - scale(5);
-    let lower_cy = mid + scale(5);
-    if punct {
-        draw_ring(hdc, cx, upper_cy, scale(4), punct_fg);
-        draw_comma(hdc, cx, lower_cy, punct_fg);
-    } else {
-        // 半角：实心小点 + 逗号（点更小，一眼能分出这是半角）
-        let brush: HBRUSH = CreateSolidBrush(punct_fg);
-        let old = SelectObject(hdc, brush);
-        let d = scale(2);
-        Ellipse(hdc, cx - d, upper_cy - d, cx + d + 1, upper_cy + d + 1);
-        SelectObject(hdc, old);
-        DeleteObject(brush as HGDIOBJ);
-        draw_comma(hdc, cx, lower_cy, punct_fg);
-    }
+    draw_glyphs_aa(hdc, &cell, &punct_glyphs(&cell, punct), punct_fg);
 
     // 第四格：菜单。
     draw_menu_glyph(hdc, &rects[3]);
@@ -960,5 +1072,42 @@ mod tests {
             DeleteDC(dc);
             ReleaseDC(std::ptr::null_mut(), screen);
         }
+    }
+
+    /// 抗锯齿靠的是 `glyph_sdf` 的正负号：< 0 在墨里、> 0 在外面、跨 0 的那一个像素
+    /// 才按距离给半透明。符号算反了整格会变成一块实心方块（或者干脆什么都不画），
+    /// 而预览图上一眼很难分出来，所以这里把内外点钉死。
+    #[test]
+    fn 句号圆环的距离场内外分明() {
+        // 圆心 (0,0)、环中线半径 4、半线宽 1 → 墨在半径 3~5 之间
+        let ring = Glyph::Ring { cx: 0.0, cy: 0.0, r: 4.0, hw: 1.0 };
+        assert!(glyph_sdf(ring, 0.0, 0.0) > 0.0, "圆心是环的洞，该在外面");
+        assert!(glyph_sdf(ring, 4.0, 0.0) < 0.0, "环中线上，该在墨里");
+        assert!(glyph_sdf(ring, 0.0, -4.0) < 0.0, "上下左右要对匀");
+        assert!(glyph_sdf(ring, 2.0, 0.0) > 0.0, "圈里的洞");
+        assert!(glyph_sdf(ring, 6.0, 0.0) > 0.0, "圈外的空");
+        assert!(glyph_sdf(ring, 3.0, 0.0).abs() < 0.001, "内边缘处距离为 0");
+    }
+
+    #[test]
+    fn 逗号是有头有尾的不对称形状() {
+        let comma = Glyph::Comma { cx: 0.0, cy: 0.0, k: 1.0 };
+        assert!(glyph_sdf(comma, 0.0, 0.0) < 0.0, "圆头中心在墨里");
+        assert!(glyph_sdf(comma, 0.0, 50.0) > 0.0, "远处在外面");
+        // 尾巴往**左下**甩：下方几个像素处还在墨里，正上方对称位置就该空了。
+        assert!(glyph_sdf(comma, 0.0, 3.0) < 0.0, "圆头下面接着尾巴");
+        assert!(glyph_sdf(comma, -1.5, 6.0) < 0.0, "尾尖附近仍是墨");
+        assert!(glyph_sdf(comma, 0.0, -3.0) > 0.0, "上面不该有东西（逗号不是两端对称的）");
+    }
+
+    #[test]
+    fn 品牌标只挑_ico_里真有的帧() {
+        assert_eq!(pick_frame(24), 24);
+        assert_eq!(pick_frame(30), 24, "30 没有现成帧，只能退到 24");
+        assert_eq!(pick_frame(23), 20, "不能超过想要的大小");
+        assert_eq!(pick_frame(200), 64, "最大档就是 64");
+        assert_eq!(pick_frame(8), 16, "想要得比最小时用最小帧");
+        let side = badge_side();
+        assert!(BADGE_FRAMES.contains(&side), "实际取值 {side} 必须是 ico 里有的帧");
     }
 }
