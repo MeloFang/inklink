@@ -746,7 +746,7 @@ Obsidian 语料 + AI 兜底，默认关闭联网（符合项目铁律）。
 - 纯函数 `scale`/`item_rects`/`hit_test`/`row_at`/`menu_size` 补了单测，`cargo test --release` 64 项全绿。
 - 部署 1.1.10，`C:\Program Files\inklink\inklink-ui.exe` 与 `HKCU\...\Run\inklink-ui` 自启项删除。
 
-#### 修"偶尔同时冒出两条浮条" + 标点格句号左移逗号右移（2026-11-01，未部署、未提交、版本号未变）
+#### 修"偶尔同时冒出两条浮条" + 标点格句号左移逗号右移（2026-11-01，✅ 1.1.20 已部署 / 提交 `014fc3b`）
 
 规格：`.kiro\specs\fix-duplicate-floating-bars-punctuation-layout\`（requirements / design / tasks）。
 改动只在 `tsf\src\bar.rs`。
@@ -788,8 +788,10 @@ Obsidian 语料 + AI 兜底，默认关闭联网（符合项目铁律）。
 - 预览：`tsf\target\bar-preview*.bmp`，新增 `bar-preview-punct-cn.bmp` / `bar-preview-punct-half.bmp`。
 
 **其他验证**：`rustfmt --edition 2024 --check src\bar.rs` 通过；64 / 32 位 DLL 都能构建；
-`cargo clippy` 在 `bar.rs` 无新问题。clippy 仍因 `lib.rs` 里本次之前就有的 3 个
-`not_unsafe_ptr_arg_deref` 错误（`DllGetClassObject`，2550:13、2554:23、2554:29）退出非零，未修。
+`cargo clippy` 在 `bar.rs` 无新问题。`lib.rs` 里本次之前就有的 3 个
+`not_unsafe_ptr_arg_deref` 错误（`DllGetClassObject`，2550:13、2554:23、2554:29）
+已随 1.1.20 一起修掉（把该函数标成 `unsafe extern "system" fn` 并补 `# Safety` 说明），
+现在 `cargo clippy --all-targets` **0 error**；剩余 167 条全是 E0133 风格告警。
 
 **手测清单**（⬜ 待手测，部署后做）：
 
