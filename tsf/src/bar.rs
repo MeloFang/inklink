@@ -26,29 +26,29 @@
 //! 回到前台再自动放出来（只在"自动收起过"时才放，用户手动关掉输入法不会被它复活）。
 
 use std::cell::Cell;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, Ordering};
 
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
-    AlphaBlend, BeginPaint, CreateCompatibleDC, CreateDIBSection, CreateFontW,
-    CreateRoundRectRgn, CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, EndPaint, FillRect,
-    InvalidateRect, RoundRect, SelectObject, SetBkMode, SetTextColor, SetWindowRgn, AC_SRC_ALPHA,
-    AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION, DIB_RGB_COLORS, DT_CENTER,
-    DT_SINGLELINE, DT_VCENTER, HBRUSH, HDC, HGDIOBJ, PAINTSTRUCT, TRANSPARENT,
+    AC_SRC_ALPHA, AC_SRC_OVER, AlphaBlend, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION,
+    BeginPaint, CreateCompatibleDC, CreateDIBSection, CreateFontW, CreateSolidBrush,
+    DIB_RGB_COLORS, DT_CENTER, DT_SINGLELINE, DT_VCENTER, DeleteDC, DeleteObject, DrawTextW,
+    EndPaint, FillRect, GdiFlush, HBITMAP, HBRUSH, HDC, HGDIOBJ, PAINTSTRUCT, SelectObject,
+    SetBkMode, SetTextColor, TRANSPARENT,
 };
 use windows_sys::Win32::System::Threading::GetCurrentProcessId;
 use windows_sys::Win32::UI::HiDpi::GetDpiForSystem;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DrawIconEx, EnumWindows, GetClassNameW, GetClientRect,
-    GetCursorPos, GetForegroundWindow, GetWindowRect, GetWindowThreadProcessId, IsWindowVisible,
-    KillTimer, LoadCursorW, LoadIconW, LoadImageW, MoveWindow, PostMessageW, RegisterClassW,
-    SetTimer, ShowWindow, SystemParametersInfoW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, DI_NORMAL,
-    HICON, IDC_ARROW, IDI_APPLICATION, IMAGE_ICON, LR_LOADFROMFILE, MA_NOACTIVATE,
-    SPI_GETWORKAREA, SW_HIDE, SW_SHOWNOACTIVATE, WNDCLASSW, WM_APP, WM_ERASEBKGND, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_PAINT, WM_TIMER, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreateWindowExW, DI_NORMAL, DefWindowProcW, DrawIconEx,
+    EnumWindows, GetClassNameW, GetCursorPos, GetForegroundWindow, GetWindowRect,
+    GetWindowThreadProcessId, HICON, IDC_ARROW, IDI_APPLICATION, IMAGE_ICON, IsWindowVisible,
+    KillTimer, LR_LOADFROMFILE, LoadCursorW, LoadIconW, LoadImageW, MA_NOACTIVATE, MoveWindow,
+    PostMessageW, RegisterClassW, SPI_GETWORKAREA, SW_HIDE, SW_SHOWNOACTIVATE, SetTimer,
+    ShowWindow, SystemParametersInfoW, ULW_ALPHA, UpdateLayeredWindow, WM_APP, WM_ERASEBKGND,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_PAINT, WM_TIMER, WNDCLASSW,
+    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
 const CLASS_NAME: &str = "inklink-bar";
@@ -87,11 +87,12 @@ static PAINTED_CHINESE: AtomicBool = AtomicBool::new(true);
 static PAINTED_PUNCT: AtomicBool = AtomicBool::new(true);
 
 // 96 DPI 下的设计尺寸，实际按 DPI 缩放。
-// 整体节奏照搜狗那条浮条：44px 高、留白大、四格等距，不做逐格色块。
-const PAD: i32 = 6;
-/// 32 而不是 26：标点格里「。」「，」要上下叠两行，还要留出呼吸空间。
-const ITEM_H: i32 = 32;
-const RADIUS: i32 = 10;
+// 整体节奏照搜狗那条浮条：四格等距，不做逐格色块。
+// 高度 36（原来 44，用户嫌上下太宽）：格高 28 刚好放下 24px 的品牌标，
+// 标点格里「。」「，」上下叠两行也还有 2~3px 的呼吸。
+const PAD: i32 = 4;
+const ITEM_H: i32 = 28;
+const RADIUS: i32 = 8;
 const GAP: i32 = 4;
 /// 第一格是品牌标（深蓝圆角方块 + 白色 i），点它等同点 ☰。
 const W_BRAND: i32 = 30;
@@ -135,12 +136,7 @@ fn item_rects() -> [RECT; 4] {
     let gap = scale(GAP);
     let h = scale(ITEM_H);
     let sep_total = scale(SEP_GAP) * 2 + scale(SEP_W);
-    let widths = [
-        scale(W_BRAND),
-        scale(W_MODE),
-        scale(W_PUNCT),
-        scale(W_MENU),
-    ];
+    let widths = [scale(W_BRAND), scale(W_MODE), scale(W_PUNCT), scale(W_MENU)];
     let mut rects = [RECT {
         left: 0,
         top: 0,
@@ -178,10 +174,14 @@ fn hit_test(x: i32, y: i32) -> i32 {
     -1
 }
 
-fn invalidate(hwnd: HWND) {
-    unsafe {
-        InvalidateRect(hwnd, std::ptr::null(), 0);
+/// 重画整条并交给系统合成（分层窗口没有 `WM_PAINT` 那一套，改了状态就直接调这个）。
+/// 返回 `UpdateLayeredWindow` 是否成功；失败时窗口会是空的，记一行日志方便排查。
+fn redraw(hwnd: HWND) -> bool {
+    let ok = unsafe { present(hwnd) };
+    if !ok {
+        crate::log_line("bar: UpdateLayeredWindow failed");
     }
+    ok
 }
 
 fn our_hwnd() -> HWND {
@@ -213,7 +213,10 @@ fn is_our_class(hwnd: HWND) -> bool {
         if n <= 0 {
             return false;
         }
-        buf[..n as usize].iter().copied().eq(CLASS_NAME.encode_utf16())
+        buf[..n as usize]
+            .iter()
+            .copied()
+            .eq(CLASS_NAME.encode_utf16())
     }
 }
 
@@ -262,8 +265,9 @@ pub fn show() {
         AUTO_HIDDEN.store(false, Ordering::SeqCst);
         hide_other_bars(hwnd);
         if IsWindowVisible(hwnd) == 0 {
+            // 分层窗口要先有内容再显示，否则会先闪一下空白（或者干脆看不见）。
+            redraw(hwnd);
             ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-            invalidate(hwnd);
             crate::log_line("bar show");
         }
         // 看门狗只在窗口存在期间跑；进程切到后台就靠它把浮条收走。
@@ -296,7 +300,7 @@ pub fn refresh() {
             return;
         }
         if IsWindowVisible(hwnd) != 0 {
-            invalidate(hwnd);
+            redraw(hwnd);
         }
     }
 }
@@ -323,8 +327,11 @@ fn ensure_window() {
 
         if (our_hwnd() as isize) == 0 {
             let name = wide(CLASS_NAME);
+            // WS_EX_LAYERED：整条按像素带 alpha 交给系统合成（`UpdateLayeredWindow`），
+            // 圆角边缘才能抗锯齿。原来用 `SetWindowRgn` 裁圆角，区域只有"在/不在"两种，
+            // 四个角是一圈台阶 —— 用户说的"圆角这里锯齿很粗糙"。
             let hwnd = CreateWindowExW(
-                WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED,
                 name.as_ptr(),
                 name.as_ptr(),
                 WS_POPUP,
@@ -345,21 +352,7 @@ fn ensure_window() {
             let (w, h) = window_size();
             let (x, y) = crate::state::read_pos().unwrap_or_else(default_position);
             MoveWindow(hwnd, x, y, w, h, 0);
-            apply_region(hwnd);
             crate::log_line(&format!("bar: created {w}x{h} at {x},{y}"));
-        }
-    }
-}
-
-/// 把窗口裁成圆角：`WS_POPUP` 是矩形，不裁的话四角会露出一块白（深色背景上很显眼）。
-/// 区域归系统所有，`SetWindowRgn` 之后不要再删它。
-fn apply_region(hwnd: HWND) {
-    let (w, h) = window_size();
-    let r = scale(RADIUS);
-    unsafe {
-        let rgn = CreateRoundRectRgn(0, 0, w + 1, h + 1, r * 2, r * 2);
-        if !rgn.is_null() {
-            SetWindowRgn(hwnd, rgn, 1);
         }
     }
 }
@@ -460,13 +453,161 @@ fn inset(r: &RECT, d: i32) -> RECT {
     }
 }
 
-/// 圆角实心块。整条底色、悬停垫底都走这里。
-unsafe fn fill_round(hdc: HDC, r: &RECT, color: u32, radius: i32) {
-    let brush: HBRUSH = CreateSolidBrush(color);
-    let old = SelectObject(hdc, brush);
-    RoundRect(hdc, r.left, r.top, r.right, r.bottom, radius * 2, radius * 2);
-    SelectObject(hdc, old);
-    DeleteObject(brush as HGDIOBJ);
+// ── 整条的画布：32 位 DIB + 按像素 alpha ────────────────────────────────────
+//
+// GDI 的 `RoundRect`/`CreateRoundRectRgn` 都没有抗锯齿，圆角是一圈台阶；1px 的描边
+// 在角上只剩几个孤立像素，看着"锯齿很粗糙"。现在整条先画进一张 32 位 DIB，
+// 外形（圆角 + 描边）和悬停垫底按圆角矩形的距离场算覆盖率，再用 `UpdateLayeredWindow`
+// 带 alpha 交给系统合成 —— 角上的过渡像素是半透明的，叠在什么桌面上都是平滑的。
+
+/// 一张自上而下的 32 位 DIB，选进内存 DC。`Drop` 时归还 GDI 对象（不 panic）。
+struct Canvas {
+    dc: HDC,
+    dib: HBITMAP,
+    old: HGDIOBJ,
+    bits: *mut u32,
+    w: i32,
+    h: i32,
+}
+
+impl Canvas {
+    unsafe fn new(w: i32, h: i32) -> Option<Canvas> {
+        if w <= 0 || h <= 0 || w > 4096 || h > 4096 {
+            return None;
+        }
+        let bmi = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: w,
+                biHeight: -h, // 自上而下
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB,
+                ..std::mem::zeroed()
+            },
+            bmiColors: [std::mem::zeroed()],
+        };
+        let dc = CreateCompatibleDC(std::ptr::null_mut());
+        if dc.is_null() {
+            return None;
+        }
+        let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
+        let dib = CreateDIBSection(dc, &bmi, DIB_RGB_COLORS, &mut bits, std::ptr::null_mut(), 0);
+        if dib.is_null() || bits.is_null() {
+            DeleteDC(dc);
+            return None;
+        }
+        let old = SelectObject(dc, dib as HGDIOBJ);
+        Some(Canvas {
+            dc,
+            dib,
+            old,
+            bits: bits as *mut u32,
+            w,
+            h,
+        })
+    }
+
+    /// 直接改像素（`0xAARRGGBB`）。先 `GdiFlush`：GDI 的绘制可能还攒在批里没落到位图上。
+    unsafe fn pixels(&mut self) -> &mut [u32] {
+        GdiFlush();
+        std::slice::from_raw_parts_mut(self.bits, (self.w * self.h) as usize)
+    }
+}
+
+impl Drop for Canvas {
+    fn drop(&mut self) {
+        unsafe {
+            SelectObject(self.dc, self.old);
+            DeleteObject(self.dib as HGDIOBJ);
+            DeleteDC(self.dc);
+        }
+    }
+}
+
+/// 圆角矩形的有向距离（像素）：< 0 在里面。`(x0,y0)-(x1,y1)` 是外框，`r` 是圆角半径。
+/// 纯函数，可单测。
+fn round_rect_sdf(px: f32, py: f32, x0: f32, y0: f32, x1: f32, y1: f32, r: f32) -> f32 {
+    let (cx, cy) = ((x0 + x1) / 2.0, (y0 + y1) / 2.0);
+    let (hx, hy) = ((x1 - x0) / 2.0, (y1 - y0) / 2.0);
+    let r = r.min(hx).min(hy).max(0.0);
+    let qx = (px - cx).abs() - (hx - r);
+    let qy = (py - cy).abs() - (hy - r);
+    let outside = (qx.max(0.0) * qx.max(0.0) + qy.max(0.0) * qy.max(0.0)).sqrt();
+    outside + qx.max(qy).min(0.0) - r
+}
+
+/// 距离 → 覆盖率：一个像素宽的线性过渡。
+fn coverage(d: f32) -> f32 {
+    (0.5 - d).clamp(0.0, 1.0)
+}
+
+/// COLORREF（0x00BBGGRR）拆成 (r, g, b)。
+fn rgb_of(c: u32) -> (f32, f32, f32) {
+    (
+        (c & 0xFF) as f32,
+        ((c >> 8) & 0xFF) as f32,
+        ((c >> 16) & 0xFF) as f32,
+    )
+}
+
+/// 在不透明的画布上叠一块抗锯齿圆角（悬停垫底）。
+fn fill_round_aa(px: &mut [u32], w: i32, h: i32, r: &RECT, radius: f32, color: u32) {
+    let (cr, cg, cb) = rgb_of(color);
+    let (x0, y0, x1, y1) = (r.left as f32, r.top as f32, r.right as f32, r.bottom as f32);
+    for y in r.top.max(0)..r.bottom.min(h) {
+        for x in r.left.max(0)..r.right.min(w) {
+            let a = coverage(round_rect_sdf(
+                x as f32 + 0.5,
+                y as f32 + 0.5,
+                x0,
+                y0,
+                x1,
+                y1,
+                radius,
+            ));
+            if a <= 0.0 {
+                continue;
+            }
+            let i = (y * w + x) as usize;
+            let p = px[i];
+            let (pr, pg, pb) = (
+                ((p >> 16) & 0xFF) as f32,
+                ((p >> 8) & 0xFF) as f32,
+                (p & 0xFF) as f32,
+            );
+            let mix = |o: f32, n: f32| (o + (n - o) * a + 0.5) as u32;
+            px[i] = (mix(pr, cr) << 16) | (mix(pg, cg) << 8) | mix(pb, cb);
+        }
+    }
+}
+
+/// 最后一步：按外形给整张图上 alpha，并把描边混进去。输出是预乘 alpha（`AlphaBlend`/
+/// `UpdateLayeredWindow` 要的格式）。
+///
+/// 每个像素：`outer` = 在整条圆角里的覆盖率（= alpha），`inner` = 在往里缩一圈描边宽度的
+/// 圆角里的覆盖率；内容色占 `inner`，描边色占 `outer - inner`。两条边都是抗锯齿的。
+fn apply_frame(px: &mut [u32], w: i32, h: i32, radius: f32, border_w: f32, border: u32) {
+    let (br, bg, bb) = rgb_of(border);
+    let (fw, fh) = (w as f32, h as f32);
+    for y in 0..h {
+        for x in 0..w {
+            let d = round_rect_sdf(x as f32 + 0.5, y as f32 + 0.5, 0.0, 0.0, fw, fh, radius);
+            let outer = coverage(d);
+            let inner = coverage(d + border_w);
+            let i = (y * w + x) as usize;
+            let p = px[i];
+            let (cr, cg, cb) = (
+                ((p >> 16) & 0xFF) as f32,
+                ((p >> 8) & 0xFF) as f32,
+                (p & 0xFF) as f32,
+            );
+            let ring = outer - inner;
+            let ch = |c: f32, b: f32| ((c * inner + b * ring) + 0.5).min(255.0) as u32;
+            let a = (outer * 255.0 + 0.5) as u32;
+            px[i] = (a << 24) | (ch(cr, br) << 16) | (ch(cg, bg) << 8) | ch(cb, bb);
+        }
+    }
 }
 
 /// 直角实心块（分隔竖线、☰ 的三道横线）。
@@ -631,7 +772,14 @@ unsafe fn draw_glyphs_aa(hdc: HDC, area: &RECT, glyphs: &[Glyph], color: u32) {
         return;
     }
     let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
-    let dib = CreateDIBSection(mem, &bmi, DIB_RGB_COLORS, &mut bits, std::ptr::null_mut(), 0);
+    let dib = CreateDIBSection(
+        mem,
+        &bmi,
+        DIB_RGB_COLORS,
+        &mut bits,
+        std::ptr::null_mut(),
+        0,
+    );
     if dib.is_null() || bits.is_null() {
         DeleteDC(mem);
         return;
@@ -679,13 +827,24 @@ fn punct_glyphs(cell: &RECT, chinese_punct: bool) -> [Glyph; 2] {
     let k = dpi_k();
     let cx = (cell.left + cell.right) as f32 / 2.0;
     let mid = (cell.top + cell.bottom) as f32 / 2.0;
-    // 逗号的尾巴比圈往下多伸 ~6px，整体往上提 0.4 让视觉重心落在格子正中。
-    let upper = mid - 5.4 * k;
-    let lower = mid + 3.6 * k;
+    // 句号外径 6.4px，和逗号圆头（直径 4.6px）只差一档 —— 原来外径 8.7px，
+    // 比逗号大出一倍，看着头重脚轻。逗号尾巴往下多伸 ~7px，所以两者整体往上提，
+    // 让"圈 + 逗号头"这两团墨落在格子正中，细尾巴不算重量。
+    let upper = mid - 4.6 * k;
+    let lower = mid + 2.6 * k;
     let top = if chinese_punct {
-        Glyph::Ring { cx, cy: upper, r: 3.4 * k, hw: 0.95 * k }
+        Glyph::Ring {
+            cx,
+            cy: upper,
+            r: 2.4 * k,
+            hw: 0.8 * k,
+        }
     } else {
-        Glyph::Dot { cx, cy: upper, r: 2.1 * k }
+        Glyph::Dot {
+            cx,
+            cy: upper,
+            r: 1.8 * k,
+        }
     };
     [top, Glyph::Comma { cx, cy: lower, k }]
 }
@@ -695,14 +854,23 @@ fn dpi_k() -> f32 {
     scale(96) as f32 / 96.0
 }
 
-unsafe fn paint_frame(hdc: HDC, client: &RECT) {
-    let radius = scale(RADIUS);
-
-    // 一条白底 + 1px 描边：先整块画描边色，再往里缩 1px 画白色，
-    // 圆角靠窗口区域（`SetWindowRgn`）裁，四角不会露出桌面。
-    fill_round(hdc, client, C_BORDER, radius);
-    let inner = inset(client, 1);
-    fill_round(hdc, &inner, C_BG, (radius - 1).max(0));
+/// 把整条画进画布（不碰窗口）。测试用同一份代码渲预览图，改配色改布局不用先部署。
+///
+/// 顺序：整块白底（GDI）→ 悬停垫底（抗锯齿，直接改像素）→ 图标/文字/符号（GDI）→
+/// 外形 alpha + 描边（直接改像素）。GDI 往 32 位 DIB 里画东西不管 alpha 字节，
+/// 所以 alpha 只在最后一步统一算。
+///
+/// `hover` 是悬停在哪一格（-1 = 没有）。作为参数传进来而不是在这里读 `HOVER`：
+/// 预览图测试要画悬停态，又不能去改全局（别的测试在并行跑）。
+unsafe fn paint_bar(c: &mut Canvas, hover: i32) {
+    let (w, h) = (c.w, c.h);
+    let client = RECT {
+        left: 0,
+        top: 0,
+        right: w,
+        bottom: h,
+    };
+    fill_rect(c.dc, &client, C_BG);
 
     let font = get_font();
     let rects = item_rects();
@@ -711,21 +879,22 @@ unsafe fn paint_frame(hdc: HDC, client: &RECT) {
     PAINTED_CHINESE.store(chinese, Ordering::Relaxed);
     PAINTED_PUNCT.store(punct, Ordering::Relaxed);
     PAINTED_VALID.store(true, Ordering::Relaxed);
-    let hover = HOVER.load(Ordering::Relaxed);
 
     // 悬停只在当前格后面垫一层浅色圆角，不改文字颜色。
+    // 只缩 1px：格高 28、品牌标 24，缩多了垫底会被品牌标整个盖住，悬停没反馈。
     if (0..4).contains(&hover) {
-        let r = inset(&rects[hover as usize], scale(3));
-        fill_round(hdc, &r, C_HOVER, scale(7));
+        let r = inset(&rects[hover as usize], scale(1));
+        fill_round_aa(c.pixels(), w, h, &r, scale(6) as f32, C_HOVER);
     }
 
+    let hdc = c.dc;
     // 品牌标和状态之间的分隔竖线。
     let sep_x = rects[0].right + scale(SEP_GAP);
     let sep = RECT {
         left: sep_x,
-        top: rects[0].top + scale(8),
+        top: rects[0].top + scale(7),
         right: sep_x + scale(SEP_W),
-        bottom: rects[0].bottom - scale(8),
+        bottom: rects[0].bottom - scale(7),
     };
     fill_rect(hdc, &sep, C_BORDER);
 
@@ -748,29 +917,60 @@ unsafe fn paint_frame(hdc: HDC, client: &RECT) {
 
     // 第四格：菜单。
     draw_menu_glyph(hdc, &rects[3]);
+
+    // 外形：圆角 + 描边，都抗锯齿。描边 1px（高 DPI 跟着放大）。
+    let border_w = scale(1).max(1) as f32;
+    apply_frame(c.pixels(), w, h, scale(RADIUS) as f32, border_w, C_BORDER);
 }
 
+/// 画一帧并交给系统合成。窗口尺寸取 `window_size()`，位置不动（`pptDst` 传空）。
+unsafe fn present(hwnd: HWND) -> bool {
+    let (w, h) = window_size();
+    let Some(mut c) = Canvas::new(w, h) else {
+        return false;
+    };
+    paint_bar(&mut c, HOVER.load(Ordering::Relaxed));
+    let size = SIZE { cx: w, cy: h };
+    let src = POINT { x: 0, y: 0 };
+    let blend = BLENDFUNCTION {
+        BlendOp: AC_SRC_OVER as u8,
+        BlendFlags: 0,
+        SourceConstantAlpha: 255,
+        AlphaFormat: AC_SRC_ALPHA as u8,
+    };
+    UpdateLayeredWindow(
+        hwnd,
+        std::ptr::null_mut(),
+        std::ptr::null(),
+        &size,
+        c.dc,
+        &src,
+        0,
+        &blend,
+        ULW_ALPHA,
+    ) != 0
+}
+
+/// 分层窗口正常不会收到 `WM_PAINT`；万一来了，验证掉区域并重画一帧，免得它反复来。
 unsafe fn paint(hwnd: HWND) {
     let mut ps: PAINTSTRUCT = std::mem::zeroed();
-    let hdc = BeginPaint(hwnd, &mut ps);
-    let mut client: RECT = std::mem::zeroed();
-    GetClientRect(hwnd, &mut client);
-    paint_frame(hdc, &client);
+    BeginPaint(hwnd, &mut ps);
     EndPaint(hwnd, &ps);
+    present(hwnd);
 }
 
 fn toggle_mode(hwnd: HWND) {
     let on = !crate::state::chinese();
     crate::state::set_chinese(on);
     crate::log_line(&format!("bar toggle chinese -> {on}"));
-    invalidate(hwnd);
+    redraw(hwnd);
 }
 
 fn toggle_punct(hwnd: HWND) {
     let on = !crate::state::punctuation();
     crate::state::set_punctuation(on);
     crate::log_line(&format!("bar toggle punct -> {on}"));
-    invalidate(hwnd);
+    redraw(hwnd);
 }
 
 struct DragState {
@@ -803,14 +1003,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let hit = hit_test(x, y);
             if hit != HOVER.load(Ordering::Relaxed) {
                 HOVER.store(hit, Ordering::Relaxed);
-                invalidate(hwnd);
+                redraw(hwnd);
             }
             if DRAG_ARMED.load(Ordering::Relaxed) {
                 let mut pt: POINT = std::mem::zeroed();
                 GetCursorPos(&mut pt);
                 let (dx, dy) = DRAG
                     .lock()
-                    .map(|d| d.as_ref().map(|s| (pt.x - s.cursor.x, pt.y - s.cursor.y)).unwrap_or((0, 0)))
+                    .map(|d| {
+                        d.as_ref()
+                            .map(|s| (pt.x - s.cursor.x, pt.y - s.cursor.y))
+                            .unwrap_or((0, 0))
+                    })
                     .unwrap_or((0, 0));
                 if !DRAGGING.load(Ordering::Relaxed) && (dx.abs() > 3 || dy.abs() > 3) {
                     DRAGGING.store(true, Ordering::Relaxed);
@@ -905,11 +1109,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 } else if !visible {
                     // 切回前台要复活；同一个程序里已经有别的浮条在显示时就不用抢了
                     // （几条 TSF 线程各有一条，屏幕上只该有一条）。
-                    let revive =
-                        AUTO_HIDDEN.load(Ordering::SeqCst) || !any_other_bar_visible(hwnd);
+                    let revive = AUTO_HIDDEN.load(Ordering::SeqCst) || !any_other_bar_visible(hwnd);
                     if revive {
+                        redraw(hwnd);
                         ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-                        invalidate(hwnd);
                         AUTO_HIDDEN.store(false, Ordering::SeqCst);
                     }
                 }
@@ -920,7 +1123,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     || chinese != PAINTED_CHINESE.load(Ordering::Relaxed)
                     || punct != PAINTED_PUNCT.load(Ordering::Relaxed)
                 {
-                    invalidate(hwnd);
+                    redraw(hwnd);
                 }
             }
             0
@@ -941,7 +1144,10 @@ mod tests {
     fn 四格从左到右不重叠() {
         let rects = item_rects();
         for i in 1..4 {
-            assert!(rects[i].left >= rects[i - 1].right, "第 {i} 格左边要 >= 上一格右边");
+            assert!(
+                rects[i].left >= rects[i - 1].right,
+                "第 {i} 格左边要 >= 上一格右边"
+            );
         }
     }
 
@@ -964,13 +1170,16 @@ mod tests {
         }
         assert_eq!(hit_test(-5, -5), -1, "负坐标不该命中");
         let last = rects[3];
-        assert_eq!(hit_test(last.right + 5, last.top + 1), -1, "越过最后一格不该命中");
+        assert_eq!(
+            hit_test(last.right + 5, last.top + 1),
+            -1,
+            "越过最后一格不该命中"
+        );
     }
 
     #[test]
     fn 浮条能创建显示并绘制() {
         use windows_sys::Win32::Foundation::HWND;
-        use windows_sys::Win32::Graphics::Gdi::UpdateWindow;
         use windows_sys::Win32::UI::WindowsAndMessaging::IsWindowVisible;
 
         show();
@@ -978,100 +1187,117 @@ mod tests {
         assert_ne!(raw, 0, "show() 之后应该有窗口句柄");
         let hwnd = raw as HWND;
 
-        // 0..=3 每个格子的 hover 状态都画一遍：悬停会走「给该格画高亮底」的分支
-        // （第 0 格那条会用**空字符串**调 draw_item），这条分支在宿主里 AV 崩过，必须覆盖。
+        // 0..=3 每个格子的 hover 状态都画一遍：悬停会走「给该格画高亮底」的分支，
+        // 这条分支在宿主里 AV 崩过，必须覆盖。
         //
-        // 注意：`UpdateWindow` 只在窗口**有无效区域**时才同步发 WM_PAINT。上一次
-        // `BeginPaint` 已经把区域验证掉了，所以不先 `invalidate` 这里的循环是空转——
-        // 当初就是这么漏掉这个崩溃的（测试全绿，宿主一悬停就死）。
+        // 分层窗口不走 WM_PAINT，`redraw` 是**同步**画完并 `UpdateLayeredWindow` 的；
+        // 以前靠 `InvalidateRect + UpdateWindow` 触发绘制，漏过一次"根本没画"的空转。
         for h in -1..=3 {
             HOVER.store(h, std::sync::atomic::Ordering::Relaxed);
-            invalidate(hwnd);
-            unsafe { UpdateWindow(hwnd) };
+            assert!(
+                redraw(hwnd),
+                "hover={h} 时 UpdateLayeredWindow 失败（窗口会是空的）"
+            );
         }
         HOVER.store(-1, std::sync::atomic::Ordering::Relaxed);
 
-        assert_ne!(unsafe { IsWindowVisible(hwnd) }, 0, "show() 之后窗口应该可见");
+        assert_ne!(
+            unsafe { IsWindowVisible(hwnd) },
+            0,
+            "show() 之后窗口应该可见"
+        );
         hide();
-        assert_eq!(unsafe { IsWindowVisible(hwnd) }, 0, "hide() 之后窗口应该不可见");
+        assert_eq!(
+            unsafe { IsWindowVisible(hwnd) },
+            0,
+            "hide() 之后窗口应该不可见"
+        );
     }
 
-    /// 把 `paint_frame` 渲进一张内存位图，存成 `tsf/target/bar-preview.bmp`。
-    /// 改配色/布局时先看这张图，不用部署到宿主进程里等它出现。
+    /// 把预乘 alpha 的像素叠到一块纯色"桌面"上，写成 32 位 BMP（自上而下）。
+    fn write_preview(name: &str, px: &[u32], w: i32, h: i32, desk: (u32, u32, u32)) {
+        let size = (w as usize) * (h as usize) * 4;
+        let mut out: Vec<u8> = Vec::with_capacity(54 + size);
+        out.extend_from_slice(b"BM");
+        out.extend_from_slice(&((54 + size) as u32).to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&54u32.to_le_bytes());
+        out.extend_from_slice(&40u32.to_le_bytes());
+        out.extend_from_slice(&w.to_le_bytes());
+        out.extend_from_slice(&(-h).to_le_bytes());
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&32u16.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&(size as u32).to_le_bytes());
+        out.extend_from_slice(&2835i32.to_le_bytes());
+        out.extend_from_slice(&2835i32.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        for &p in px {
+            let a = p >> 24;
+            // 预乘过的：结果 = 前景 + 桌面 × (1 - a)
+            let over = |c: u32, d: u32| (c + d * (255 - a) / 255).min(255) as u8;
+            out.push(over(p & 0xFF, desk.2));
+            out.push(over((p >> 8) & 0xFF, desk.1));
+            out.push(over((p >> 16) & 0xFF, desk.0));
+            out.push(255);
+        }
+        // 固定写到 crate 的 target 下：`temp_dir()` 在特权/受限环境里未必可写。
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(name);
+        std::fs::write(&path, &out).expect("预览图写入失败");
+    }
+
+    /// 用和窗口完全相同的 `paint_bar` 渲一帧，叠在白色和深灰两种"桌面"上，
+    /// 存成 `tsf/target/bar-preview.bmp` / `bar-preview-dark.bmp`，
+    /// 另有一张悬停在标点格上的 `bar-preview-hover.bmp`。
+    /// 改配色/布局时先看这两张图（圆角抗锯齿在深色桌面上最容易看出来）。
     #[test]
     fn 渲染预览图() {
-        use std::ffi::c_void;
-        use windows_sys::Win32::Graphics::Gdi::{
-            CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC, ReleaseDC,
-            SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, RGBQUAD,
-        };
-
         let (w, h) = window_size();
         unsafe {
-            let bmi = BITMAPINFO {
-                bmiHeader: BITMAPINFOHEADER {
-                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-                    biWidth: w,
-                    biHeight: -h, // 负数 = 自上而下，写 BMP 时不用再翻
-                    biPlanes: 1,
-                    biBitCount: 32,
-                    biCompression: BI_RGB,
-                    ..std::mem::zeroed()
-                },
-                bmiColors: [RGBQUAD {
-                    rgbBlue: 0,
-                    rgbGreen: 0,
-                    rgbRed: 0,
-                    rgbReserved: 0,
-                }],
-            };
-            let screen = GetDC(std::ptr::null_mut());
-            let dc = CreateCompatibleDC(screen);
-            let mut bits: *mut c_void = std::ptr::null_mut();
-            let dib = CreateDIBSection(dc, &bmi, DIB_RGB_COLORS, &mut bits, std::ptr::null_mut(), 0);
-            assert!(!dib.is_null(), "DIB 创建失败");
-            let old = SelectObject(dc, dib as _);
+            let mut c = Canvas::new(w, h).expect("画布创建失败");
+            paint_bar(&mut c, -1);
+            let px = c.pixels().to_vec();
+            write_preview("bar-preview.bmp", &px, w, h, (0xFF, 0xFF, 0xFF));
+            write_preview("bar-preview-dark.bmp", &px, w, h, (0x3A, 0x3A, 0x3A));
 
-            let client = RECT {
-                left: 0,
-                top: 0,
-                right: w,
-                bottom: h,
-            };
-            paint_frame(dc, &client);
-
-            let stride = (w as usize) * 4;
-            let size = stride * (h as usize);
-            let pixels = std::slice::from_raw_parts(bits as *const u8, size);
-            let mut out: Vec<u8> = Vec::with_capacity(54 + size);
-            out.extend_from_slice(b"BM");
-            out.extend_from_slice(&((54 + size) as u32).to_le_bytes());
-            out.extend_from_slice(&0u32.to_le_bytes());
-            out.extend_from_slice(&54u32.to_le_bytes());
-            out.extend_from_slice(&40u32.to_le_bytes());
-            out.extend_from_slice(&w.to_le_bytes());
-            out.extend_from_slice(&(-h).to_le_bytes());
-            out.extend_from_slice(&1u16.to_le_bytes());
-            out.extend_from_slice(&32u16.to_le_bytes());
-            out.extend_from_slice(&0u32.to_le_bytes());
-            out.extend_from_slice(&(size as u32).to_le_bytes());
-            out.extend_from_slice(&2835i32.to_le_bytes());
-            out.extend_from_slice(&2835i32.to_le_bytes());
-            out.extend_from_slice(&0u32.to_le_bytes());
-            out.extend_from_slice(&0u32.to_le_bytes());
-            out.extend_from_slice(pixels);
-
-            // 固定写到 crate 的 target 下：`temp_dir()` 在特权/受限环境里未必可写。
-            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("target")
-                .join("bar-preview.bmp");
-            std::fs::write(&path, &out).expect("预览图写入失败");
-
-            SelectObject(dc, old);
-            DeleteObject(dib as _);
-            DeleteDC(dc);
-            ReleaseDC(std::ptr::null_mut(), screen);
+            // 悬停在标点格上（看垫底的圆角是不是也平滑）
+            let mut c = Canvas::new(w, h).expect("画布创建失败");
+            paint_bar(&mut c, 2);
+            let px = c.pixels().to_vec();
+            write_preview("bar-preview-hover.bmp", &px, w, h, (0xFF, 0xFF, 0xFF));
         }
+    }
+
+    /// 圆角是不是真的抗锯齿了：角外全透明、中间不透明、角上弧线经过的像素是**半透明**的
+    /// （GDI 区域裁出来的角只有 0/255 两种值）。期望值按圆角几何手算：
+    /// 100×36、r=8 的框，像素 (2,2) 的中心到圆角圆心 (8,8) 的距离 5.5√2 ≈ 7.78，
+    /// 比半径小 0.22 → 覆盖率 0.72。
+    #[test]
+    fn 外形四角是抗锯齿的() {
+        let (w, h) = (100, 36);
+        let mut px = vec![0x00FF_FFFFu32; (w * h) as usize];
+        apply_frame(&mut px, w, h, 8.0, 1.0, 0x0000_0000);
+        let a = |x: i32, y: i32| px[(y * w + x) as usize] >> 24;
+        assert_eq!(a(0, 0), 0, "角外透明");
+        assert_eq!(a(50, 18), 255, "中间不透明");
+        let edge = a(2, 2);
+        assert!(
+            (170..=200).contains(&edge),
+            "角上过渡像素应约 0.72×255，实际 {edge}"
+        );
+        assert_eq!(a(w - 3, 2), edge, "右上角对称");
+        assert_eq!(a(2, h - 3), edge, "左下角对称");
+        assert_eq!(a(w - 3, h - 3), edge, "右下角对称");
+        // 描边 1px：上边正中最外一行是描边色（黑），往里一行是内容（白）
+        assert_eq!(px[50] & 0x00FF_FFFF, 0, "最外一行是描边");
+        assert_eq!(
+            px[(w + 50) as usize] & 0x00FF_FFFF,
+            0x00FF_FFFF,
+            "第二行是内容"
+        );
     }
 
     /// 抗锯齿靠的是 `glyph_sdf` 的正负号：< 0 在墨里、> 0 在外面、跨 0 的那一个像素
@@ -1080,7 +1306,12 @@ mod tests {
     #[test]
     fn 句号圆环的距离场内外分明() {
         // 圆心 (0,0)、环中线半径 4、半线宽 1 → 墨在半径 3~5 之间
-        let ring = Glyph::Ring { cx: 0.0, cy: 0.0, r: 4.0, hw: 1.0 };
+        let ring = Glyph::Ring {
+            cx: 0.0,
+            cy: 0.0,
+            r: 4.0,
+            hw: 1.0,
+        };
         assert!(glyph_sdf(ring, 0.0, 0.0) > 0.0, "圆心是环的洞，该在外面");
         assert!(glyph_sdf(ring, 4.0, 0.0) < 0.0, "环中线上，该在墨里");
         assert!(glyph_sdf(ring, 0.0, -4.0) < 0.0, "上下左右要对匀");
@@ -1091,13 +1322,20 @@ mod tests {
 
     #[test]
     fn 逗号是有头有尾的不对称形状() {
-        let comma = Glyph::Comma { cx: 0.0, cy: 0.0, k: 1.0 };
+        let comma = Glyph::Comma {
+            cx: 0.0,
+            cy: 0.0,
+            k: 1.0,
+        };
         assert!(glyph_sdf(comma, 0.0, 0.0) < 0.0, "圆头中心在墨里");
         assert!(glyph_sdf(comma, 0.0, 50.0) > 0.0, "远处在外面");
         // 尾巴往**左下**甩：下方几个像素处还在墨里，正上方对称位置就该空了。
         assert!(glyph_sdf(comma, 0.0, 3.0) < 0.0, "圆头下面接着尾巴");
         assert!(glyph_sdf(comma, -1.5, 6.0) < 0.0, "尾尖附近仍是墨");
-        assert!(glyph_sdf(comma, 0.0, -3.0) > 0.0, "上面不该有东西（逗号不是两端对称的）");
+        assert!(
+            glyph_sdf(comma, 0.0, -3.0) > 0.0,
+            "上面不该有东西（逗号不是两端对称的）"
+        );
     }
 
     #[test]
@@ -1108,6 +1346,9 @@ mod tests {
         assert_eq!(pick_frame(200), 64, "最大档就是 64");
         assert_eq!(pick_frame(8), 16, "想要得比最小时用最小帧");
         let side = badge_side();
-        assert!(BADGE_FRAMES.contains(&side), "实际取值 {side} 必须是 ico 里有的帧");
+        assert!(
+            BADGE_FRAMES.contains(&side),
+            "实际取值 {side} 必须是 ico 里有的帧"
+        );
     }
 }

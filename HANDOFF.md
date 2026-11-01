@@ -414,6 +414,13 @@ DLL 被加载后无法卸载：脚本每次用**新文件名 + 改注册表**，
 
 ### 踩过的坑（本阶段新增）
 
+- **想要圆角平滑就不能用 `SetWindowRgn`**（1.1.18 修，用户原话"四个圆角锯齿很粗糙"）：窗口区域只有
+  "在/不在"两种，`CreateRoundRectRgn` 裁出来的角是一圈台阶，`RoundRect` 画的 1px 描边在角上也只剩
+  几个孤立像素。浮条现在是 `WS_EX_LAYERED`：整条画进 32 位 DIB，最后按圆角矩形距离场统一算 alpha
+  和描边（`apply_frame`），`UpdateLayeredWindow(ULW_ALPHA)` 交给系统合成。两点要记住：
+  ① GDI 往 32 位 DIB 画字/图标**不管 alpha 字节**，所以 alpha 只能在最后一步统一写；
+  ② 分层窗口不走 `WM_PAINT`，改了状态要调 `redraw()` 同步重画；显示前必须先 `redraw` 一次，
+  否则窗口是空的。高度同时从 44 收到 36（`PAD` 6→4、`ITEM_H` 32→28），句号外径 8.7→6.4px。
 - **小字号彩色文字不要用 `CLEARTYPE_QUALITY`**（1.1.16 修）：`CreateFontW` 传 `5`（ClearType，
   子像素抗锯齿）时，17px 的「中」「英」在笔画边缘会拉出橙/蓝色边，用户的原话是"字发花、很脏"。
   改成 `ANTIALIASED_QUALITY = 4`（灰度抗锯齿）后立刻干净。ClearType 适合白底黑字的大段文本，
