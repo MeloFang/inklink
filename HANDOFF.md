@@ -1,6 +1,6 @@
 # 续接文档：inklink
 
-> **最后更新**：2026-11-02 ｜ **当前阶段**：M0/M1 完成，产品化 P0–P1、P3 已上线（浮条改进程内、候选窗可暗色），P5 进行中（引擎目录已能一键复现、发布包 28.65→8.87 MB） ｜ **总体进度**：M0 ✅ M1 ✅ P1 ✅ P3 ✅；P5 剩 CI 出包与单文件 exe 安装器，之后是 P2a 单页设置小窗
+> **最后更新**：2026-11-02 ｜ **当前阶段**：M0/M1 完成，产品化 P0–P1、P3、P5 已做完（浮条改进程内、候选窗可暗色、引擎目录一键复现、CI 出包、单文件安装器） ｜ **总体进度**：M0 ✅ M1 ✅ P1 ✅ P3 ✅ P5 ✅（CI 已写好但仓库还没 remote，没实跑过）；下一步 P2a 单页原生设置小窗
 
 ---
 
@@ -39,6 +39,7 @@
 | P0 | 全局状态（中英 + 中文标点开关，注册表） | ✅ 1.0.17 |
 | P1 | 浮条（中/英、标点、☰、拖动记忆；1.1.10 起由 DLL 在宿主进程内自绘，去托盘/开机自启） | ✅ 1.1.0（1.1.10 改进程内） |
 | P3 | 配置外置 + 候选窗暗色（`HKCU\Software\inklink\Config`；列数/行数/撤回窗口/学习开关） | ✅ 1.1.21 |
+| P5 | 发布工程化（一键取 librime、裁 data、引擎编译脚本、CI 出包、单文件安装器） | ✅ （CI 未实跑：仓库还没 remote） |
 
 ### 已完成的细节（实测验证）
 
@@ -110,9 +111,21 @@ Start-Process 'C:\inklink-engine\inklink.exe' -ArgumentList '--serve' -WorkingDi
 $env:PATH = "$env:USERPROFILE\.cargo\bin;$env:PATH"   # 必须先修 PATH（GNU rustc 会盖掉 MSVC）
 cd C:\dsh\work\inklink\tsf
 cargo build --release --target-dir target-static      # 静态 CRT，DLL 不依赖 vcruntime140
-cd C:\dsh\work\inklink\app\src-tauri
-cargo build --release --offline                       # 引擎
+cargo test --release --target-dir target-static       # 122 个单测
+
+# 引擎（x86 C++，链 Weasel 的 rime.dll）
+.\tools\build-engine.ps1 -Dest C:\inklink-engine
+
+# 从零铺引擎数据（下载 Weasel 0.17.4 + 校验 SHA256 + 裁 data + 铺 rime-ice 词库）
+.\tools\fetch-librime.ps1 -Dest C:\inklink-engine -DownloadLexicon
+
+# 出发布包（zip + 单文件安装器 + SHA256SUMS.txt + RELEASE-NOTES.md）
+.\tools\release.ps1
 ```
+
+> `release.ps1` 里编安装器那段必须先把 `~\.cargo\bin` 放 PATH 最前面。本机同时装着 GNU 和
+> MSVC 两套 Rust，不修 PATH 会挑到 GNU 那套，编 `windows-sys` 时要 `dlltool.exe`（MSVC 里没有）
+> 直接失败；报错长这样：`error calling dlltool 'dlltool.exe': program not found`。
 
 ---
 
