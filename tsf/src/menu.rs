@@ -57,13 +57,38 @@ static HOVER: AtomicI32 = AtomicI32::new(-1);
 static CLASS_REGISTERED: Once = Once::new();
 static ITEMS: Mutex<Vec<Item>> = Mutex::new(Vec::new());
 
-// 与浮条同一套配色（COLORREF 是 0x00BBGGRR）
-const C_BG: u32 = 0x00_FF_FF_FF;
-const C_BORDER: u32 = 0x00_D6_D6_D6;
-const C_HOVER: u32 = 0x00_F2_EC_E4;
-const C_TEXT: u32 = 0x00_20_20_20;
-const C_DIM: u32 = 0x00_A8_A8_A8;
-const C_ACCENT: u32 = 0x00_00_66_FF;
+// 与浮条同一套配色（COLORREF 是 0x00BBGGRR）。浅色/暗色只换这张表。
+struct Palette {
+    bg: u32,
+    border: u32,
+    hover: u32,
+    text: u32,
+    dim: u32,
+    /// 勾选标记的颜色（浅色用橙、暗色用琥珀，和候选窗选中色同族）
+    accent: u32,
+}
+
+const MENU_LIGHT: Palette = Palette {
+    bg: 0x00_FF_FF_FF,
+    border: 0x00_D6_D6_D6,
+    hover: 0x00_F2_EC_E4,
+    text: 0x00_20_20_20,
+    dim: 0x00_A8_A8_A8,
+    accent: 0x00_00_66_FF,
+};
+
+const MENU_DARK: Palette = Palette {
+    bg: 0x00_2A_26_26,
+    border: 0x00_46_41_41,
+    hover: 0x00_38_33_33,
+    text: 0x00_F1_EC_EC,
+    dim: 0x00_97_8E_8E,
+    accent: 0x00_3D_9E_FF,
+};
+
+fn palette(dark: bool) -> &'static Palette {
+    if dark { &MENU_DARK } else { &MENU_LIGHT }
+}
 
 // 96 DPI 下的设计尺寸
 const ROW_H: i32 = 26;
@@ -223,14 +248,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let mut client: RECT = std::mem::zeroed();
             GetClientRect(hwnd, &mut client);
 
-            let bg = CreateSolidBrush(C_BG);
+            let pal = palette(crate::config::snapshot().dark);
+            let bg = CreateSolidBrush(pal.bg);
             FillRect(hdc, &client, bg);
             DeleteObject(bg as HGDIOBJ);
 
             // 1px 边框
             let brush = GetStockObject(NULL_BRUSH);
             let old_brush = SelectObject(hdc, brush);
-            let border = CreatePen(0, 1, C_BORDER);
+            let border = CreatePen(0, 1, pal.border);
             let old_pen = SelectObject(hdc, border as HGDIOBJ);
             Rectangle(hdc, 0, 0, client.right, client.bottom);
             SelectObject(hdc, old_pen);
@@ -248,7 +274,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 let h = row_height(it);
                 if it.separator {
                     let y = top + h / 2;
-                    let pen = CreatePen(0, 1, C_BORDER);
+                    let pen = CreatePen(0, 1, pal.border);
                     let old = SelectObject(hdc, pen as HGDIOBJ);
                     MoveToEx(hdc, scale(PAD_X), y, std::ptr::null_mut());
                     LineTo(hdc, client.right - scale(PAD_X), y);
@@ -256,7 +282,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     DeleteObject(pen as HGDIOBJ);
                 } else {
                     if i as i32 == hover {
-                        let hb = CreateSolidBrush(C_HOVER);
+                        let hb = CreateSolidBrush(pal.hover);
                         let r = RECT {
                             left: scale(3),
                             top,
@@ -267,7 +293,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         DeleteObject(hb as HGDIOBJ);
                     }
                     if it.checked {
-                        SetTextColor(hdc, C_ACCENT);
+                        SetTextColor(hdc, pal.accent);
                         let mark = wide("✓");
                         let mut r = RECT {
                             left: scale(PAD_X) - scale(2),
@@ -283,7 +309,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             DT_LEFT | DT_SINGLELINE | DT_VCENTER,
                         );
                     }
-                    SetTextColor(hdc, if it.enabled { C_TEXT } else { C_DIM });
+                    SetTextColor(hdc, if it.enabled { pal.text } else { pal.dim });
                     let label = wide(&it.label);
                     let mut r = RECT {
                         left: scale(PAD_X) + scale(CHECK_W),

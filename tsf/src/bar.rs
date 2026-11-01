@@ -100,6 +100,8 @@ static FONT: AtomicIsize = AtomicIsize::new(0);
 static PAINTED_VALID: AtomicBool = AtomicBool::new(false);
 static PAINTED_CHINESE: AtomicBool = AtomicBool::new(true);
 static PAINTED_PUNCT: AtomicBool = AtomicBool::new(true);
+/// 上一次用的是不是暗色主题。`config::snapshot().dark` 变了也要重画。
+static PAINTED_DARK: AtomicBool = AtomicBool::new(false);
 
 // 96 DPI 下的设计尺寸，实际按 DPI 缩放。
 // 整体节奏照搜狗那条浮条：四格等距，不做逐格色块。
@@ -119,18 +121,46 @@ const W_PUNCT: i32 = 34;
 const W_MENU: i32 = 30;
 
 // COLORREF 是 0x00BBGGRR（低字节是红）
-/// 整条是一块白底，不再给每格画独立的灰方块 —— 那样四坨色块很笨重。
-const C_BG: u32 = 0x00_FF_FF_FF;
-/// 描边 #E2E2E8：白底浮条放到白色窗口上，没有一条清楚的边界就"化"进去了。
-const C_BORDER: u32 = 0x00_E8_E2_E2;
-/// 悬停垫底 #F2F2F6（比原来更淡，只做"鼠标在这儿"的暗示，不抢视觉）。
-const C_HOVER: u32 = 0x00_F6_F2_F2;
-/// 常态文字/图形 #3A3A3E。
-const C_TEXT: u32 = 0x00_3E_3A_3A;
-/// 关闭/未激活 #A2A2A8（比常态浅，一眼能分出开和关）。
-const C_DIM: u32 = 0x00_A8_A2_A2;
-/// 激活色 = 品牌深蓝 #062657（原来是搜狗那种橙，2026-10-29 按用户要求换掉）。
-const C_ACCENT: u32 = 0x00_57_26_06;
+/// 浮条的一套配色。浅色/暗色只差这张表，形状与排版完全一样。
+struct BarPalette {
+    /// 整条底色
+    bg: u32,
+    /// 描边 + 分隔竖线
+    border: u32,
+    /// 悬停垫底
+    hover: u32,
+    /// 常态文字/图形
+    text: u32,
+    /// 关闭/未激活
+    dim: u32,
+    /// 激活色（中/英 处于"中"、标点处于全角时）
+    accent: u32,
+}
+
+/// 浅色：#FFFFFF 底、#E2E2E8 描边、#F2F2F6 悬停、#3A3A3E 字、#A2A2A8 灰、品牌深蓝 #062657 激活。
+const PALETTE_LIGHT: BarPalette = BarPalette {
+    bg: 0x00_FF_FF_FF,
+    border: 0x00_E8_E2_E2,
+    hover: 0x00_F6_F2_F2,
+    text: 0x00_3E_3A_3A,
+    dim: 0x00_A8_A2_A2,
+    accent: 0x00_57_26_06,
+};
+
+/// 暗色：和候选窗的暗色主题同一套色（#1E1E22 系），贴到深色编辑器上不刺眼。
+/// 激活色在这里取近白而不是深蓝 —— 深蓝在深底上等于看不见，搜狗暗色也是这么做的。
+const PALETTE_DARK: BarPalette = BarPalette {
+    bg: 0x00_26_22_22,
+    border: 0x00_46_41_41,
+    hover: 0x00_38_33_33,
+    text: 0x00_F1_EC_EC,
+    dim: 0x00_97_8E_8E,
+    accent: 0x00_F1_EC_EC,
+};
+
+fn bar_palette(dark: bool) -> &'static BarPalette {
+    if dark { &PALETTE_DARK } else { &PALETTE_LIGHT }
+}
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
@@ -1141,7 +1171,7 @@ unsafe fn draw_text_centered(hdc: HDC, r: &RECT, text: &str, fg: u32, font: HGDI
 }
 
 /// 菜单格的三道横线。不用 `☰` 字形：字体缺字会画成豆腐块，手画的永远一样清楚。
-unsafe fn draw_menu_glyph(hdc: HDC, r: &RECT) {
+unsafe fn draw_menu_glyph(hdc: HDC, r: &RECT, color: u32) {
     let w = scale(12);
     let th = scale(2).max(1);
     let gap = scale(4);
@@ -1156,7 +1186,7 @@ unsafe fn draw_menu_glyph(hdc: HDC, r: &RECT) {
             right: cx - w / 2 + w,
             bottom: y + th,
         };
-        fill_rect(hdc, &bar, C_TEXT);
+        fill_rect(hdc, &bar, color);
     }
 }
 
@@ -1375,7 +1405,7 @@ fn dpi_k() -> f32 {
 ///
 /// `hover` 是悬停在哪一格（-1 = 没有）。作为参数传进来而不是在这里读 `HOVER`：
 /// 预览图测试要画悬停态，又不能去改全局（别的测试在并行跑）。
-unsafe fn paint_bar(c: &mut Canvas, hover: i32) {
+unsafe fn paint_bar(c: &mut Canvas, hover: i32, dark: bool) {
     let (w, h) = (c.w, c.h);
     let client = RECT {
         left: 0,
@@ -1383,7 +1413,10 @@ unsafe fn paint_bar(c: &mut Canvas, hover: i32) {
         right: w,
         bottom: h,
     };
-    fill_rect(c.dc, &client, C_BG);
+    // 主题由调用方决定（`present()` 读一次注册表就够；悬停重绘不必再读）。
+    let pal = bar_palette(dark);
+
+    fill_rect(c.dc, &client, pal.bg);
 
     let font = get_font();
     let rects = item_rects();
@@ -1397,7 +1430,7 @@ unsafe fn paint_bar(c: &mut Canvas, hover: i32) {
     // 只缩 1px：格高 28、品牌标 24，缩多了垫底会被品牌标整个盖住，悬停没反馈。
     if (0..4).contains(&hover) {
         let r = inset(&rects[hover as usize], scale(1));
-        fill_round_aa(c.pixels(), w, h, &r, scale(6) as f32, C_HOVER);
+        fill_round_aa(c.pixels(), w, h, &r, scale(6) as f32, pal.hover);
     }
 
     let hdc = c.dc;
@@ -1409,31 +1442,31 @@ unsafe fn paint_bar(c: &mut Canvas, hover: i32) {
         right: sep_x + scale(SEP_W),
         bottom: rects[0].bottom - scale(7),
     };
-    fill_rect(hdc, &sep, C_BORDER);
+    fill_rect(hdc, &sep, pal.border);
 
     // 第一格：品牌标（浮条里唯一一个"重"的元素，和搜狗那个橙色 S 一个位置）
     draw_badge(hdc, &rects[0]);
 
-    // 第二格：中/英。开=品牌深蓝，关=浅灰。
+    // 第二格：中/英。开=激活色，关=灰。
     let (mode_text, mode_fg) = if chinese {
-        ("中", C_ACCENT)
+        ("中", pal.accent)
     } else {
-        ("英", C_DIM)
+        ("英", pal.dim)
     };
     draw_text_centered(hdc, &rects[1], mode_text, mode_fg, font);
 
     // 第三格：中文标点 / 半角。像搜狗那样**上下叠放**（上句号、下逗号）。
     // 两个符号都用 GDI 画形状而不是打字体 —— 15px 字号下全角标点只剩一粒灰点。
     let cell = rects[2];
-    let punct_fg = if punct { C_ACCENT } else { C_DIM };
+    let punct_fg = if punct { pal.accent } else { pal.dim };
     draw_glyphs_aa(hdc, &cell, &punct_glyphs(&cell, punct, dpi_k()), punct_fg);
 
     // 第四格：菜单。
-    draw_menu_glyph(hdc, &rects[3]);
+    draw_menu_glyph(hdc, &rects[3], pal.text);
 
     // 外形：圆角 + 描边，都抗锯齿。描边 1px（高 DPI 跟着放大）。
     let border_w = scale(1).max(1) as f32;
-    apply_frame(c.pixels(), w, h, scale(RADIUS) as f32, border_w, C_BORDER);
+    apply_frame(c.pixels(), w, h, scale(RADIUS) as f32, border_w, pal.border);
 }
 
 /// 画一帧并交给系统合成。窗口尺寸取 `window_size()`，位置不动（`pptDst` 传空）。
@@ -1442,7 +1475,9 @@ unsafe fn present(hwnd: HWND) -> bool {
     let Some(mut c) = Canvas::new(w, h) else {
         return false;
     };
-    paint_bar(&mut c, HOVER.load(Ordering::Relaxed));
+    let dark = crate::config::snapshot().dark;
+    PAINTED_DARK.store(dark, Ordering::Relaxed);
+    paint_bar(&mut c, HOVER.load(Ordering::Relaxed), dark);
     let size = SIZE { cx: w, cy: h };
     let src = POINT { x: 0, y: 0 };
     let blend = BLENDFUNCTION {
@@ -1621,9 +1656,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 // 状态是全局的（注册表）：别的程序里点了中/英或标点，这一条也要跟着变，
                 // 否则同一时刻不同窗口里的浮条会显示不同的状态。
                 let (chinese, punct) = crate::state::snapshot();
+                let dark = crate::config::snapshot().dark;
                 if !PAINTED_VALID.load(Ordering::Relaxed)
                     || chinese != PAINTED_CHINESE.load(Ordering::Relaxed)
                     || punct != PAINTED_PUNCT.load(Ordering::Relaxed)
+                    || dark != PAINTED_DARK.load(Ordering::Relaxed)
                 {
                     redraw(hwnd);
                 }
@@ -3542,9 +3579,10 @@ mod tests {
             bottom: h,
         };
         let mut c = unsafe { Canvas::new(w, h) }.expect("画布创建失败");
-        let fg = if chinese { C_ACCENT } else { C_DIM };
+        let pal = bar_palette(false);
+        let fg = if chinese { pal.accent } else { pal.dim };
         unsafe {
-            fill_rect(c.dc, &local, C_BG);
+            fill_rect(c.dc, &local, pal.bg);
             draw_glyphs_aa(c.dc, &local, &punct_glyphs(&local, chinese, dpi_k()), fg);
         }
         let mut px = unsafe { c.pixels() }.to_vec();
@@ -3726,23 +3764,27 @@ mod tests {
         std::fs::write(&path, &out).expect("预览图写入失败");
     }
 
-    /// 用和窗口完全相同的 `paint_bar` 渲一帧，叠在白色和深灰两种"桌面"上，
-    /// 存成 `tsf/target/bar-preview.bmp` / `bar-preview-dark.bmp`，
-    /// 另有一张悬停在标点格上的 `bar-preview-hover.bmp`。
-    /// 改配色/布局时先看这两张图（圆角抗锯齿在深色桌面上最容易看出来）。
+    /// 用和窗口完全相同的 `paint_bar` 渲一帧，浅色/暗色各一份，叠在对应的"桌面"上：
+    /// `bar-preview.bmp`（浅色 + 白底）、`bar-preview-dark.bmp`（暗色 + 深底）、
+    /// `bar-preview-hover.bmp`（悬停在标点格上，看垫底的圆角）。
+    /// 改配色/布局时先看这几张图（圆角抗锯齿在深色桌面上最容易看出来）。
     #[test]
     fn 渲染预览图() {
         let (w, h) = window_size();
         unsafe {
             let mut c = Canvas::new(w, h).expect("画布创建失败");
-            paint_bar(&mut c, -1);
+            paint_bar(&mut c, -1, false);
             let px = c.pixels().to_vec();
             write_preview("bar-preview.bmp", &px, w, h, (0xFF, 0xFF, 0xFF));
-            write_preview("bar-preview-dark.bmp", &px, w, h, (0x3A, 0x3A, 0x3A));
+
+            let mut c = Canvas::new(w, h).expect("画布创建失败");
+            paint_bar(&mut c, -1, true);
+            let px = c.pixels().to_vec();
+            write_preview("bar-preview-dark.bmp", &px, w, h, (0x1E, 0x1E, 0x22));
 
             // 悬停在标点格上（看垫底的圆角是不是也平滑）
             let mut c = Canvas::new(w, h).expect("画布创建失败");
-            paint_bar(&mut c, 2);
+            paint_bar(&mut c, 2, false);
             let px = c.pixels().to_vec();
             write_preview("bar-preview-hover.bmp", &px, w, h, (0xFF, 0xFF, 0xFF));
 
@@ -3754,6 +3796,46 @@ mod tests {
                 let (px, w, h) = render_punct_cell(chinese);
                 write_preview(name, &px, w, h, (0xFF, 0xFF, 0xFF));
             }
+        }
+    }
+
+    /// 相对亮度（0–255，ITU-R BT.601 权重）。COLORREF 低字节是红。
+    fn luma(c: u32) -> i32 {
+        let r = (c & 0xFF) as i32;
+        let g = ((c >> 8) & 0xFF) as i32;
+        let b = ((c >> 16) & 0xFF) as i32;
+        (r * 299 + g * 587 + b * 114) / 1000
+    }
+
+    /// 两套主题都得能看清：底色深度对、正文和底色拉得开、
+    /// "开/关"两个状态之间也要能一眼分出来。改配色时这条会先炸。
+    #[test]
+    fn 两套主题的底色和墨迹都分得开() {
+        assert!(luma(PALETTE_LIGHT.bg) > 200, "浅色主题底色应该是亮的");
+        assert!(luma(PALETTE_DARK.bg) < 70, "暗色主题底色应该是深的");
+
+        for (name, pal) in [("浅色", &PALETTE_LIGHT), ("暗色", &PALETTE_DARK)] {
+            let text_gap = (luma(pal.text) - luma(pal.bg)).abs();
+            assert!(text_gap >= 100, "{name}：正文与底色亮度差 {text_gap}，太小");
+            let accent_gap = (luma(pal.accent) - luma(pal.bg)).abs();
+            assert!(
+                accent_gap >= 100,
+                "{name}：激活色与底色亮度差 {accent_gap}，太小"
+            );
+            let dim_gap = (luma(pal.dim) - luma(pal.bg)).abs();
+            assert!(
+                dim_gap >= 40,
+                "{name}：未激活色与底色亮度差 {dim_gap}，太小"
+            );
+            // 开/关要能分开：激活色与灰至少差 40
+            let on_off = (luma(pal.accent) - luma(pal.dim)).abs();
+            assert!(on_off >= 40, "{name}：开与关只差 {on_off}，分不出来");
+            // 悬停垫底不能和底色一样
+            let hover_gap = (luma(pal.hover) - luma(pal.bg)).abs();
+            assert!(
+                hover_gap >= 3,
+                "{name}：悬停垫底和底色几乎一样（{hover_gap}）"
+            );
         }
     }
 
