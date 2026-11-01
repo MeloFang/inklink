@@ -156,7 +156,7 @@ const PALETTE_DARK: BarPalette = BarPalette {
     border: 0x00_46_41_41,
     hover: 0x00_38_33_33,
     text: 0x00_3D_9E_FF,   // #ff9e3d 暖橙（COLORREF 是 0x00BBGGRR）
-    dim: 0x00_3D_71_A9,   // #a9713d 暗一档的橙 = 关状态
+    dim: 0x00_3D_71_A9,    // #a9713d 暗一档的橙 = 关状态
     accent: 0x00_3D_9E_FF, // 激活同样用 #ff9e3d
 };
 
@@ -949,14 +949,19 @@ fn load_badge(side: i32) -> HICON {
     unsafe { LoadIconW(std::ptr::null_mut(), IDI_APPLICATION) as HICON }
 }
 
-unsafe fn draw_badge(hdc: HDC, r: &RECT) {
+unsafe fn draw_badge(hdc: HDC, r: &RECT) -> RECT {
     // 图标比格子小一圈，留出边距；尺寸正好是 ICO 里的某一帧，1:1 贴上去，不经过缩放。
     let side = badge_side();
     let mut h = BADGE.load(Ordering::Relaxed);
     if h == 0 {
         let icon = load_badge(side);
         if icon.is_null() {
-            return;
+            return RECT {
+                left: 0,
+                top: 0,
+                right: 0,
+                bottom: 0,
+            };
         }
         h = icon as isize;
         BADGE.store(h, Ordering::Relaxed);
@@ -974,6 +979,53 @@ unsafe fn draw_badge(hdc: HDC, r: &RECT) {
         std::ptr::null_mut(),
         DI_NORMAL,
     );
+    RECT {
+        left: x,
+        top: y,
+        right: x + side,
+        bottom: y + side,
+    }
+}
+
+/// 暗色主题下把品牌标的深蓝底换成橙底，白色 `i` 原样保留。
+///
+/// 图标是位图，GDI 没法直接换色，只能在像素上重新映射。识别靠"蓝比红多多少"：
+/// 深蓝底是 `#062657`（b − r = 81），白字形和浮条底色都接近中性（b − r ≈ 0~4），
+/// 所以 `navy = (b−r)/81` 正好是"这个像素有多少是深蓝底"的占比；
+/// 白色字形占比用亮度估。两者取大的当"图标覆盖率"，边缘像素才能和底色融得自然，
+/// 图标圆角外面的背景像素（覆盖率≈0）一个都不动。
+fn recolor_badge_to_orange(px: &mut [u32], w: i32, r: &RECT) {
+    for y in r.top..r.bottom {
+        for x in r.left..r.right {
+            let i = (y * w + x) as usize;
+            if i >= px.len() {
+                continue;
+            }
+            let p = px[i];
+            let cr = ((p >> 16) & 0xFF) as f32;
+            let cg = ((p >> 8) & 0xFF) as f32;
+            let cb = (p & 0xFF) as f32;
+
+            let navy = ((cb - cr) / 81.0).clamp(0.0, 1.0);
+            let luma = (cr * 0.299 + cg * 0.587 + cb * 0.114) as f32;
+            let glyph = ((luma - 120.0) / 135.0).clamp(0.0, 1.0);
+            let cover = navy.max(glyph);
+            if cover <= 0.02 {
+                continue;
+            }
+
+            // 目标色：底色用橙，往上按字形占比插值到白
+            let g = (glyph / cover.max(0.02)).clamp(0.0, 1.0);
+            let mix = |a: f32, b: f32| a + (b - a) * g;
+            let (tr, tg, tb) = (mix(255.0, 255.0), mix(158.0, 255.0), mix(61.0, 255.0));
+
+            // 再按覆盖率跟原像素混合（抗锯齿边缘）
+            let nr = cr + (tr - cr) * cover;
+            let ng = cg + (tg - cg) * cover;
+            let nb = cb + (tb - cb) * cover;
+            px[i] = (p & 0xFF00_0000) | ((nr as u32) << 16) | ((ng as u32) << 8) | (nb as u32);
+        }
+    }
 }
 
 fn inset(r: &RECT, d: i32) -> RECT {
@@ -1447,7 +1499,11 @@ unsafe fn paint_bar(c: &mut Canvas, hover: i32, dark: bool) {
     fill_rect(hdc, &sep, pal.border);
 
     // 第一格：品牌标（浮条里唯一一个"重"的元素，和搜狗那个橙色 S 一个位置）
-    draw_badge(hdc, &rects[0]);
+    let badge = draw_badge(hdc, &rects[0]);
+    if dark && badge.right > badge.left {
+        // 暗色下深蓝底在深底上几乎看不见，换成橙底白字（用户指定）
+        recolor_badge_to_orange(c.pixels(), w, &badge);
+    }
 
     // 第二格：中/英。开=激活色，关=灰。
     let (mode_text, mode_fg) = if chinese {

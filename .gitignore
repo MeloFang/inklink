@@ -86,3 +86,4 @@ msg.txt
 # 候选窗预览图（`cargo test` 渲的 cand-preview-*.bmp 转出来的 PNG）
 /ui/cand-preview-*.png
 ui/bar-compare-dark.png
+/ui/badge-dark-x8.png
