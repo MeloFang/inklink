@@ -106,12 +106,9 @@ struct Palette {
     num: u32,
     sel: u32,
     border: u32,
-    /// 选中格的垫底色。和 `bg` 相同 = 不画垫底（浅色主题就是这种情况）。
-    hl: u32,
 }
 
-/// 浅色（默认，对齐主流输入法）：白底、深灰字、橙色选中。选中只靠字的颜色区分，
-/// 所以 `hl` 等于底色（不画垫底）。
+/// 浅色（默认，对齐主流输入法）：白底、深灰字、橙色选中。
 const PALETTE_LIGHT: Palette = Palette {
     bg: 0x00FF_FFFF,     // #ffffff
     pinyin: 0x0099_9999, // #999999
@@ -119,22 +116,16 @@ const PALETTE_LIGHT: Palette = Palette {
     num: 0x00AA_AAAA,    // #aaaaaa
     sel: 0x0000_66FF,    // #ff6600
     border: 0x00E0_E0E0, // #e0e0e0
-    hl: 0x00FF_FFFF,     // = bg，不画垫底
 };
 
-/// 暗色：近黑底、**暖橙字**（用户指定的那个橙）。
-///
-/// 全篇都是橙之后，光靠字的亮度差已经分不出选中了，所以选中额外垫一块
-/// 暖色底（`hl`），字再用亮一档的橙。序号用暗一档的橙，不抢正文；
-/// 拼音行用暗棕，和正文同色系但不打架。
+/// 暗色：近黑底、亮灰字、同一族的亮橙选中（换成蓝色会破掉"选中=橙"的既有语感）。
 const PALETTE_DARK: Palette = Palette {
     bg: 0x0022_1E1E,     // #1e1e22
-    pinyin: 0x004A_6A8A, // #8a6a4a 暗棕（COLORREF 是 0x00BBGGRR，反着读）
-    text: 0x003D_9EFF,   // #ff9e3d 正文 = 橙
-    num: 0x003F_86C9,    // #c9863f 暗一档的橙，序号不抢正文
-    sel: 0x0094_D8FF,    // #ffd894 更亮更淡一档
+    pinyin: 0x0097_8E8E, // #8e8e97
+    text: 0x00F1_EC_EC,  // #ececf1
+    num: 0x0078_6E6E,    // #6e6e78
+    sel: 0x003D_9EFF,    // #ff9e3d
     border: 0x0042_3A3A, // #3a3a42
-    hl: 0x0020_2E3F,     // #3f2e20 暖色垫底
 };
 
 fn palette(dark: bool) -> &'static Palette {
@@ -488,17 +479,6 @@ unsafe fn paint_frame(hdc: windows_sys::Win32::Graphics::Gdi::HDC, client: &RECT
         let row = (i / cols) as i32;
         let x = PAD + col * cell_w;
         let y = PAD + PINYIN_H + row * ROW_H;
-        // 垫底必须先画，否则会把序号盖掉（这坑踩过一次）
-        if i == sel && pal.hl != pal.bg {
-            // 全员同色时，靠一块暖色垫底把"当前选的是哪个"钉住
-            let hl = CreateSolidBrush(pal.hl);
-            let old_b = SelectObject(hdc, hl);
-            let old_p = SelectObject(hdc, GetStockObject(8 /* NULL_PEN */));
-            RoundRect(hdc, x - 3, y + 1, x + cell_w - 8, y + ROW_H - 1, 6, 6);
-            SelectObject(hdc, old_b);
-            SelectObject(hdc, old_p);
-            DeleteObject(hl as *mut core::ffi::c_void);
-        }
         if i / cols == sel_row {
             let color = if i == sel { pal.sel } else { pal.num };
             draw_text(hdc, x, y, &format!("{}.", col + 1), color, ROW_H);
