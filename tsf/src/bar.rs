@@ -736,13 +736,15 @@ fn glyph_sdf(g: Glyph, px: f32, py: f32) -> f32 {
         Glyph::Ring { cx, cy, r, hw } => (dist(px, py, cx, cy) - r).abs() - hw,
         Glyph::Dot { cx, cy, r } => dist(px, py, cx, cy) - r,
         Glyph::Comma { cx, cy, k } => {
-            // 96 DPI 下的设计：圆头 r=2.3；尾巴从圆头右下起笔、垂直落下再往左下甩出去，
-            // 三段半径 1.7 → 1.15 → 0.45，收成尖但不是"钉子"。
+            // 96 DPI 下的设计：圆头 r=2.1（和句号环的外径一个量级，两个符号才不打架）；
+            // 尾巴从圆头右下起笔、垂直落下再往左下甩出去，三段半径 1.5 → 1.0 → 0.4，
+            // 收成尖但不是"钉子"。总高约 7.9，比原来 9.2 收了一档（用户说句号太大、
+            // 头重脚轻，句号收小之后逗号不跟着收就变成下重上轻）。
             let p = |x: f32, y: f32, r: f32| (cx + x * k, cy + y * k, r * k);
-            let head = dist(px, py, cx, cy) - 2.3 * k;
-            let a = p(0.7, 0.6, 1.7);
-            let b = p(0.9, 3.4, 1.15);
-            let c = p(-1.6, 6.4, 0.45);
+            let head = dist(px, py, cx, cy) - 2.1 * k;
+            let a = p(0.6, 0.5, 1.5);
+            let b = p(0.8, 3.0, 1.0);
+            let c = p(-1.4, 5.4, 0.4);
             head.min(taper(px, py, a, b)).min(taper(px, py, b, c))
         }
     }
@@ -1331,10 +1333,15 @@ mod tests {
         assert!(glyph_sdf(comma, 0.0, 50.0) > 0.0, "远处在外面");
         // 尾巴往**左下**甩：下方几个像素处还在墨里，正上方对称位置就该空了。
         assert!(glyph_sdf(comma, 0.0, 3.0) < 0.0, "圆头下面接着尾巴");
-        assert!(glyph_sdf(comma, -1.5, 6.0) < 0.0, "尾尖附近仍是墨");
+        assert!(glyph_sdf(comma, -1.4, 5.4) < 0.0, "尾尖的中心仍是墨");
+        assert!(glyph_sdf(comma, -0.3, 4.2) < 0.0, "尾巴中段在墨里");
         assert!(
             glyph_sdf(comma, 0.0, -3.0) > 0.0,
             "上面不该有东西（逗号不是两端对称的）"
+        );
+        assert!(
+            glyph_sdf(comma, 0.0, 7.5) > 0.0,
+            "尾巴到 5.4+0.4 就收尖了，再往下必须是空的"
         );
     }
 
