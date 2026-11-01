@@ -147,15 +147,17 @@ const PALETTE_LIGHT: BarPalette = BarPalette {
     accent: 0x00_57_26_06,
 };
 
-/// 暗色：和候选窗的暗色主题同一套色（#1E1E22 系），贴到深色编辑器上不刺眼。
-/// 激活色在这里取近白而不是深蓝 —— 深蓝在深底上等于看不见，搜狗暗色也是这么做的。
+/// 暗色：底色沿用候选窗的 #1E1E22 系，字用暖橙（用户指定 #FF9E3D）。
+///
+/// 激活色原来是近白，用户要求换成橙——暗底上橙色比白色柔和，也和候选窗
+/// 暗色主题的选中色是同一个色号。关状态用暗一档的橙，仍能一眼分出来。
 const PALETTE_DARK: BarPalette = BarPalette {
     bg: 0x00_26_22_22,
     border: 0x00_46_41_41,
     hover: 0x00_38_33_33,
-    text: 0x00_F1_EC_EC,
-    dim: 0x00_97_8E_8E,
-    accent: 0x00_F1_EC_EC,
+    text: 0x00_3D_9E_FF,   // #ff9e3d 暖橙（COLORREF 是 0x00BBGGRR）
+    dim: 0x00_3D_71_A9,   // #a9713d 暗一档的橙 = 关状态
+    accent: 0x00_3D_9E_FF, // 激活同样用 #ff9e3d
 };
 
 fn bar_palette(dark: bool) -> &'static BarPalette {
