@@ -14,22 +14,21 @@
 //! - 由 TSF 线程的消息循环驱动，**不另起线程**
 //! - 只做显示 + 鼠标点击选词；上屏动作通过回调交给 `lib.rs`（编辑会话必须在那边发）
 
-use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering};
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, SIZE, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
-    BeginPaint, CreatePen, CreateRoundRectRgn, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint,
-    FillRect, GetDC, GetStockObject, GetTextExtentPoint32W, InvalidateRect, ReleaseDC, RoundRect,
-    CreateFontW, SelectObject, SetBkMode, SetTextColor, SetWindowRgn, DT_LEFT, DT_SINGLELINE,
-    DT_VCENTER, PAINTSTRUCT, PS_SOLID, TRANSPARENT,
+    BeginPaint, CreateFontW, CreatePen, CreateRoundRectRgn, CreateSolidBrush, DT_LEFT,
+    DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawTextW, EndPaint, FillRect, GetDC, GetStockObject,
+    GetTextExtentPoint32W, InvalidateRect, PAINTSTRUCT, PS_SOLID, ReleaseDC, RoundRect,
+    SelectObject, SetBkMode, SetTextColor, SetWindowRgn, TRANSPARENT,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, GetClientRect, IsWindowVisible, RegisterClassW, SetWindowPos,
-    ShowWindow,
-    CW_USEDEFAULT, MA_NOACTIVATE, SWP_NOACTIVATE, SWP_NOZORDER, SW_HIDE, SW_SHOWNOACTIVATE,
-    WM_ERASEBKGND, WM_LBUTTONDOWN, WM_MOUSEACTIVATE, WM_PAINT, WNDCLASSW, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, GetClientRect, IsWindowVisible, MA_NOACTIVATE,
+    RegisterClassW, SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOZORDER, SetWindowPos,
+    ShowWindow, WM_ERASEBKGND, WM_LBUTTONDOWN, WM_MOUSEACTIVATE, WM_PAINT, WNDCLASSW,
+    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
 static HWND_CELL: AtomicIsize = AtomicIsize::new(0);
@@ -64,8 +63,6 @@ pub fn clear_click_handler() {
 
 const CLASS_NAME: &str = "inklink-candidate";
 
-/// 网格列数
-const COLS: usize = 5;
 /// 内边距
 const PAD: i32 = 14;
 /// 拼音行高
@@ -74,15 +71,66 @@ const PINYIN_H: i32 = 24;
 const ROW_H: i32 = 34;
 /// 单元格最小宽度
 const MIN_CELL_W: i32 = 96;
+/// 圆角半径
+const CORNER_RADIUS: i32 = 8;
 
-// 浅色主题（对齐主流输入法）
-const BG_COLOR: u32 = 0x00FF_FFFF; // #ffffff 白底
-const PINYIN_COLOR: u32 = 0x0099_9999; // 灰
-const TEXT_COLOR: u32 = 0x0022_2222; // #222222 深灰
-const NUM_COLOR: u32 = 0x00AA_AAAA; // 浅灰序号
-const SEL_COLOR: u32 = 0x0000_66FF; // #ff6600 橙色高亮（BGR）
-const BORDER_COLOR: u32 = 0x00E0_E0E0; // 浅灰边框
-const CORNER_RADIUS: i32 = 8; // 圆角半径
+/// 候选窗现在的排版与主题。
+///
+/// 配置是**每次 `show()` 现读**的（见 `config.rs`），读到的结果存在这里，
+/// 让同一次绘制里的 `window_size` / `hit_index` / `WM_PAINT` 用同一份 ——
+/// 不这么锁，用户中途改配置就会"窗口尺寸按新列数、点击命中按旧列数"。
+#[derive(Clone, Copy)]
+struct Layout {
+    cols: usize,
+    dark: bool,
+}
+
+impl Layout {
+    const DEFAULT: Layout = Layout {
+        cols: 5,
+        dark: false,
+    };
+}
+
+static LAYOUT: Mutex<Layout> = Mutex::new(Layout::DEFAULT);
+
+fn layout() -> Layout {
+    *LAYOUT.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// 一套配色。`COLORREF` 是 `0x00BBGGRR`，字面量写成 `0x00_BB_GG_RR` 方便核对。
+struct Palette {
+    bg: u32,
+    pinyin: u32,
+    text: u32,
+    num: u32,
+    sel: u32,
+    border: u32,
+}
+
+/// 浅色（默认，对齐主流输入法）：白底、深灰字、橙色选中。
+const PALETTE_LIGHT: Palette = Palette {
+    bg: 0x00FF_FFFF,     // #ffffff
+    pinyin: 0x0099_9999, // #999999
+    text: 0x0022_2222,   // #222222
+    num: 0x00AA_AAAA,    // #aaaaaa
+    sel: 0x0000_66FF,    // #ff6600
+    border: 0x00E0_E0E0, // #e0e0e0
+};
+
+/// 暗色：近黑底、亮灰字、同一族的亮橙选中（换成蓝色会破掉"选中=橙"的既有语感）。
+const PALETTE_DARK: Palette = Palette {
+    bg: 0x0022_1E1E,     // #1e1e22
+    pinyin: 0x0097_8E8E, // #8e8e97
+    text: 0x00F1_EC_EC,  // #ececf1
+    num: 0x0078_6E6E,    // #6e6e78
+    sel: 0x003D_9EFF,    // #ff9e3d
+    border: 0x0042_3A3A, // #3a3a42
+};
+
+fn palette(dark: bool) -> &'static Palette {
+    if dark { &PALETTE_DARK } else { &PALETTE_LIGHT }
+}
 
 /// 显示候选窗。`caret` 是光标的三段坐标 `(x, 顶边 y, 底边 y)`（屏幕坐标）。
 ///
@@ -101,13 +149,22 @@ pub fn show(
         if hwnd == 0 {
             return;
         }
+        // 先锁住这次要用的排版/主题，再算尺寸 —— 否则同一帧里
+        // `window_size` 与 `WM_PAINT` 可能读到两份不同的配置。
+        let cfg = crate::config::snapshot();
+        let layout = Layout {
+            cols: cfg.cols,
+            dark: cfg.dark,
+        };
+        *LAYOUT.lock().unwrap_or_else(|p| p.into_inner()) = layout;
+
         *CANDIDATES.lock().unwrap() = candidates.to_vec();
         *PINYIN.lock().unwrap() = pinyin.to_string();
         SELECTED.store(sel, Ordering::SeqCst);
         PAGE.store(page, Ordering::SeqCst);
         TOTAL_PAGES.store(total_pages, Ordering::SeqCst);
 
-        let (w, h) = window_size(candidates);
+        let (w, h) = window_size(candidates, layout.cols);
         let (x, y) = place(caret, w, h);
         SetWindowPos(
             hwnd as HWND,
@@ -185,7 +242,7 @@ fn place_in(area: (i32, i32, i32, i32), caret: (i32, i32, i32), w: i32, h: i32) 
 fn work_area(x: i32, y: i32) -> (i32, i32, i32, i32) {
     use windows_sys::Win32::Foundation::POINT;
     use windows_sys::Win32::Graphics::Gdi::{
-        GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+        GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint,
     };
     unsafe {
         let pt = POINT { x, y };
@@ -210,11 +267,7 @@ fn screen_size() -> (i32, i32) {
     unsafe {
         let w = GetSystemMetrics(SM_CXSCREEN);
         let h = GetSystemMetrics(SM_CYSCREEN);
-        if w > 0 && h > 0 {
-            (w, h)
-        } else {
-            (1280, 720)
-        }
+        if w > 0 && h > 0 { (w, h) } else { (1280, 720) }
     }
 }
 
@@ -233,10 +286,10 @@ pub fn hide() {
 }
 
 /// 计算窗口尺寸：列宽取最长候选，行数按候选数。
-fn window_size(candidates: &[String]) -> (i32, i32) {
-    let rows = candidates.len().div_ceil(COLS).max(1) as i32;
+fn window_size(candidates: &[String], cols: usize) -> (i32, i32) {
+    let rows = candidates.len().div_ceil(cols).max(1) as i32;
     let cell_w = cell_width(candidates);
-    let w = cell_w * COLS as i32 + PAD * 2;
+    let w = cell_w * cols as i32 + PAD * 2;
     let h = PINYIN_H + rows * ROW_H + PAD * 2;
     (w.max(220), h)
 }
@@ -245,7 +298,7 @@ fn window_size(candidates: &[String]) -> (i32, i32) {
 ///
 /// 和 `WM_PAINT` 里的算式必须保持一致：整格都算可点（含序号那一小块），
 /// 因为用户是"照着看见的那一格点"，不是照着文字的像素点。
-fn hit_index(x: i32, y: i32, candidates: &[String]) -> Option<usize> {
+fn hit_index(x: i32, y: i32, candidates: &[String], cols: usize) -> Option<usize> {
     let grid_top = PAD + PINYIN_H;
     if y < grid_top {
         return None;
@@ -253,10 +306,10 @@ fn hit_index(x: i32, y: i32, candidates: &[String]) -> Option<usize> {
     let cell_w = cell_width(candidates);
     let col = (x - PAD) / cell_w;
     let row = (y - grid_top) / ROW_H;
-    if col < 0 || col >= COLS as i32 || row < 0 {
+    if col < 0 || col >= cols as i32 || row < 0 {
         return None;
     }
-    let idx = row as usize * COLS + col as usize;
+    let idx = row as usize * cols + col as usize;
     if idx < candidates.len() {
         Some(idx)
     } else {
@@ -290,7 +343,10 @@ fn cell_width(candidates: &[String]) -> i32 {
 fn ensure_window() {
     unsafe {
         if !REGISTERED.swap(true, Ordering::SeqCst) {
-            let name: Vec<u16> = CLASS_NAME.encode_utf16().chain(std::iter::once(0)).collect();
+            let name: Vec<u16> = CLASS_NAME
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
             let wc = WNDCLASSW {
                 lpfnWndProc: Some(wndproc),
                 hInstance: std::ptr::null_mut(),
@@ -301,7 +357,10 @@ fn ensure_window() {
         }
 
         if HWND_CELL.load(Ordering::SeqCst) == 0 {
-            let name: Vec<u16> = CLASS_NAME.encode_utf16().chain(std::iter::once(0)).collect();
+            let name: Vec<u16> = CLASS_NAME
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
             let hwnd = CreateWindowExW(
                 WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
                 name.as_ptr(),
@@ -347,6 +406,91 @@ unsafe fn draw_text(
     );
 }
 
+/// 把候选窗画到一块 DC 上（客户区 `client`）。
+///
+/// 从 `WM_PAINT` 里抽出来是为了能单测：测试给它一块内存位图，就能渲出
+/// 浅色/暗色两版预览，不用部署到宿主里看。所有颜色/列数都从 `LAYOUT` 取，
+/// 所以调用方必须先让 `show()` 或测试把 `LAYOUT` 设好。
+unsafe fn paint_frame(hdc: windows_sys::Win32::Graphics::Gdi::HDC, client: &RECT) {
+    let rc = *client;
+    let layout = layout();
+    let pal = palette(layout.dark);
+    let cols = layout.cols.max(1);
+
+    let bg = CreateSolidBrush(pal.bg);
+    FillRect(hdc, &rc, bg);
+    DeleteObject(bg as *mut core::ffi::c_void);
+
+    // 圆角边框
+    let pen = CreatePen(PS_SOLID, 1, pal.border);
+    let old_pen = SelectObject(hdc, pen);
+    let null_brush = SelectObject(hdc, GetStockObject(5 /* NULL_BRUSH */));
+    RoundRect(
+        hdc,
+        0,
+        0,
+        rc.right,
+        rc.bottom,
+        CORNER_RADIUS * 2,
+        CORNER_RADIUS * 2,
+    );
+    SelectObject(hdc, null_brush);
+    SelectObject(hdc, old_pen);
+    DeleteObject(pen as *mut core::ffi::c_void);
+
+    let cand_font = get_font(&FONT_CAND, 17);
+    let pinyin_font = get_font(&FONT_PINYIN, 14);
+    SetBkMode(hdc, TRANSPARENT as i32);
+
+    // 拼音行（小号灰字）
+    let old = SelectObject(hdc, pinyin_font);
+    let pinyin = PINYIN.lock().unwrap_or_else(|p| p.into_inner()).clone();
+    draw_text(hdc, PAD, PAD + 2, &pinyin, pal.pinyin, PINYIN_H);
+
+    // 翻页指示（右上角，小灰字）
+    let page = PAGE.load(Ordering::SeqCst);
+    let total = TOTAL_PAGES.load(Ordering::SeqCst);
+    if total > 1 {
+        let indicator = format!("{page}/{total}");
+        let iw = text_width(hdc, &indicator);
+        draw_text(
+            hdc,
+            rc.right - PAD - iw,
+            PAD + 2,
+            &indicator,
+            pal.num,
+            PINYIN_H,
+        );
+    }
+
+    // 候选网格（大号字，选中项用强调色）
+    SelectObject(hdc, cand_font);
+    let cands = CANDIDATES.lock().unwrap_or_else(|p| p.into_inner()).clone();
+    let cell_w = cell_width(&cands);
+    let sel = SELECTED.load(Ordering::SeqCst);
+    // 只给「选中项所在的那一行」标数字 1~N。
+    //
+    // 展开成多行后如果从 1 标到 25，数字会和上下键/左右键的行列语义
+    // 冲突（用户看不出「2」到底是这行的第 2 个还是整页第 2 个）。
+    // 现在一行一标，上下换行、左右/数字选行内。
+    let sel_row = sel / cols;
+    for (i, c) in cands.iter().enumerate() {
+        let col = (i % cols) as i32;
+        let row = (i / cols) as i32;
+        let x = PAD + col * cell_w;
+        let y = PAD + PINYIN_H + row * ROW_H;
+        if i / cols == sel_row {
+            let color = if i == sel { pal.sel } else { pal.num };
+            draw_text(hdc, x, y, &format!("{}.", col + 1), color, ROW_H);
+        }
+        // 非选中行不画数字，但文字仍从 x+22 起，保证上下行对齐
+        let txt_color = if i == sel { pal.sel } else { pal.text };
+        draw_text(hdc, x + 22, y, c, txt_color, ROW_H);
+    }
+
+    SelectObject(hdc, old);
+}
+
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
         WM_ERASEBKGND => 1,
@@ -359,7 +503,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let x = (lparam as i16) as i32;
             let y = ((lparam >> 16) as i16) as i32;
             let cands = CANDIDATES.lock().unwrap_or_else(|p| p.into_inner()).clone();
-            if let Some(idx) = hit_index(x, y, &cands) {
+            if let Some(idx) = hit_index(x, y, &cands, layout().cols) {
                 let stored = CLICK_FN.load(Ordering::SeqCst);
                 let ctx = CLICK_CTX.load(Ordering::SeqCst);
                 hide();
@@ -377,72 +521,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let hdc = BeginPaint(hwnd, &mut ps);
             let mut rc: RECT = std::mem::zeroed();
             GetClientRect(hwnd, &mut rc);
-
-            let bg = CreateSolidBrush(BG_COLOR);
-            FillRect(hdc, &rc, bg);
-            DeleteObject(bg as *mut core::ffi::c_void);
-
-            // 圆角边框
-            let pen = CreatePen(PS_SOLID, 1, BORDER_COLOR);
-            let old_pen = SelectObject(hdc, pen);
-            let null_brush = SelectObject(hdc, GetStockObject(5 /* NULL_BRUSH */));
-            RoundRect(
-                hdc,
-                0,
-                0,
-                rc.right,
-                rc.bottom,
-                CORNER_RADIUS * 2,
-                CORNER_RADIUS * 2,
-            );
-            SelectObject(hdc, null_brush);
-            SelectObject(hdc, old_pen);
-            DeleteObject(pen as *mut core::ffi::c_void);
-
-            let cand_font = get_font(&FONT_CAND, 17);
-            let pinyin_font = get_font(&FONT_PINYIN, 14);
-            SetBkMode(hdc, TRANSPARENT as i32);
-
-            // 拼音行（小号灰字）
-            let old = SelectObject(hdc, pinyin_font);
-            let pinyin = PINYIN.lock().unwrap().clone();
-            draw_text(hdc, PAD, PAD + 2, &pinyin, PINYIN_COLOR, PINYIN_H);
-
-            // 翻页指示（右上角，小灰字）
-            let page = PAGE.load(Ordering::SeqCst);
-            let total = TOTAL_PAGES.load(Ordering::SeqCst);
-            if total > 1 {
-                let indicator = format!("{page}/{total}");
-                let iw = text_width(hdc, &indicator);
-                draw_text(hdc, rc.right - PAD - iw, PAD + 2, &indicator, NUM_COLOR, PINYIN_H);
-            }
-
-            // 候选网格（大号深色字，选中橙色）
-            SelectObject(hdc, cand_font);
-            let cands = CANDIDATES.lock().unwrap().clone();
-            let cell_w = cell_width(&cands);
-            let sel = SELECTED.load(Ordering::SeqCst);
-            // 只给「选中项所在的那一行」标数字 1~5。
-            //
-            // 展开成 5×5 后如果从 1 标到 25，数字会和上下键/左右键的行列语义
-            // 冲突（用户看不出「2」到底是这行的第 2 个还是整页第 2 个）。
-            // 现在一行一标，上下换行、左右/数字选行内。
-            let sel_row = sel / COLS;
-            for (i, c) in cands.iter().enumerate() {
-                let col = (i % COLS) as i32;
-                let row = (i / COLS) as i32;
-                let x = PAD + col * cell_w;
-                let y = PAD + PINYIN_H + row * ROW_H;
-                if i / COLS == sel_row {
-                    let color = if i == sel { SEL_COLOR } else { NUM_COLOR };
-                    draw_text(hdc, x, y, &format!("{}.", col + 1), color, ROW_H);
-                }
-                // 非选中行不画数字，但文字仍从 x+22 起，保证上下行对齐
-                let txt_color = if i == sel { SEL_COLOR } else { TEXT_COLOR };
-                draw_text(hdc, x + 22, y, c, txt_color, ROW_H);
-            }
-
-            SelectObject(hdc, old);
+            paint_frame(hdc, &rc);
             EndPaint(hwnd, &ps);
             0
         }
@@ -459,10 +538,7 @@ unsafe fn text_width(hdc: windows_sys::Win32::Graphics::Gdi::HDC, text: &str) ->
 }
 
 /// 懒创建字体并缓存。
-unsafe fn get_font(
-    slot: &AtomicIsize,
-    size: i32,
-) -> windows_sys::Win32::Graphics::Gdi::HFONT {
+unsafe fn get_font(slot: &AtomicIsize, size: i32) -> windows_sys::Win32::Graphics::Gdi::HFONT {
     let existing = slot.load(Ordering::SeqCst);
     if existing != 0 {
         return existing as _;
@@ -494,28 +570,192 @@ unsafe fn get_font(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // 只有预览图那两条测试用到：渲一帧到内存位图。放在这里，cdylib 构建才不会报 unused。
+    use windows_sys::Win32::Graphics::Gdi::{
+        BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS,
+        DeleteDC, HGDIOBJ,
+    };
 
     const AREA: (i32, i32, i32, i32) = (0, 0, 1920, 1040);
+
+    /// 渲染一帧候选窗，写 32 位 BMP（自上而下，BGRA）。
+    ///
+    /// 存在意义：暗色主题不用部署到宿主里就能看。用 `paint_frame` 画，和真实
+    /// 窗口走同一条代码路径，所以预览里能看出对齐、配色、序号位置。
+    fn write_frame(
+        name: &str,
+        cands: &[String],
+        pinyin: &str,
+        sel: usize,
+        dark: bool,
+        cols: usize,
+    ) {
+        unsafe {
+            let (w, h) = window_size(cands, cols);
+            let bmi = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: w,
+                    biHeight: -h,
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB,
+                    ..std::mem::zeroed()
+                },
+                bmiColors: [std::mem::zeroed()],
+            };
+            let dc = CreateCompatibleDC(std::ptr::null_mut());
+            assert!(!dc.is_null(), "CreateCompatibleDC 失败");
+            let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
+            let dib =
+                CreateDIBSection(dc, &bmi, DIB_RGB_COLORS, &mut bits, std::ptr::null_mut(), 0);
+            assert!(!dib.is_null() && !bits.is_null(), "CreateDIBSection 失败");
+            let old = SelectObject(dc, dib as HGDIOBJ);
+
+            *CANDIDATES.lock().unwrap_or_else(|p| p.into_inner()) = cands.to_vec();
+            *PINYIN.lock().unwrap_or_else(|p| p.into_inner()) = pinyin.to_string();
+            SELECTED.store(sel, Ordering::SeqCst);
+            PAGE.store(1, Ordering::SeqCst);
+            TOTAL_PAGES.store(2, Ordering::SeqCst);
+            *LAYOUT.lock().unwrap_or_else(|p| p.into_inner()) = Layout { cols, dark };
+
+            let rc = RECT {
+                left: 0,
+                top: 0,
+                right: w,
+                bottom: h,
+            };
+            paint_frame(dc, &rc);
+
+            let px = std::slice::from_raw_parts(bits as *const u8, (w * h * 4) as usize);
+            let image = px.to_vec();
+            SelectObject(dc, old);
+            DeleteObject(dib as HGDIOBJ);
+            DeleteDC(dc);
+
+            let mut out: Vec<u8> = Vec::with_capacity(54 + image.len());
+            out.extend_from_slice(b"BM");
+            out.extend_from_slice(&((54 + image.len()) as u32).to_le_bytes());
+            out.extend_from_slice(&0u32.to_le_bytes());
+            out.extend_from_slice(&54u32.to_le_bytes());
+            out.extend_from_slice(&40u32.to_le_bytes());
+            out.extend_from_slice(&w.to_le_bytes());
+            out.extend_from_slice(&(-h).to_le_bytes());
+            out.extend_from_slice(&1u16.to_le_bytes());
+            out.extend_from_slice(&32u16.to_le_bytes());
+            out.extend_from_slice(&0u32.to_le_bytes());
+            out.extend_from_slice(&(image.len() as u32).to_le_bytes());
+            out.extend_from_slice(&2835i32.to_le_bytes());
+            out.extend_from_slice(&2835i32.to_le_bytes());
+            out.extend_from_slice(&0u32.to_le_bytes());
+            out.extend_from_slice(&0u32.to_le_bytes());
+            out.extend_from_slice(&image);
+
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("target")
+                .join(name);
+            std::fs::write(&path, &out).expect("预览图写入失败");
+        }
+    }
+
+    /// 浅色 / 暗色各渲一帧，落在 `tsf/target/cand-preview-light.bmp` / `-dark.bmp`。
+    #[test]
+    fn 渲染两套主题的预览图() {
+        let cands: Vec<String> = vec![
+            "项目".into(),
+            "橡木".into(),
+            "羡慕".into(),
+            "项目管理".into(),
+            "项目经理".into(),
+            "香木".into(),
+            "向慕".into(),
+        ];
+        for (dark, name) in [
+            (false, "cand-preview-light.bmp"),
+            (true, "cand-preview-dark.bmp"),
+        ] {
+            write_frame(name, &cands, "xiang'mu", 0, dark, 5);
+        }
+    }
+
+    /// 两种主题的对比度都要够：正文和背景的亮度差至少 100（0~255）。
+    #[test]
+    fn 两套主题的字都看得清() {
+        fn luma(c: u32) -> i32 {
+            // COLORREF 0x00BBGGRR
+            let b = (c & 0xFF) as i32;
+            let g = ((c >> 8) & 0xFF) as i32;
+            let r = ((c >> 16) & 0xFF) as i32;
+            (r * 299 + g * 587 + b * 114) / 1000
+        }
+        for dark in [false, true] {
+            let p = palette(dark);
+            assert!(
+                (luma(p.text) - luma(p.bg)).abs() >= 100,
+                "dark={dark} 正文与背景对比度不够"
+            );
+            assert!(
+                (luma(p.sel) - luma(p.bg)).abs() >= 60,
+                "dark={dark} 选中色与背景分不开"
+            );
+            assert!(
+                (luma(p.pinyin) - luma(p.bg)).abs() >= 40,
+                "dark={dark} 拼音行太淡"
+            );
+        }
+        // 浅色底亮、暗色底暗，别写反了
+        assert!(luma(palette(false).bg) > 200);
+        assert!(luma(palette(true).bg) < 60);
+    }
 
     /// 鼠标点在格子里要落到正确的候选上
     #[test]
     fn 点哪一格就选哪一个() {
         let cands: Vec<String> = (0..7).map(|i| format!("词{i}")).collect();
+        let cols = 5;
         // 拼音行不算
-        assert_eq!(hit_index(10, 2, &cands), None);
+        assert_eq!(hit_index(10, 2, &cands, cols), None);
         // 第一行第一个（点在序号那一小块也算）
-        assert_eq!(hit_index(PAD + 3, PAD + PINYIN_H + 5, &cands), Some(0));
+        assert_eq!(
+            hit_index(PAD + 3, PAD + PINYIN_H + 5, &cands, cols),
+            Some(0)
+        );
         // 第一行第三个
         let cw = cell_width(&cands);
-        assert_eq!(hit_index(PAD + cw * 2 + 3, PAD + PINYIN_H + 5, &cands), Some(2));
+        assert_eq!(
+            hit_index(PAD + cw * 2 + 3, PAD + PINYIN_H + 5, &cands, cols),
+            Some(2)
+        );
         // 第二行第一个 = 下标 5
         assert_eq!(
-            hit_index(PAD + 3, PAD + PINYIN_H + ROW_H + 5, &cands),
+            hit_index(PAD + 3, PAD + PINYIN_H + ROW_H + 5, &cands, cols),
             Some(5)
         );
         // 第二行第三个是空的（只有 7 个）
         assert_eq!(
-            hit_index(PAD + cw * 2 + 3, PAD + PINYIN_H + ROW_H + 5, &cands),
+            hit_index(PAD + cw * 2 + 3, PAD + PINYIN_H + ROW_H + 5, &cands, cols),
+            None
+        );
+    }
+
+    /// 列数变了，命中测试要跟着变（P3：每页候选数可配置）
+    #[test]
+    fn 列数变化后命中测试跟着走() {
+        let cands: Vec<String> = (0..7).map(|i| format!("词{i}")).collect();
+        let cw = cell_width(&cands);
+        // 3 列时，第 4 个候选在第 2 行第 1 格
+        assert_eq!(
+            hit_index(PAD + 3, PAD + PINYIN_H + ROW_H + 5, &cands, 3),
+            Some(3)
+        );
+        // 3 列时第 2 行第 3 格是下标 5
+        assert_eq!(
+            hit_index(PAD + cw * 2 + 3, PAD + PINYIN_H + ROW_H + 5, &cands, 3),
+            Some(5)
+        );
+        // 越界的列不算命中
+        assert_eq!(
+            hit_index(PAD + cw * 3 + 3, PAD + PINYIN_H + 5, &cands, 3),
             None
         );
     }

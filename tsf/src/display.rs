@@ -20,13 +20,15 @@
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 use windows::Win32::Foundation::{COLORREF, E_INVALIDARG, E_NOTIMPL, E_POINTER};
-use windows::Win32::System::Variant::{VARIANT, VARIANT_0, VARIANT_0_0, VARIANT_0_0_0, VT_EMPTY, VT_I4};
+use windows::Win32::System::Variant::{
+    VARIANT, VARIANT_0, VARIANT_0_0, VARIANT_0_0_0, VT_EMPTY, VT_I4,
+};
 use windows::Win32::UI::TextServices::{
     CLSID_TF_CategoryMgr, GUID_PROP_ATTRIBUTE, IEnumTfDisplayAttributeInfo,
-    IEnumTfDisplayAttributeInfo_Impl, ITfContext, ITfDisplayAttributeInfo,
+    IEnumTfDisplayAttributeInfo_Impl, ITfCategoryMgr, ITfContext, ITfDisplayAttributeInfo,
     ITfDisplayAttributeInfo_Impl, ITfDisplayAttributeProvider, ITfDisplayAttributeProvider_Impl,
-    ITfRange, ITfCategoryMgr, TF_ATTR_INPUT, TF_CT_COLORREF, TF_CT_NONE, TF_DA_COLOR,
-    TF_DA_COLOR_0, TF_DISPLAYATTRIBUTE, TF_LS_DOT,
+    ITfRange, TF_ATTR_INPUT, TF_CT_COLORREF, TF_CT_NONE, TF_DA_COLOR, TF_DA_COLOR_0,
+    TF_DISPLAYATTRIBUTE, TF_LS_DOT,
 };
 use windows::core::{BSTR, GUID, Result, implement};
 
@@ -148,19 +150,20 @@ impl AttrEnum {
     }
 
     fn skip_items(&self, ulcount: u32) {
-        let next = self.index.load(Ordering::SeqCst).saturating_add(ulcount as usize);
+        let next = self
+            .index
+            .load(Ordering::SeqCst)
+            .saturating_add(ulcount as usize);
         self.index.store(next.min(1), Ordering::SeqCst);
     }
 }
 
 impl IEnumTfDisplayAttributeInfo_Impl for AttrEnum_Impl {
     fn Clone(&self) -> Result<IEnumTfDisplayAttributeInfo> {
-        Ok(
-            AttrEnum {
-                index: AtomicUsize::new(self.index.load(Ordering::SeqCst)),
-            }
-            .into(),
-        )
+        Ok(AttrEnum {
+            index: AtomicUsize::new(self.index.load(Ordering::SeqCst)),
+        }
+        .into())
     }
 
     fn Next(
@@ -233,8 +236,11 @@ pub fn ensure_atom() -> u32 {
     // SAFETY: 只读调用；CategoryMgr 是系统提供的 in-proc 单例
     let atom = unsafe {
         use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance};
-        match CoCreateInstance::<_, ITfCategoryMgr>(&CLSID_TF_CategoryMgr, None, CLSCTX_INPROC_SERVER)
-        {
+        match CoCreateInstance::<_, ITfCategoryMgr>(
+            &CLSID_TF_CategoryMgr,
+            None,
+            CLSCTX_INPROC_SERVER,
+        ) {
             Ok(mgr) => mgr.RegisterGUID(&GUID_INKLINK_ATTRIBUTE).unwrap_or(0),
             Err(_) => 0,
         }

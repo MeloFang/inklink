@@ -42,6 +42,7 @@ inklink/
 │  ├─ src/ipc.rs         命名管道客户端 + 引擎自动拉起
 │  ├─ src/pinyin.rs      402 音节表（贪心最长匹配；算分段上屏吃掉多少字母 + 组合串按音节显示的 `'`）
 │  ├─ src/state.rs       全局状态（注册表 HKCU\Software\inklink\State：中英、中文标点；UI 位置）
+│  ├─ src/config.rs      可调配置（HKCU\Software\inklink\Config：暗色/列数/行数/撤回窗口/学习开关）
 │  ├─ src/bar.rs         浮条（宿主进程内自绘，窗口类 inklink-bar；Activate→show、Deactivate→hide）
 │  ├─ src/menu.rs        自绘 ☰ 菜单（不用 TrackPopupMenu，见 ADR-0008）
 │  └─ build.rs           把 VERSION 编进 DLL
@@ -58,6 +59,7 @@ inklink/
 │  ├─ engine-pipe.ps1    命名管道客户端（诊断/验证，可 dot-source）
 │  ├─ probe-legacy-select.ps1  回归探针：老协议选词不会让引擎死锁
 │  ├─ draw-logo.py       几何重绘产品标记：输出 docs\brand\ink-mark.svg + installer\inklink.ico/png
+│  ├─ config.ps1         读写用户配置（HKCU\Software\inklink\Config，故意全 ASCII）
 │  └─ release.ps1        打 dist\inklink-<版本>.zip
 ├─ dist/                 发布产物（**不进 git**）
 ├─ docs/                 架构、ADR、阶段记录
@@ -107,7 +109,7 @@ powershell -ExecutionPolicy Bypass -File tools\release.ps1
 $env:PATH = "$env:USERPROFILE\.cargo\bin;$env:PATH"
 
 cd C:\dsh\work\inklink\tsf
-cargo test --release                       # 111 个单测（按键认领 / 标点 / 引号 / 拼音切分 / 音节分隔显示 / 分词边界 / 分段上屏 / 误选撤回 / 整句上报 / 候选窗摆放与点击 / 注入退格抑制 / 显示属性 / 全局状态缺省值 / 浮条与菜单布局 / 浮条创建显示绘制 / 浮条外观预览 / 标点符号的距离场内外 / 品牌标取哪一帧 / 浮条圆角抗锯齿 / 浮条可见性仲裁 / 标点横向错开）
+cargo test --release                       # 121 个单测（按键认领 / 标点 / 引号 / 拼音切分 / 音节分隔显示 / 分词边界 / 分段上屏 / 误选撤回 / 整句上报 / 候选窗摆放与点击 / 注入退格抑制 / 显示属性 / 全局状态缺省值 / 配置默认值与夹取 / 浮条与菜单布局 / 浮条创建显示绘制 / 浮条外观预览 / 标点符号的距离场内外 / 品牌标取哪一帧 / 浮条圆角抗锯齿 / 浮条可见性仲裁 / 标点横向错开 / 候选窗两套主题）
 cargo build --release --lib --target-dir target-static
 cargo build --release --lib --target i686-pc-windows-msvc --target-dir target-static
 ```

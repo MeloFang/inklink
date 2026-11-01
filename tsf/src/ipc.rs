@@ -67,7 +67,16 @@ unsafe fn read_exact_timeout(pipe: HANDLE, buf: &mut [u8], timeout_ms: u32) -> b
     while got < buf.len() {
         let mut avail: u32 = 0;
         // SAFETY: pipe 有效；只查可用字节数
-        let ok = unsafe { PeekNamedPipe(pipe, std::ptr::null_mut(), 0, std::ptr::null_mut(), &mut avail, std::ptr::null_mut()) };
+        let ok = unsafe {
+            PeekNamedPipe(
+                pipe,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                &mut avail,
+                std::ptr::null_mut(),
+            )
+        };
         if ok == 0 {
             return false;
         }
@@ -127,7 +136,7 @@ pub fn caret_screen_rect() -> Option<(i32, i32, i32)> {
 unsafe fn caret_via_gui_thread() -> Option<(i32, i32, i32)> {
     use windows_sys::Win32::Graphics::Gdi::ClientToScreen;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        GetForegroundWindow, GetGUIThreadInfo, GetWindowThreadProcessId, GUITHREADINFO,
+        GUITHREADINFO, GetForegroundWindow, GetGUIThreadInfo, GetWindowThreadProcessId,
     };
     let fg = GetForegroundWindow();
     if fg.is_null() {
@@ -536,7 +545,10 @@ pub fn press_backspace(times: usize) {
 }
 
 fn wide(s: &str) -> Vec<u16> {
-    OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
+    OsStr::new(s)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect()
 }
 
 unsafe fn write_all(pipe: HANDLE, buf: &[u8]) {

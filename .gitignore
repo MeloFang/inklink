@@ -82,3 +82,6 @@ msg.txt
 
 # Kiro 的本地规格目录（spec 文档留作参考，但不入库）
 /.kiro/
+
+# 候选窗预览图（`cargo test` 渲的 cand-preview-*.bmp 转出来的 PNG）
+/ui/cand-preview-*.png

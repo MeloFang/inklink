@@ -13,25 +13,26 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use windows::Win32::Foundation::{
     CLASS_E_NOAGGREGATION, E_NOINTERFACE, HINSTANCE, LPARAM, RECT, S_FALSE, S_OK, WPARAM,
 };
-use windows::core::BOOL;
 use windows::Win32::System::Com::{IClassFactory, IClassFactory_Impl};
 use windows::Win32::UI::TextServices::{
     IEnumTfDisplayAttributeInfo, ITfComposition, ITfCompositionSink, ITfCompositionSink_Impl,
     ITfContext, ITfContextComposition, ITfDisplayAttributeInfo, ITfDisplayAttributeProvider,
     ITfDisplayAttributeProvider_Impl, ITfEditSession, ITfEditSession_Impl, ITfKeyEventSink,
-    ITfKeyEventSink_Impl, ITfKeystrokeMgr, ITfRange, ITfRangeACP, ITfTextInputProcessorEx,
-    ITfTextInputProcessorEx_Impl, ITfTextInputProcessor_Impl, ITfThreadMgr, TF_ANCHOR_END,
+    ITfKeyEventSink_Impl, ITfKeystrokeMgr, ITfRange, ITfRangeACP, ITfTextInputProcessor_Impl,
+    ITfTextInputProcessorEx, ITfTextInputProcessorEx_Impl, ITfThreadMgr, TF_ANCHOR_END,
     TF_ANCHOR_START, TF_DEFAULT_SELECTION, TF_ES_ASYNC, TF_ES_READWRITE, TF_SELECTION,
 };
-mod ipc;
-mod candwin;
-mod display;
-mod state;
-mod pinyin;
+use windows::core::BOOL;
 mod bar;
+mod candwin;
+mod config;
+mod display;
+mod ipc;
 mod menu;
-use windows::core::{GUID, HRESULT, Interface, Ref, implement};
+mod pinyin;
+mod state;
 use windows::core::IUnknownImpl;
+use windows::core::{GUID, HRESULT, Interface, Ref, implement};
 
 /// 文本服务的 CLSID（固定值，注册表与代码必须一致）
 pub const CLSID_INKLINK_TSF: GUID = GUID::from_u128(0x8f2a6c1e_4b3d_4f7a_9a21_5c6d7e8f9a0b);
@@ -40,13 +41,24 @@ pub const GUID_PROFILE: GUID = GUID::from_u128(0x1b2c3d4e_5f60_4718_9a2b_3c4d5e6
 
 const DLL_DESC: &str = "inklink 输入法";
 
-/// 候选网格列数
-const GRID_COLS: usize = 5;
+/// 候选网格列数（P3 起可配置，默认 5）。
+///
+/// 每次现读注册表：一个 `RegOpenKeyExW` + 几个 `RegQueryValueExW` 是微秒级的，
+/// 换来的是"改配置立刻生效、不用重启宿主"。见 `config.rs` 顶部的理由。
+fn grid_cols() -> usize {
+    config::snapshot().cols
+}
 
-/// 候选窗收起时每页 5 个（1 行）
-const PAGE_SIZE_COLLAPSED: usize = 5;
-/// 展开时每页 25 个（5 行 × 5 列）
-const PAGE_SIZE_EXPANDED: usize = 25;
+/// 候选窗收起时每页几个（默认 5 = 一行）
+/// 展开时每页几个（默认 25 = 5 行 × 5 列）
+fn page_size(expanded: bool) -> usize {
+    let cfg = config::snapshot();
+    if expanded {
+        cfg.expanded()
+    } else {
+        cfg.collapsed()
+    }
+}
 
 /// 光标在屏幕上的位置：`(x, 顶边 y, 底边 y)`。
 ///
@@ -68,7 +80,9 @@ impl IClassFactory_Impl for ClassFactory_Impl {
         // SAFETY: 标准 COM 契约；ppv 由调用方保证可写
         unsafe {
             if ppv.is_null() {
-                return Err(windows::core::Error::from(windows::Win32::Foundation::E_POINTER));
+                return Err(windows::core::Error::from(
+                    windows::Win32::Foundation::E_POINTER,
+                ));
             }
             *ppv = core::ptr::null_mut();
             if !outer.is_null() {
@@ -290,7 +304,11 @@ impl TextService {
     /// 记的是不同的码（词码 vs 整串全拼），不会互相覆盖。
     ///
     /// 只选一次的不用报：那一次本身就已经按整串记下了（`picks >= 2` 是门槛）。
-    fn note_pick_for_sentence(&self, code_before: &str, action: &EditAction) -> Option<(String, String)> {
+    fn note_pick_for_sentence(
+        &self,
+        code_before: &str,
+        action: &EditAction,
+    ) -> Option<(String, String)> {
         let (word, finished) = match action {
             EditAction::Commit(w) => (w.clone(), true),
             EditAction::PickCompose(w, _) => (w.clone(), false),
@@ -342,36 +360,40 @@ impl TextService {
 /// 还要跟踪 range，出错就是挂死（见 1.0.1 的选词死锁）；数退格不需要任何
 /// 新接口，而且退格事件本来就由我们处理。
 ///
-/// 判据：上屏后 2 秒内连按 `word.chars().count()` 次退格 —— 中文里一个汉字
-/// 一次退格，正好等于把刚上屏的词删光。
+/// 判据：上屏后 2 秒内（P3 可配置）连按 `word.chars().count()` 次退格 —— 中文里
+/// 一个汉字一次退格，正好等于把刚上屏的词删光。
 struct CommitMark {
     code: String,
     word: String,
     remaining: usize,
     deadline: std::time::Instant,
+    /// 这次的窗口多长。每按一次退格都会顺延，所以得记住原值。
+    window: std::time::Duration,
 }
 
 impl CommitMark {
-    /// 多久之内删掉才算"选错了"。太短来不及反悔，太长容易把正常编辑算进来。
-    const WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
-
+    /// 建一个"可能选错了"的记账。
+    ///
+    /// 返回 `None` 有两种原因：词是空的；或者用户把撤回窗口配成了 0（关掉撤回）。
     fn new(code: String, word: String) -> Option<Self> {
         let remaining = word.chars().count();
         if remaining == 0 {
             return None;
         }
+        let window = crate::config::snapshot().undo_window()?;
         Some(Self {
             code,
             word,
             remaining,
-            deadline: std::time::Instant::now() + Self::WINDOW,
+            deadline: std::time::Instant::now() + window,
+            window,
         })
     }
 
     /// 记一次退格。删光了返回 `(code, word)`，该撤回学习。
     fn on_backspace(&mut self) -> Option<(String, String)> {
         self.remaining = self.remaining.saturating_sub(1);
-        self.deadline = std::time::Instant::now() + Self::WINDOW;
+        self.deadline = std::time::Instant::now() + self.window;
         if self.remaining == 0 {
             Some((self.code.clone(), self.word.clone()))
         } else {
@@ -488,11 +510,27 @@ impl ITfTextInputProcessor_Impl for TextService_Impl {
         log_line("deactivate");
         bar::hide();
         // 切换输入法/焦点时清空状态，否则缓冲会跨会话累积
-        self.inner.buffer.lock().unwrap_or_else(|p| p.into_inner()).clear();
-        self.inner.cands.lock().unwrap_or_else(|p| p.into_inner()).clear();
-        *self.inner.matched_len.lock().unwrap_or_else(|p| p.into_inner()) = 0;
+        self.inner
+            .buffer
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear();
+        self.inner
+            .cands
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear();
+        *self
+            .inner
+            .matched_len
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = 0;
         *self.inner.context.lock().unwrap_or_else(|p| p.into_inner()) = None;
-        *self.inner.composition.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        *self
+            .inner
+            .composition
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = None;
         *self.inner.pending.lock().unwrap_or_else(|p| p.into_inner()) = None;
         *self.inner.cursor.lock().unwrap_or_else(|p| p.into_inner()) = 0;
         candwin::hide();
@@ -623,7 +661,11 @@ impl TextService_Impl {
         }
         if let Some((code, text)) = self.note_pick_for_sentence(code_before, &action) {
             log_line(&format!("learn-sentence code={code} text={text}"));
-            ipc::select(0, &code, &text);
+            if crate::config::snapshot().learn {
+                ipc::select(0, &code, &text);
+            } else {
+                log_line("learn-sentence skipped (learn off)");
+            }
             // 整句也记一条"可能被撤回"的账：删掉最后那个词只撤回那个词，
             // 一直删到整句都没了，这一条才触发。
             self.mark_sentence(&code, &text);
@@ -643,11 +685,23 @@ impl TextService_Impl {
         }
         let mut cands = self.inner.cands.lock().unwrap_or_else(|p| p.into_inner());
         let mut cursor = self.inner.cursor.lock().unwrap_or_else(|p| p.into_inner());
-        let mut matched_len = self.inner.matched_len.lock().unwrap_or_else(|p| p.into_inner());
+        let mut matched_len = self
+            .inner
+            .matched_len
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let mut page = self.inner.page.lock().unwrap_or_else(|p| p.into_inner());
-        let mut expanded = self.inner.expanded.lock().unwrap_or_else(|p| p.into_inner());
+        let mut expanded = self
+            .inner
+            .expanded
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let mut sel = self.inner.sel.lock().unwrap_or_else(|p| p.into_inner());
-        let pos = *self.inner.last_pos.lock().unwrap_or_else(|p| p.into_inner());
+        let pos = *self
+            .inner
+            .last_pos
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let code_before = buffer.clone();
         let pick_idx = *page * page_size(*expanded) + index;
         match apply_pick(
@@ -676,7 +730,13 @@ impl TextService_Impl {
         if tid == 0 {
             return;
         }
-        if let Some(ctx) = self.inner.context.lock().unwrap_or_else(|p| p.into_inner()).clone() {
+        if let Some(ctx) = self
+            .inner
+            .context
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+        {
             let sink: ITfEditSession = self.to_interface();
             // SAFETY: 标准 TSF 编辑会话请求，sink 生命周期由 COM 引用计数管理
             let _ = unsafe { ctx.RequestEditSession(tid, &sink, TF_ES_ASYNC | TF_ES_READWRITE) };
@@ -731,11 +791,24 @@ impl TextService_Impl {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clone();
-        let cands = self.inner.cands.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        let cands = self
+            .inner
+            .cands
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
         let page = *self.inner.page.lock().unwrap_or_else(|p| p.into_inner());
-        let expanded = *self.inner.expanded.lock().unwrap_or_else(|p| p.into_inner());
+        let expanded = *self
+            .inner
+            .expanded
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let sel = *self.inner.sel.lock().unwrap_or_else(|p| p.into_inner());
-        let pos = *self.inner.last_pos.lock().unwrap_or_else(|p| p.into_inner());
+        let pos = *self
+            .inner
+            .last_pos
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         show_cand_window(&pinyin, &cands, page, expanded, sel, pos);
     }
 
@@ -837,7 +910,11 @@ impl ITfEditSession_Impl for TextService_Impl {
                     self.place_caret(&ctx, ec, &range, cursor)?;
                     // 用 TSF 的 GetTextExt 问应用"我这段在屏幕哪"（和搜狗同款）
                     let pos = text_ext_pos(&ctx, ec, &range);
-                    *self.inner.last_pos.lock().unwrap_or_else(|p| p.into_inner()) = pos;
+                    *self
+                        .inner
+                        .last_pos
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner()) = pos;
                     self.refresh_cand_window();
                     // 写回（短锁，不跨越 TSF 调用）
                     *self
@@ -934,7 +1011,11 @@ impl ITfEditSession_Impl for TextService_Impl {
                 display::mark(&ctx, ec, &range);
                 self.place_caret(&ctx, ec, &range, rest_cursor)?;
                 let pos = text_ext_pos(&ctx, ec, &range);
-                *self.inner.last_pos.lock().unwrap_or_else(|p| p.into_inner()) = pos;
+                *self
+                    .inner
+                    .last_pos
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner()) = pos;
                 self.refresh_cand_window();
                 *self
                     .inner
@@ -974,7 +1055,9 @@ impl ITfEditSession_Impl for TextService_Impl {
                 let digit = preceding_char_is_digit(&ctx, ec);
                 let text = if digit { half } else { full };
                 let why = insert_at_caret(&ctx, ec, &text);
-                log_line(&format!("insert-punct '{text}' digit_before={digit} -> {why}"));
+                log_line(&format!(
+                    "insert-punct '{text}' digit_before={digit} -> {why}"
+                ));
                 if why != "ok" {
                     ipc::send_text(&text);
                 }
@@ -1036,7 +1119,8 @@ impl ITfEditSession_Impl for TextService_Impl {
                                         let (from, len) = if cch > 0 {
                                             (anchor, cch)
                                         } else {
-                                            let from = if anchor - want < 0 { 0 } else { anchor - want };
+                                            let from =
+                                                if anchor - want < 0 { 0 } else { anchor - want };
                                             (from, anchor - from)
                                         };
                                         if len <= 0 {
@@ -1067,7 +1151,9 @@ impl ITfEditSession_Impl for TextService_Impl {
                                             .is_ok()
                                         && shifted != 0;
                                     if moved && range.SetText(ec, 0, &[]).is_ok() {
-                                        log_line(&format!("delete-back shiftstart shifted={shifted}"));
+                                        log_line(&format!(
+                                            "delete-back shiftstart shifted={shifted}"
+                                        ));
                                         done = true;
                                         why = "ok (shiftstart)";
                                     } else {
@@ -1133,11 +1219,19 @@ impl ITfCompositionSink_Impl for TextService_Impl {
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .clear();
-            *self.inner.matched_len.lock().unwrap_or_else(|p| p.into_inner()) = 0;
+            *self
+                .inner
+                .matched_len
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = 0;
             *self.inner.cursor.lock().unwrap_or_else(|p| p.into_inner()) = 0;
             *self.inner.sel.lock().unwrap_or_else(|p| p.into_inner()) = 0;
             *self.inner.page.lock().unwrap_or_else(|p| p.into_inner()) = 0;
-            *self.inner.expanded.lock().unwrap_or_else(|p| p.into_inner()) = false;
+            *self
+                .inner
+                .expanded
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = false;
             candwin::hide();
             self.sentence_clear();
         }
@@ -1165,11 +1259,19 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .clear();
-            *self.inner.matched_len.lock().unwrap_or_else(|p| p.into_inner()) = 0;
+            *self
+                .inner
+                .matched_len
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = 0;
             *self.inner.cursor.lock().unwrap_or_else(|p| p.into_inner()) = 0;
             *self.inner.sel.lock().unwrap_or_else(|p| p.into_inner()) = 0;
             *self.inner.page.lock().unwrap_or_else(|p| p.into_inner()) = 0;
-            *self.inner.expanded.lock().unwrap_or_else(|p| p.into_inner()) = false;
+            *self
+                .inner
+                .expanded
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = false;
             candwin::hide();
             self.sentence_clear();
         }
@@ -1197,7 +1299,12 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
         if is_shift_chord(vk, shift_held(), ctrl_alt_win_held()) {
             self.inner.shift_used.store(true, Ordering::SeqCst);
         }
-        let composing = !self.inner.buffer.lock().unwrap_or_else(|p| p.into_inner()).is_empty();
+        let composing = !self
+            .inner
+            .buffer
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_empty();
         // 刚上屏、可能被撤回的词，要先把退格抢过来数一下
         let undo = !composing && self.undo_pending();
         // 全局状态（注册表）：中英模式 + 中文标点开关，所有应用一致。
@@ -1270,7 +1377,12 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
         // 之前的表现是"按两下没反应，第三下才删掉"。窗口之外的退格不认领、
         // 也不经这里，应用照常自己删。
         if vk == VK_BACK {
-            let composing = !self.inner.buffer.lock().unwrap_or_else(|p| p.into_inner()).is_empty();
+            let composing = !self
+                .inner
+                .buffer
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_empty();
             if !composing {
                 let had_mark = self.undo_pending();
                 for (code, word) in self.count_backspace() {
@@ -1344,7 +1456,11 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
             // 收起时 `-` 才是拼音分词符。展开态是临时的导航态（打字会收起），
             // 所以按 `-` 只可能是在翻候选。
             let is_expanded = {
-                let e = self.inner.expanded.lock().unwrap_or_else(|p| p.into_inner());
+                let e = self
+                    .inner
+                    .expanded
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
                 *e
             };
             let sep = if is_expanded {
@@ -1359,11 +1475,18 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
             if let Some(sep) = sep {
                 let mut buffer = self.inner.buffer.lock().unwrap_or_else(|p| p.into_inner());
                 let mut cands = self.inner.cands.lock().unwrap_or_else(|p| p.into_inner());
-                let mut matched_len =
-                    self.inner.matched_len.lock().unwrap_or_else(|p| p.into_inner());
+                let mut matched_len = self
+                    .inner
+                    .matched_len
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
                 let mut cursor = self.inner.cursor.lock().unwrap_or_else(|p| p.into_inner());
                 let mut page = self.inner.page.lock().unwrap_or_else(|p| p.into_inner());
-                let mut expanded = self.inner.expanded.lock().unwrap_or_else(|p| p.into_inner());
+                let mut expanded = self
+                    .inner
+                    .expanded
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
                 let mut sel = self.inner.sel.lock().unwrap_or_else(|p| p.into_inner());
                 let at = (*cursor).min(buffer.len());
                 buffer.insert(at, sep);
@@ -1384,7 +1507,11 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                     *page,
                     *expanded,
                     *sel,
-                    *self.inner.last_pos.lock().unwrap_or_else(|p| p.into_inner()),
+                    *self
+                        .inner
+                        .last_pos
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner()),
                 );
                 self.request_edit(EditAction::Compose(buffer.clone(), *cursor));
                 return Ok(BOOL(1));
@@ -1411,14 +1538,22 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                     }
                     if composing_now {
                         // 先上屏候选，再跟上标点
-                        let mut buffer = self.inner.buffer.lock().unwrap_or_else(|p| p.into_inner());
+                        let mut buffer =
+                            self.inner.buffer.lock().unwrap_or_else(|p| p.into_inner());
                         let mut cands = self.inner.cands.lock().unwrap_or_else(|p| p.into_inner());
-                        let mut matched_len =
-                            self.inner.matched_len.lock().unwrap_or_else(|p| p.into_inner());
-                        let mut cursor = self.inner.cursor.lock().unwrap_or_else(|p| p.into_inner());
+                        let mut matched_len = self
+                            .inner
+                            .matched_len
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner());
+                        let mut cursor =
+                            self.inner.cursor.lock().unwrap_or_else(|p| p.into_inner());
                         let mut page = self.inner.page.lock().unwrap_or_else(|p| p.into_inner());
-                        let mut expanded =
-                            self.inner.expanded.lock().unwrap_or_else(|p| p.into_inner());
+                        let mut expanded = self
+                            .inner
+                            .expanded
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner());
                         let mut sel = self.inner.sel.lock().unwrap_or_else(|p| p.into_inner());
                         let idx = *page * page_size(*expanded) + *sel;
                         let head = cands.get(idx).cloned().unwrap_or_default();
@@ -1433,7 +1568,7 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                         *sel = 0;
                         candwin::hide();
                         log_line(&format!("punct-in-compose vk={vk:#x} -> {text}"));
-                        if !head.is_empty() {
+                        if !head.is_empty() && crate::config::snapshot().learn {
                             ipc::select(idx, &code, &head);
                         }
                         self.request_edit(EditAction::Commit(text));
@@ -1461,10 +1596,18 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
 
         let mut buffer = self.inner.buffer.lock().unwrap_or_else(|p| p.into_inner());
         let mut cands = self.inner.cands.lock().unwrap_or_else(|p| p.into_inner());
-        let mut matched_len = self.inner.matched_len.lock().unwrap_or_else(|p| p.into_inner());
+        let mut matched_len = self
+            .inner
+            .matched_len
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let mut cursor = self.inner.cursor.lock().unwrap_or_else(|p| p.into_inner());
         let mut page = self.inner.page.lock().unwrap_or_else(|p| p.into_inner());
-        let mut expanded = self.inner.expanded.lock().unwrap_or_else(|p| p.into_inner());
+        let mut expanded = self
+            .inner
+            .expanded
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let mut sel = self.inner.sel.lock().unwrap_or_else(|p| p.into_inner());
         let composing = !buffer.is_empty();
 
@@ -1505,7 +1648,18 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                     shift_held()
                 ));
                 // 显示候选窗
-                show_cand_window(&buffer, &cands, *page, *expanded, *sel, *self.inner.last_pos.lock().unwrap_or_else(|p| p.into_inner()));
+                show_cand_window(
+                    &buffer,
+                    &cands,
+                    *page,
+                    *expanded,
+                    *sel,
+                    *self
+                        .inner
+                        .last_pos
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner()),
+                );
                 // 把拼音写到文档里（组合串）
                 self.request_edit(EditAction::Compose(buffer.clone(), *cursor));
                 Ok(BOOL(1))
@@ -1525,7 +1679,18 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                         self.sentence_clear();
                         self.request_edit(EditAction::Cancel);
                     } else {
-                        show_cand_window(&buffer, &cands, *page, *expanded, *sel, *self.inner.last_pos.lock().unwrap_or_else(|p| p.into_inner()));
+                        show_cand_window(
+                            &buffer,
+                            &cands,
+                            *page,
+                            *expanded,
+                            *sel,
+                            *self
+                                .inner
+                                .last_pos
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner()),
+                        );
                         self.request_edit(compose_action(&buffer, *cursor));
                     }
                     Ok(BOOL(1))
@@ -1547,7 +1712,18 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                         self.sentence_clear();
                         self.request_edit(EditAction::Cancel);
                     } else {
-                        show_cand_window(&buffer, &cands, *page, *expanded, *sel, *self.inner.last_pos.lock().unwrap_or_else(|p| p.into_inner()));
+                        show_cand_window(
+                            &buffer,
+                            &cands,
+                            *page,
+                            *expanded,
+                            *sel,
+                            *self
+                                .inner
+                                .last_pos
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner()),
+                        );
                         self.request_edit(compose_action(&buffer, *cursor));
                     }
                     Ok(BOOL(1))
@@ -1560,7 +1736,7 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                 if composing {
                     if *expanded {
                         let size = page_size(true);
-                        if *sel % GRID_COLS > 0 {
+                        if *sel % grid_cols() > 0 {
                             *sel -= 1;
                         } else if *page > 0 {
                             *page -= 1;
@@ -1568,7 +1744,18 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                             let page_len = cands.len().saturating_sub(page_start).min(size);
                             *sel = page_len.saturating_sub(1);
                         }
-                        show_cand_window(&buffer, &cands, *page, *expanded, *sel, *self.inner.last_pos.lock().unwrap_or_else(|p| p.into_inner()));
+                        show_cand_window(
+                            &buffer,
+                            &cands,
+                            *page,
+                            *expanded,
+                            *sel,
+                            *self
+                                .inner
+                                .last_pos
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner()),
+                        );
                     } else if *cursor > 0 {
                         *cursor -= 1;
                         self.request_edit(EditAction::MoveCaret(*cursor));
@@ -1586,13 +1773,24 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                         let page_start = *page * size;
                         let page_len = cands.len().saturating_sub(page_start).min(size);
                         let total_pages = (cands.len() + size - 1) / size;
-                        if *sel % GRID_COLS < GRID_COLS - 1 && *sel + 1 < page_len {
+                        if *sel % grid_cols() < grid_cols() - 1 && *sel + 1 < page_len {
                             *sel += 1;
                         } else if *page + 1 < total_pages {
                             *page += 1;
                             *sel = 0;
                         }
-                        show_cand_window(&buffer, &cands, *page, *expanded, *sel, *self.inner.last_pos.lock().unwrap_or_else(|p| p.into_inner()));
+                        show_cand_window(
+                            &buffer,
+                            &cands,
+                            *page,
+                            *expanded,
+                            *sel,
+                            *self
+                                .inner
+                                .last_pos
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner()),
+                        );
                     } else {
                         let len = buffer.len();
                         if *cursor < len {
@@ -1629,15 +1827,26 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                 if composing {
                     if *expanded {
                         let size = page_size(true);
-                        if *sel >= GRID_COLS {
-                            *sel -= GRID_COLS;
+                        if *sel >= grid_cols() {
+                            *sel -= grid_cols();
                         } else if *page > 0 {
                             *page -= 1;
                             let page_start = *page * size;
                             let page_len = cands.len().saturating_sub(page_start).min(size);
                             *sel = page_len.saturating_sub(1);
                         }
-                        show_cand_window(&buffer, &cands, *page, *expanded, *sel, *self.inner.last_pos.lock().unwrap_or_else(|p| p.into_inner()));
+                        show_cand_window(
+                            &buffer,
+                            &cands,
+                            *page,
+                            *expanded,
+                            *sel,
+                            *self
+                                .inner
+                                .last_pos
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner()),
+                        );
                     }
                     Ok(BOOL(1))
                 } else {
@@ -1656,14 +1865,25 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                         let page_start = *page * size;
                         let page_len = cands.len().saturating_sub(page_start).min(size);
                         let total_pages = (cands.len() + size - 1) / size;
-                        if *sel + GRID_COLS < page_len {
-                            *sel += GRID_COLS;
+                        if *sel + grid_cols() < page_len {
+                            *sel += grid_cols();
                         } else if *page + 1 < total_pages {
                             *page += 1;
                             *sel = 0;
                         }
                     }
-                    show_cand_window(&buffer, &cands, *page, *expanded, *sel, *self.inner.last_pos.lock().unwrap_or_else(|p| p.into_inner()));
+                    show_cand_window(
+                        &buffer,
+                        &cands,
+                        *page,
+                        *expanded,
+                        *sel,
+                        *self
+                            .inner
+                            .last_pos
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner()),
+                    );
                     Ok(BOOL(1))
                 } else {
                     Ok(BOOL(0))
@@ -1683,7 +1903,18 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                         *page -= 1;
                     }
                     *sel = 0;
-                    show_cand_window(&buffer, &cands, *page, *expanded, *sel, *self.inner.last_pos.lock().unwrap_or_else(|p| p.into_inner()));
+                    show_cand_window(
+                        &buffer,
+                        &cands,
+                        *page,
+                        *expanded,
+                        *sel,
+                        *self
+                            .inner
+                            .last_pos
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner()),
+                    );
                     Ok(BOOL(1))
                 } else {
                     Ok(BOOL(0))
@@ -1703,7 +1934,18 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                         }
                     }
                     *sel = 0;
-                    show_cand_window(&buffer, &cands, *page, *expanded, *sel, *self.inner.last_pos.lock().unwrap_or_else(|p| p.into_inner()));
+                    show_cand_window(
+                        &buffer,
+                        &cands,
+                        *page,
+                        *expanded,
+                        *sel,
+                        *self
+                            .inner
+                            .last_pos
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner()),
+                    );
                     Ok(BOOL(1))
                 } else {
                     Ok(BOOL(0))
@@ -1712,7 +1954,11 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
             // 空格：上屏当前选中的候选（选完可能还剩拼音，留给 apply_pick 判断）
             VK_SPACE => {
                 let pick_idx = *page * page_size(*expanded) + *sel;
-                let pos = *self.inner.last_pos.lock().unwrap_or_else(|p| p.into_inner());
+                let pos = *self
+                    .inner
+                    .last_pos
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
                 let code_before = buffer.clone();
                 match apply_pick(
                     pick_idx,
@@ -1782,9 +2028,9 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                     return Ok(BOOL(0));
                 }
                 let idx = (vk - VK_0) as usize;
-                if idx >= 1 && idx <= GRID_COLS {
-                    let row = *sel / GRID_COLS;
-                    let local = row * GRID_COLS + (idx - 1);
+                if idx >= 1 && idx <= grid_cols() {
+                    let row = *sel / grid_cols();
+                    let local = row * grid_cols() + (idx - 1);
                     let page_len = cands
                         .len()
                         .saturating_sub(*page * page_size(*expanded))
@@ -1792,7 +2038,11 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                     if local < page_len {
                         *sel = local;
                         let global = *page * page_size(*expanded) + local;
-                        let pos = *self.inner.last_pos.lock().unwrap_or_else(|p| p.into_inner());
+                        let pos = *self
+                            .inner
+                            .last_pos
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner());
                         let code_before = buffer.clone();
                         if let Some(action) = apply_pick(
                             global,
@@ -1879,11 +2129,19 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                         .lock()
                         .unwrap_or_else(|p| p.into_inner())
                         .clear();
-                    *self.inner.matched_len.lock().unwrap_or_else(|p| p.into_inner()) = 0;
+                    *self
+                        .inner
+                        .matched_len
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner()) = 0;
                     *self.inner.cursor.lock().unwrap_or_else(|p| p.into_inner()) = 0;
                     *self.inner.sel.lock().unwrap_or_else(|p| p.into_inner()) = 0;
                     *self.inner.page.lock().unwrap_or_else(|p| p.into_inner()) = 0;
-                    *self.inner.expanded.lock().unwrap_or_else(|p| p.into_inner()) = false;
+                    *self
+                        .inner
+                        .expanded
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner()) = false;
                     candwin::hide();
                     // 打了一串不像拼音的东西、用 Shift 把它原样上屏：这时候意图就是打英文，
                     // 顺手把全局模式切成英文（搜狗也是这个行为）。
@@ -2018,15 +2276,6 @@ fn is_shift_chord(vk: u32, shift: bool, ctrl_alt_win: bool) -> bool {
     vk != VK_SHIFT_ONLY && shift && !ctrl_alt_win
 }
 
-/// 当前每页候选数：收起 5，展开 25。
-fn page_size(expanded: bool) -> usize {
-    if expanded {
-        PAGE_SIZE_EXPANDED
-    } else {
-        PAGE_SIZE_COLLAPSED
-    }
-}
-
 /// 显示候选窗。
 ///
 /// 位置优先级：`pos`（TSF GetTextExt 拿到的精确坐标，和搜狗同款）→ 光标/鼠标兜底。
@@ -2123,7 +2372,10 @@ fn preceding_char_is_digit(ctx: &ITfContext, ec: u32) -> bool {
     unsafe {
         let mut sel = [TF_SELECTION::default()];
         let mut fetched = 0u32;
-        if ctx.GetSelection(ec, TF_DEFAULT_SELECTION, &mut sel, &mut fetched).is_err() {
+        if ctx
+            .GetSelection(ec, TF_DEFAULT_SELECTION, &mut sel, &mut fetched)
+            .is_err()
+        {
             return false;
         }
         let Some(range) = sel[0].range.as_ref() else {
@@ -2139,7 +2391,11 @@ fn preceding_char_is_digit(ctx: &ITfContext, ec: u32) -> bool {
             return false;
         }
         let mut shifted = 0i32;
-        if range.ShiftStart(ec, -1, &mut shifted, std::ptr::null()).is_err() || shifted == 0 {
+        if range
+            .ShiftStart(ec, -1, &mut shifted, std::ptr::null())
+            .is_err()
+            || shifted == 0
+        {
             return false;
         }
         let mut buf = [0u16; 2];
@@ -2220,7 +2476,8 @@ fn consumed_index(raw: &str, letters: usize) -> usize {
 
 /// 这串拼音里还有没有元音？没有（`x`、`ng`）就是打错的辅音，可以直接丢掉。
 fn has_vowel(s: &str) -> bool {
-    s.chars().any(|c| matches!(c, 'a' | 'e' | 'i' | 'o' | 'u' | 'v'))
+    s.chars()
+        .any(|c| matches!(c, 'a' | 'e' | 'i' | 'o' | 'u' | 'v'))
 }
 
 /// 选中第 `pick_idx` 个候选之后怎么收场，返回要执行的编辑动作。
@@ -2249,7 +2506,10 @@ fn apply_pick(
     // 上报选词，让引擎记进个人词库（失败不影响上屏）。
     // 带上 buffer（当时的完整拼音）和 pick（选中的词）：引擎按选中的字数
     // 反推该记在哪个拼音串下，分段上屏时才不会把 `皮` 记成 `pikeqiu`。
-    ipc::select(pick_idx, buffer, &pick);
+    // P3 起可以整体关掉学习（`Config\Learn=0`）：那就不发这条消息，纯查询。
+    if crate::config::snapshot().learn {
+        ipc::select(pick_idx, buffer, &pick);
+    }
 
     let stripped = strip_separators(buffer);
     let chars = pick.chars().count();
@@ -2515,11 +2775,12 @@ fn log_line(msg: &str) {
     static LOG_LOCK: Mutex<()> = Mutex::new(());
     let _guard = LOG_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     // 固定写到 Public：所有用户可写，且比 %TEMP% 更容易找到。
-    let path = format!(
-        "C:\\Users\\Public\\inklink-tsf-{}.log",
-        std::process::id()
-    );
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+    let path = format!("C:\\Users\\Public\\inklink-tsf-{}.log", std::process::id());
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
         let _ = writeln!(f, "{msg}");
     }
 }
@@ -2553,10 +2814,10 @@ pub unsafe extern "system" fn DllGetClassObject(
             return CLASS_E_NOAGGREGATION;
         }
         let factory: IClassFactory = ClassFactory.into();
-        factory.query(riid, ppv).ok().map_or_else(
-            |_| E_NOINTERFACE,
-            |_| S_OK,
-        )
+        factory
+            .query(riid, ppv)
+            .ok()
+            .map_or_else(|_| E_NOINTERFACE, |_| S_OK)
     }
 }
 
@@ -2580,7 +2841,11 @@ pub extern "system" fn DllUnregisterServer() -> HRESULT {
 
 /// 供 `regsvr32` 使用的 DLL 句柄占位（部分注册工具会查询）。
 #[unsafe(no_mangle)]
-pub extern "system" fn DllMain(_inst: HINSTANCE, _reason: u32, _reserved: *mut core::ffi::c_void) -> BOOL {
+pub extern "system" fn DllMain(
+    _inst: HINSTANCE,
+    _reason: u32,
+    _reserved: *mut core::ffi::c_void,
+) -> BOOL {
     // 什么都不做：DllMain 里做事是死锁与崩溃的常见来源
     BOOL(1)
 }
@@ -2593,8 +2858,8 @@ mod registry {
     use std::os::windows::ffi::OsStrExt;
     use windows::Win32::Foundation::{ERROR_SUCCESS, WIN32_ERROR};
     use windows::Win32::System::Registry::{
-        HKEY, HKEY_CLASSES_ROOT, HKEY_LOCAL_MACHINE, KEY_WRITE, REG_OPTION_NON_VOLATILE,
-        REG_SZ, RegCloseKey, RegCreateKeyExW, RegDeleteTreeW, RegSetValueExW,
+        HKEY, HKEY_CLASSES_ROOT, HKEY_LOCAL_MACHINE, KEY_WRITE, REG_OPTION_NON_VOLATILE, REG_SZ,
+        RegCloseKey, RegCreateKeyExW, RegDeleteTreeW, RegSetValueExW,
     };
 
     type Result<T> = core::result::Result<T, WIN32_ERROR>;
@@ -2608,9 +2873,8 @@ mod registry {
 
     fn set_sz(hkey: HKEY, name: &str, value: &str) -> Result<()> {
         let data = wide(value);
-        let bytes = unsafe {
-            core::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 2)
-        };
+        let bytes =
+            unsafe { core::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 2) };
         let name_w = wide(name);
         let rc = unsafe {
             RegSetValueExW(
@@ -2640,7 +2904,11 @@ mod registry {
                 None,
             )
         };
-        if rc == ERROR_SUCCESS { Ok(hkey) } else { Err(rc) }
+        if rc == ERROR_SUCCESS {
+            Ok(hkey)
+        } else {
+            Err(rc)
+        }
     }
 
     fn close(hkey: HKEY) {
@@ -2656,7 +2924,7 @@ mod registry {
     /// 当前 DLL 路径
     pub(crate) fn dll_path() -> String {
         use windows::Win32::System::LibraryLoader::{
-            GetModuleFileNameW, GetModuleHandleExW, GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GetModuleFileNameW, GetModuleHandleExW,
         };
         let mut buf = [0u16; 1024];
         unsafe {
@@ -2724,8 +2992,9 @@ mod registry {
             CoUninitialize,
         };
         use windows::Win32::UI::TextServices::{
-            CLSID_TF_CategoryMgr, CLSID_TF_InputProcessorProfiles, GUID_TFCAT_DISPLAYATTRIBUTEPROVIDER,
-            GUID_TFCAT_TIP_KEYBOARD, ITfCategoryMgr, ITfInputProcessorProfiles,
+            CLSID_TF_CategoryMgr, CLSID_TF_InputProcessorProfiles,
+            GUID_TFCAT_DISPLAYATTRIBUTEPROVIDER, GUID_TFCAT_TIP_KEYBOARD, ITfCategoryMgr,
+            ITfInputProcessorProfiles,
         };
 
         const LANG_ZH_CN: u16 = 0x0804;
@@ -2831,8 +3100,14 @@ mod registry {
                 None,
                 CLSCTX_INPROC_SERVER,
             ) {
-                let _ = profiles.EnableLanguageProfile(&CLSID_INKLINK_TSF, LANG_ZH_CN, &GUID_PROFILE, false);
-                let _ = profiles.RemoveLanguageProfile(&CLSID_INKLINK_TSF, LANG_ZH_CN, &GUID_PROFILE);
+                let _ = profiles.EnableLanguageProfile(
+                    &CLSID_INKLINK_TSF,
+                    LANG_ZH_CN,
+                    &GUID_PROFILE,
+                    false,
+                );
+                let _ =
+                    profiles.RemoveLanguageProfile(&CLSID_INKLINK_TSF, LANG_ZH_CN, &GUID_PROFILE);
                 let _ = profiles.Unregister(&CLSID_INKLINK_TSF);
                 drop(profiles);
             }
@@ -2870,7 +3145,10 @@ mod tests {
     fn 上屏后连按退格删光才算误选() {
         let mut mark =
             CommitMark::new("xiangmu".to_string(), "项目".to_string()).expect("两个字应该被跟踪");
-        assert!(mark.on_backspace().is_none(), "只删一个字还不够，可能是在改后面的内容");
+        assert!(
+            mark.on_backspace().is_none(),
+            "只删一个字还不够，可能是在改后面的内容"
+        );
         assert_eq!(
             mark.on_backspace(),
             Some(("xiangmu".to_string(), "项目".to_string())),
@@ -2880,7 +3158,10 @@ mod tests {
 
     #[test]
     fn 空词和单个标点不做误选判断() {
-        assert!(CommitMark::new("x".to_string(), String::new()).is_none(), "空词不该跟踪");
+        assert!(
+            CommitMark::new("x".to_string(), String::new()).is_none(),
+            "空词不该跟踪"
+        );
         let mut one = CommitMark::new("de".to_string(), "的".to_string()).expect("一个字也能跟踪");
         assert_eq!(
             one.on_backspace(),
@@ -2952,8 +3233,14 @@ mod tests {
     #[test]
     fn 空闲时带_shift_或_capslock_的字母不认领() {
         // 这是大写/英文的入口：必须放行给应用
-        assert!(!should_claim(VK_A_KEY, false, true, false, false), "Shift 按住应放行");
-        assert!(!should_claim(VK_A_KEY, false, false, true, false), "CapsLock 开着应放行");
+        assert!(
+            !should_claim(VK_A_KEY, false, true, false, false),
+            "Shift 按住应放行"
+        );
+        assert!(
+            !should_claim(VK_A_KEY, false, false, true, false),
+            "CapsLock 开着应放行"
+        );
     }
 
     #[test]
@@ -2962,7 +3249,10 @@ mod tests {
         assert!(!should_claim(VK_RETURN_KEY, false, false, false, false));
         assert!(!should_claim(VK_TAB_KEY, false, false, false, false));
         assert!(!should_claim(VK_LEFT_KEY, false, false, false, false));
-        assert!(should_claim(VK_OEM_5, false, false, false, false), "标点键必须认领，否则不调 OnKeyDown");
+        assert!(
+            should_claim(VK_OEM_5, false, false, false, false),
+            "标点键必须认领，否则不调 OnKeyDown"
+        );
     }
 
     #[test]
@@ -3163,24 +3453,45 @@ mod punct_claim_tests {
         // 微信这类应用：OnTestKeyDown 返回 false 就不调 OnKeyDown
         assert!(should_claim(VK_OEM_5, false, false, false, false), "反斜杠");
         assert!(should_claim(VK_SLASH, false, false, false, false), "斜杠");
-        assert!(should_claim(VK_OEM_COMMA, false, false, false, false), "逗号");
-        assert!(should_claim(VK_OEM_PERIOD, false, false, false, false), "句号");
+        assert!(
+            should_claim(VK_OEM_COMMA, false, false, false, false),
+            "逗号"
+        );
+        assert!(
+            should_claim(VK_OEM_PERIOD, false, false, false, false),
+            "句号"
+        );
     }
 
     #[test]
     fn 标点带_shift_也要认领() {
         // Shift+/ 要出 ？，必须认领后才能转换
         assert!(should_claim(VK_SLASH, false, true, false, false));
-        assert!(should_claim(VK_OEM_1, false, true, false, false), "Shift+; 要出 ：");
+        assert!(
+            should_claim(VK_OEM_1, false, true, false, false),
+            "Shift+; 要出 ："
+        );
     }
 
     #[test]
     fn 括号和引号必须认领() {
         // 不认领就等于漏给应用，用户看到的还是半角 ( ) 和英文引号
-        assert!(should_claim(VK_9, false, true, false, false), "Shift+9 要出 （");
-        assert!(should_claim(VK_0, false, true, false, false), "Shift+0 要出 ）");
-        assert!(should_claim(VK_OEM_7, false, true, false, false), "Shift+' 要出 “");
-        assert!(should_claim(VK_OEM_7, false, false, false, false), "' 要出 ‘");
+        assert!(
+            should_claim(VK_9, false, true, false, false),
+            "Shift+9 要出 （"
+        );
+        assert!(
+            should_claim(VK_0, false, true, false, false),
+            "Shift+0 要出 ）"
+        );
+        assert!(
+            should_claim(VK_OEM_7, false, true, false, false),
+            "Shift+' 要出 “"
+        );
+        assert!(
+            should_claim(VK_OEM_7, false, false, false, false),
+            "' 要出 ‘"
+        );
         // 不按 Shift 的数字仍然给应用（不抢数字键）
         assert!(!should_claim(VK_9, false, false, false, false));
     }
@@ -3199,7 +3510,10 @@ mod punct_claim_tests {
         assert!(!should_claim(VK_A_KEY, false, false, false, true), "字母");
         assert!(!should_claim(VK_OEM_5, false, false, false, true), "标点");
         assert!(!should_claim(VK_SLASH, false, false, false, true), "斜杠");
-        assert!(!should_claim(VK_SPACE_KEY, false, false, false, true), "空格");
+        assert!(
+            !should_claim(VK_SPACE_KEY, false, false, false, true),
+            "空格"
+        );
     }
 
     #[test]
@@ -3235,8 +3549,10 @@ mod punct_claim_tests {
     fn 注入标记过期后不再放行用户自己的退格() {
         // 万一注入的键没被送到（宿主吞了），不能让标记一直挂着把用户真正的
         // 退格当成注入键放行 —— 那样误选就永远撤不回来了。
-        *INJECTED_BACK.lock().unwrap_or_else(|p| p.into_inner()) =
-            Some((std::time::Instant::now() - std::time::Duration::from_secs(5), 3));
+        *INJECTED_BACK.lock().unwrap_or_else(|p| p.into_inner()) = Some((
+            std::time::Instant::now() - std::time::Duration::from_secs(5),
+            3,
+        ));
         assert!(!injected_backspace_pending());
         assert!(!take_injected_backspace());
     }

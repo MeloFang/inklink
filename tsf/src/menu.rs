@@ -23,10 +23,10 @@ use std::sync::{Mutex, Once};
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
-    BeginPaint, CreateFontW, CreatePen, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint,
-    FillRect, GetDC, GetStockObject, GetTextExtentPoint32W, InvalidateRect, LineTo, MoveToEx,
-    Rectangle, ReleaseDC, SelectObject, SetBkMode, SetTextColor, DT_LEFT, DT_SINGLELINE,
-    DT_VCENTER, HGDIOBJ, NULL_BRUSH, PAINTSTRUCT, TRANSPARENT,
+    BeginPaint, CreateFontW, CreatePen, CreateSolidBrush, DT_LEFT, DT_SINGLELINE, DT_VCENTER,
+    DeleteObject, DrawTextW, EndPaint, FillRect, GetDC, GetStockObject, GetTextExtentPoint32W,
+    HGDIOBJ, InvalidateRect, LineTo, MoveToEx, NULL_BRUSH, PAINTSTRUCT, Rectangle, ReleaseDC,
+    SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::HiDpi::GetDpiForSystem;
@@ -34,12 +34,12 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, VK_DOWN, VK_ESCAPE, VK_LBUTTON, VK_RETURN, VK_UP,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect, GetCursorPos,
-    GetWindowRect, LoadCursorW, PeekMessageW, RegisterClassW, ShowWindow, SystemParametersInfoW,
-    TranslateMessage, CS_HREDRAW, CS_VREDRAW, IDC_ARROW, MA_NOACTIVATE, MSG, PM_REMOVE,
-    SPI_GETWORKAREA, SW_SHOWNOACTIVATE, WM_CAPTURECHANGED, WM_DESTROY, WM_KEYDOWN, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP,
-    WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
+    GetClientRect, GetCursorPos, GetWindowRect, IDC_ARROW, LoadCursorW, MA_NOACTIVATE, MSG,
+    PM_REMOVE, PeekMessageW, RegisterClassW, SPI_GETWORKAREA, SW_SHOWNOACTIVATE, ShowWindow,
+    SystemParametersInfoW, TranslateMessage, WM_CAPTURECHANGED, WM_DESTROY, WM_KEYDOWN,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_PAINT, WM_RBUTTONDOWN,
+    WM_RBUTTONUP, WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
 pub const CMD_TOGGLE_MODE: u32 = 1;
@@ -103,7 +103,12 @@ fn build_items(chinese: bool, punct: bool) -> Vec<Item> {
     vec![
         Item {
             id: CMD_TOGGLE_MODE,
-            label: if chinese { "切换为英文" } else { "切换为中文" }.to_string(),
+            label: if chinese {
+                "切换为英文"
+            } else {
+                "切换为中文"
+            }
+            .to_string(),
             checked: chinese,
             enabled: true,
             separator: false,
@@ -161,7 +166,22 @@ fn row_at(items: &[Item], y: i32) -> Option<usize> {
 fn make_font() -> HGDIOBJ {
     let face = wide("Microsoft YaHei UI");
     unsafe {
-        CreateFontW(-scale(13), 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 5, 0, face.as_ptr()) as HGDIOBJ
+        CreateFontW(
+            -scale(13),
+            0,
+            0,
+            0,
+            400,
+            0,
+            0,
+            0,
+            1,
+            0,
+            0,
+            5,
+            0,
+            face.as_ptr(),
+        ) as HGDIOBJ
     }
 }
 
@@ -460,7 +480,9 @@ pub fn popup(owner: HWND, x: i32, y: i32, chinese: bool, punct: bool) -> u32 {
             let inside = cursor_in(hwnd);
             let list = snapshot();
             let hit = if inside {
-                row_at(&list, cursor_client_y(hwnd)).map(|i| i as i32).unwrap_or(-1)
+                row_at(&list, cursor_client_y(hwnd))
+                    .map(|i| i as i32)
+                    .unwrap_or(-1)
             } else {
                 -1
             };
@@ -540,7 +562,11 @@ mod tests {
         let list = items();
         let (_, h) = menu_size(&list);
         let rows: i32 = list.iter().map(row_height).sum();
-        assert_eq!(rows + scale(PAD_Y) * 2, h, "行高 + 上下内边距必须正好等于菜单高度");
+        assert_eq!(
+            rows + scale(PAD_Y) * 2,
+            h,
+            "行高 + 上下内边距必须正好等于菜单高度"
+        );
     }
 
     #[test]
@@ -611,6 +637,9 @@ mod tests {
     #[test]
     fn no_quit_row() {
         let list = items();
-        assert!(list.iter().all(|it| it.id != 6), "进程内菜单没有「退出浮条」项");
+        assert!(
+            list.iter().all(|it| it.id != 6),
+            "进程内菜单没有「退出浮条」项"
+        );
     }
 }

@@ -21,8 +21,8 @@
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
 use windows_sys::Win32::System::Registry::{
-    RegCloseKey, RegCreateKeyExW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW, HKEY,
-    HKEY_CURRENT_USER, KEY_READ, KEY_SET_VALUE, REG_DWORD, REG_OPTION_NON_VOLATILE,
+    HKEY, HKEY_CURRENT_USER, KEY_READ, KEY_SET_VALUE, REG_DWORD, REG_OPTION_NON_VOLATILE,
+    RegCloseKey, RegCreateKeyExW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW,
 };
 
 /// 注册表里的位置，UI 进程（浮条 / 设置台）也用这一份。
@@ -34,7 +34,7 @@ pub const VALUE_PUNCTUATION: &str = "Punctuation";
 /// 浮条位置记忆的位置（`PosX`/`PosY`，屏幕坐标，缺失就用默认右下角）。
 pub const UI_KEY: &str = r"Software\inklink\UI";
 
-fn wide(s: &str) -> Vec<u16> {
+pub(super) fn wide(s: &str) -> Vec<u16> {
     OsStr::new(s)
         .encode_wide()
         .chain(std::iter::once(0))
@@ -48,7 +48,7 @@ fn flag_from_value(raw: Option<u32>) -> bool {
     !matches!(raw, Some(0))
 }
 
-unsafe fn query_dword(key: HKEY, name: &str) -> Option<u32> {
+pub(super) unsafe fn query_dword(key: HKEY, name: &str) -> Option<u32> {
     let name_w = wide(name);
     let mut ty = 0u32;
     let mut data = 0u32;
@@ -68,15 +68,16 @@ unsafe fn query_dword(key: HKEY, name: &str) -> Option<u32> {
     }
 }
 
-unsafe fn open_key(access: u32) -> Option<HKEY> {
-    let path = wide(KEY_PATH);
+/// 打开任意一个 `HKCU` 下的键（`state` 与 `config` 共用同一套读法）。
+pub(super) unsafe fn open_key_path(path: &str, access: u32) -> Option<HKEY> {
+    let path_w = wide(path);
     let mut key: HKEY = std::ptr::null_mut();
-    let rc = RegOpenKeyExW(HKEY_CURRENT_USER, path.as_ptr(), 0, access, &mut key);
-    if rc == 0 {
-        Some(key)
-    } else {
-        None
-    }
+    let rc = RegOpenKeyExW(HKEY_CURRENT_USER, path_w.as_ptr(), 0, access, &mut key);
+    if rc == 0 { Some(key) } else { None }
+}
+
+unsafe fn open_key(access: u32) -> Option<HKEY> {
+    open_key_path(KEY_PATH, access)
 }
 
 unsafe fn create_key() -> Option<HKEY> {
@@ -94,11 +95,7 @@ unsafe fn create_key() -> Option<HKEY> {
         &mut key,
         &mut disposition,
     );
-    if rc == 0 {
-        Some(key)
-    } else {
-        None
-    }
+    if rc == 0 { Some(key) } else { None }
 }
 
 /// 当前状态 `(中文, 中文标点)`。读不到注册表时按默认（都是开）。
@@ -128,7 +125,10 @@ unsafe fn write_flag(name: &str, on: bool) {
     // 写失败必须留下痕迹：浮条点一下"没反应"十有八九是这里没写成
     // （宿主进程没有 HKCU 写权限，例如以另一个账户/受限令牌运行）。
     let Some(key) = create_key() else {
-        crate::log_line(&format!("state write {name}={} failed: open key", u32::from(on)));
+        crate::log_line(&format!(
+            "state write {name}={} failed: open key",
+            u32::from(on)
+        ));
         return;
     };
     let name_w = wide(name);
@@ -143,7 +143,10 @@ unsafe fn write_flag(name: &str, on: bool) {
     );
     RegCloseKey(key);
     if rc != 0 {
-        crate::log_line(&format!("state write {name}={} failed: rc={rc}", u32::from(on)));
+        crate::log_line(&format!(
+            "state write {name}={} failed: rc={rc}",
+            u32::from(on)
+        ));
     }
 }
 
@@ -163,11 +166,7 @@ unsafe fn open_ui_key(access: u32) -> Option<HKEY> {
     let path = wide(UI_KEY);
     let mut key: HKEY = std::ptr::null_mut();
     let rc = RegOpenKeyExW(HKEY_CURRENT_USER, path.as_ptr(), 0, access, &mut key);
-    if rc == 0 {
-        Some(key)
-    } else {
-        None
-    }
+    if rc == 0 { Some(key) } else { None }
 }
 
 unsafe fn create_ui_key() -> Option<HKEY> {
@@ -185,11 +184,7 @@ unsafe fn create_ui_key() -> Option<HKEY> {
         &mut key,
         &mut disposition,
     );
-    if rc == 0 {
-        Some(key)
-    } else {
-        None
-    }
+    if rc == 0 { Some(key) } else { None }
 }
 
 /// 浮条上次的屏幕坐标；没存过、或飞出合理范围（换屏/分辨率变小）就当没存过。
