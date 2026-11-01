@@ -74,5 +74,8 @@ msg.txt
 /ui/target/
 /ui/shot-*.png
 /ui/*.log
+# 浮条的本地预览图（`cargo test` 渲的 bar-preview.bmp 放大版）与并排对照图
+/ui/bar-preview-*.png
+/ui/_compare.png
 # 品牌检查用的对照图（不是交付物）
 /docs/brand/_probe-*.png

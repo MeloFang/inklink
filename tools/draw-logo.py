@@ -51,10 +51,10 @@ BODY = (
         (432, 519),
         (500, 479),
         (560, 443),
-        (602, 424),
-        (632, 431),
-        (648, 456),
-        (628, 477),
+        (602, 420),
+        (639, 428),
+        (655, 453),
+        (635, 477),
         (588, 498),
         (556, 530),
         (532, 572),
@@ -73,7 +73,9 @@ BODY = (
         (822, 668),
     ],
     [
-        0.8, 5.0, 14.0, 24.0, 31.0, 36.0, 42.0, 38.0, 31.0, 16.0, 12.0,
+        # 发夹处（第 6~9 点）的半宽不能超过中心线的曲率半径，否则内侧轮廓会翻折，
+        # 大尺寸下能看到一道带疙瘩的暗缝（原来是 42/38/31/16）。
+        0.8, 5.0, 14.0, 24.0, 31.0, 37.0, 37.0, 30.0, 23.0, 17.0, 12.0,
         14.0, 18.0, 22.0, 26.0, 28.0, 30.0, 31.0, 31.0, 29.0, 26.0, 22.0,
         16.0, 10.0, 5.0, 0.8,
     ],
@@ -146,9 +148,27 @@ def cubic(p0, p1, p2, p3, t):
     return (x, y)
 
 
-def shape_polygons() -> list[list[tuple[float, float]]]:
-    """标记的全部闭合轮廓（单位：UNIT 画布）。"""
-    polys = [stroke_outline(BODY[0], BODY[1])]
+def offset_closed(poly, d: float) -> list[tuple[float, float]]:
+    """闭合曲线沿外法向整体外扩 d（只用于光滑、近似凸的墨点）。"""
+    n = len(poly)
+    area = sum(poly[i][0] * poly[(i + 1) % n][1] - poly[(i + 1) % n][0] * poly[i][1] for i in range(n))
+    sign = 1.0 if area > 0 else -1.0
+    out = []
+    for i in range(n):
+        (px, py), (nx_, ny_) = poly[i - 1], poly[(i + 1) % n]
+        dx, dy = nx_ - px, ny_ - py
+        length = math.hypot(dx, dy) or 1.0
+        # 逆时针（area>0，y 向下的坐标里看是顺时针）时外法向是 (dy, -dx)
+        out.append((poly[i][0] + sign * dy / length * d, poly[i][1] - sign * dx / length * d))
+    return out
+
+
+def shape_polygons(bold: float = 0.0) -> list[list[tuple[float, float]]]:
+    """标记的全部闭合轮廓（单位：UNIT 画布）。
+
+    `bold` 是笔画每侧额外加粗的量（同一单位）：只给小尺寸用，见 `polys_for()`。
+    """
+    polys = [stroke_outline(BODY[0], [w + bold for w in BODY[1]])]
 
     drop: list[tuple[float, float]] = []
     start = DROP[0]
@@ -158,8 +178,37 @@ def shape_polygons() -> list[list[tuple[float, float]]]:
         for k in range(1, 33):
             drop.append(cubic(prev, p1, p2, p3, k / 32))
         prev = p3
+    if bold:
+        drop = offset_closed(drop, bold)
     polys.append(drop)
     return polys
+
+
+def bold_px(size: int) -> float:
+    """小尺寸的光学加粗（每侧，单位：目标像素）。
+
+    这一笔最细处只有 1~2px（游丝起笔、长锋），16~32px 下按真实宽度渲染会变成一片
+    灰色半透明像素，看起来就是"糊"。像字体的小字号光学修正那样每侧补一点墨：
+    16px 补 0.35px，32px 补 0.25px，64px 起不补，造型不变。
+    """
+    return max(0.0, 0.45 - size / 160)
+
+
+def polys_for(size: int) -> list[list[tuple[float, float]]]:
+    """该尺寸要渲染的轮廓（已经 fit 到 MARK_BOX）。"""
+    base = shape_polygons()
+    xs = [p[0] for poly in base for p in poly]
+    ys = [p[1] for poly in base for p in poly]
+    bx0, by0, bx1, by1 = (v * UNIT for v in MARK_BOX)
+    s = min((bx1 - bx0) / (max(xs) - min(xs)), (by1 - by0) / (max(ys) - min(ys)))
+    extra = bold_px(size) * UNIT / size / s     # 目标像素 → 原始几何单位
+    if extra <= 0:
+        return fit(base, MARK_BOX)
+    # 加粗后外框会变大一点；用未加粗的外框做 fit，保证各尺寸的位置/大小完全一致。
+    bold = shape_polygons(extra)
+    mx, my = (min(xs) + max(xs)) / 2, (min(ys) + max(ys)) / 2
+    cx, cy = (bx0 + bx1) / 2, (by0 + by1) / 2
+    return [[((x - mx) * s + cx, (y - my) * s + cy) for x, y in poly] for poly in bold]
 
 
 def fit(polys, box) -> list[list[tuple[float, float]]]:
@@ -174,8 +223,16 @@ def fit(polys, box) -> list[list[tuple[float, float]]]:
     return [[((x - mx) * s + cx, (y - my) * s + cy) for x, y in poly] for poly in polys]
 
 
-def render(size: int, polys, ss: int = 8) -> Image.Image:
-    """在该尺寸下原生渲染（先 ss 倍超采样再降采样，边缘干净无锯齿）。"""
+def render(size: int, polys=None, ss: int = 16) -> Image.Image:
+    """在该尺寸下原生渲染：ss 倍超采样后按**面积平均**（BOX）降采样。
+
+    BOX 得到的就是每个像素被覆盖的比例，边缘干净；原来用 LANCZOS，它的核比一个像素宽，
+    小尺寸下会把笔画边缘抹开一圈、还带一点振铃，正是"糊"的来源之一。
+    `polys` 不给就按尺寸取 `polys_for(size)`（含小尺寸光学加粗）。
+    """
+    if polys is None:
+        polys = polys_for(size)
+    ss = max(4, min(ss, 4096 // size))      # 大图不需要 16 倍（1024×16 的画布要 256MB）
     big = size * ss
     scale = big / UNIT
     canvas = Image.new("L", (big, big), 0)
@@ -184,15 +241,14 @@ def render(size: int, polys, ss: int = 8) -> Image.Image:
         pts = [(x * scale, y * scale) for x, y in poly]
         if len(pts) >= 3:
             draw.polygon(pts, fill=255)
-    mark = canvas.resize((size, size), Image.LANCZOS)
+    mark = canvas.resize((size, size), Image.BOX)
 
-    tile = Image.new("RGB", (big, big), NAVY)
+    tile = Image.new("RGB", (size, size), NAVY)
     mask = Image.new("L", (big, big), 0)
     ImageDraw.Draw(mask).rounded_rectangle(
         (0, 0, big - 1, big - 1), radius=int(CORNER_RATIO * big), fill=255
     )
-    mask = mask.resize((size, size), Image.LANCZOS)
-    tile = tile.resize((size, size), Image.LANCZOS)
+    mask = mask.resize((size, size), Image.BOX)
 
     out = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     out.paste(tile, (0, 0), mask)
@@ -277,24 +333,28 @@ def main() -> None:
     write_svg(polys, BRAND_DIR / "ink-mark.svg")
 
     for size, name in ((1024, BRAND_DIR / "ink-mark.png"), (512, INSTALLER / "inklink.png")):
-        render(size, polys).save(name, format="PNG", optimize=True)
+        render(size).save(name, format="PNG", optimize=True)
 
-    write_ico([render(s, polys) for s in (16, 20, 24, 32, 40, 48, 64, 128, 256)],
+    # 每档按自己的尺寸取轮廓（小尺寸带光学加粗），不从大图缩
+    write_ico([render(s) for s in (16, 20, 24, 32, 40, 48, 64, 128, 256)],
               INSTALLER / "inklink.ico")
 
     if "--preview" in sys.argv:
-        # 检查图：4 个实际尺寸 + 16px 放大 8 倍，用眼睛确认小尺寸没糊
+        # 检查图：各实际尺寸 + 16/24px 放大 8 倍。整张图最后用 NEAREST 放大 2 倍，
+        # 看到的就是真实像素（原来用 LANCZOS 放大，预览图自己就把边缘抹糊了）。
         sheet = Image.new("RGB", (860, 340), (0xF2, 0xF2, 0xF4))
         x = 16
-        for s in (16, 24, 32, 64, 128):
-            im = render(s, polys)
-            sheet.paste(im, (x, 210 - s // 2), im)
-            x += s + 24
-        z = render(16, polys).resize((128, 128), Image.NEAREST)
-        sheet.paste(z, (16, 40), z)
-        z2 = render(256, polys).resize((280, 280), Image.LANCZOS)
+        for s in (16, 20, 24, 32, 64, 128):
+            im = render(s)
+            sheet.paste(im, (x, 274 - s // 2), im)
+            x += s + 18
+        z = render(16).resize((128, 128), Image.NEAREST)
+        sheet.paste(z, (16, 16), z)
+        z = render(24).resize((192, 192), Image.NEAREST)
+        sheet.paste(z, (160, 16), z)
+        z2 = render(280)
         sheet.paste(z2, (560, 30), z2)
-        sheet = sheet.resize((1720, 680), Image.LANCZOS)
+        sheet = sheet.resize((1720, 680), Image.NEAREST)
         UI_DIR.mkdir(parents=True, exist_ok=True)
         sheet.save(UI_DIR / "logo-check.png")
 
