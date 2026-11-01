@@ -262,13 +262,58 @@ fn unpack(entries: &[Entry], pf: &Path, eng: &Path) -> Result<usize, String> {
     Ok(written)
 }
 
+/// 拉起引擎。这里故意不用 `std::process::Command`——它没法关掉句柄继承，
+/// 而引擎一旦继承了我们（或调用者 cmd）的 stdout，`Start-Process -Wait`、
+/// cmd 的 `start /wait` 这类"等进程树结束"的调用会被一个常驻进程永远拖住。
 fn start_engine(eng: &Path) -> bool {
-    Command::new(eng.join("rime-server.exe"))
-        .arg("--serve")
-        .current_dir(eng)
-        .creation_flags(CREATE_NO_WINDOW)
-        .spawn()
-        .is_ok()
+    use windows_sys::Win32::System::Threading::{
+        CreateProcessW, CREATE_BREAKAWAY_FROM_JOB, CREATE_NO_WINDOW, DETACHED_PROCESS,
+        PROCESS_INFORMATION, STARTUPINFOW,
+    };
+    let exe = eng.join("rime-server.exe");
+    let mut cmdline = wide(&format!("\"{}\" --serve", exe.display()));
+    let dir = wide(&eng.to_string_lossy());
+    let mut si = STARTUPINFOW::default();
+    si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
+    let mut pi = PROCESS_INFORMATION::default();
+    unsafe {
+        let ok = CreateProcessW(
+            std::ptr::null(),
+            cmdline.as_mut_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            0, // bInheritHandles = FALSE：不继承任何句柄
+            CREATE_NO_WINDOW | DETACHED_PROCESS | CREATE_BREAKAWAY_FROM_JOB,
+            std::ptr::null(),
+            dir.as_ptr(),
+            &si,
+            &mut pi,
+        );
+        if ok != 0 {
+            CloseHandle(pi.hProcess);
+            CloseHandle(pi.hThread);
+            return true;
+        }
+        // 作业对象不允许 breakaway 时会失败，去掉这个标志再试一次。
+        let ok = CreateProcessW(
+            std::ptr::null(),
+            cmdline.as_mut_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+            CREATE_NO_WINDOW | DETACHED_PROCESS,
+            std::ptr::null(),
+            dir.as_ptr(),
+            &si,
+            &mut pi,
+        );
+        if ok != 0 {
+            CloseHandle(pi.hProcess);
+            CloseHandle(pi.hThread);
+            return true;
+        }
+    }
+    false
 }
 
 fn install() -> Result<(), String> {
