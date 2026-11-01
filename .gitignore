@@ -79,3 +79,6 @@ msg.txt
 /ui/_compare.png
 # 品牌检查用的对照图（不是交付物）
 /docs/brand/_probe-*.png
+
+# Kiro 的本地规格目录（spec 文档留作参考，但不入库）
+/.kiro/

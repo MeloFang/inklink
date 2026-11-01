@@ -746,6 +746,62 @@ Obsidian 语料 + AI 兜底，默认关闭联网（符合项目铁律）。
 - 纯函数 `scale`/`item_rects`/`hit_test`/`row_at`/`menu_size` 补了单测，`cargo test --release` 64 项全绿。
 - 部署 1.1.10，`C:\Program Files\inklink\inklink-ui.exe` 与 `HKCU\...\Run\inklink-ui` 自启项删除。
 
+#### 修"偶尔同时冒出两条浮条" + 标点格句号左移逗号右移（2026-11-01，未部署、未提交、版本号未变）
+
+规格：`.kiro\specs\fix-duplicate-floating-bars-punctuation-layout\`（requirements / design / tasks）。
+改动只在 `tsf\src\bar.rs`。
+
+**根因**：窗口句柄和看门狗定时器是按线程的，但"这条线程想不想显示"（`WANTED`）和"是不是被看门狗
+收起的"（`AUTO_HIDDEN`）是进程级的。看门狗的复活条件是 `AUTO_HIDDEN || !any_other_bar_visible()`：
+任一线程在后台把 `AUTO_HIDDEN` 置真，其余线程回到前台时都会跳过"已有一条在显示"的检查，各放一条。
+另外 `any_other_bar_visible()` 本身是"先查再显示"（两条线程可能同时查到"没有"），枚举结果还存在
+进程级 `ANY_BAR` 里，两次枚举重叠会互相覆盖。
+
+**修法**：
+
+- `wanted` / `auto_hidden` 改成线程局部（`INSTANCE_VISIBILITY`），只描述本线程。
+- 新增进程级 `VISIBLE_OWNER: AtomicIsize`（`0` = 无、`-1` = 正在仲裁、其他 = 可见那条的句柄）。
+  所有把隐藏浮条变可见的路径只做**一次** `compare_exchange` 拿哨兵，拿到的才能"收起别的 → 绘制 →
+  显示 → 复核 → 发布"；没拿到的不等待、不自旋、保持隐藏。激活可以接管（先收起旧的再显示新的），
+  看门狗只补空缺、不抢占。
+- 收起（停用 / 后台）先隐藏、确认不可见了才把所有权换回 `0`。
+- 删掉 `ANY_BAR`：枚举上下文放在调用栈上（`EnumContext`，经 `LPARAM` 传），按 PID 只看本进程。
+  枚举只负责看清、收干净，不负责选谁显示。
+- 失败一律保守：查不清、收不干净、绘制失败、显示后仍不可见、显示后宿主离开前台，都不显示请求者，
+  下一次激活或看门狗可重试。
+- 编排只有一个入口 `drive_visibility`，生产（`show` / `hide` / `WM_TIMER`）和测试共用。
+
+**标点**：`punct_glyphs(cell, chinese_punct, k)`，句号（中文空心环、半角实心点）中心 `center - k`、
+逗号中心 `center + k`（`k` = DPI 缩放，96 DPI 时 1px），纵向位置、尺寸、颜色、点击区都不变。
+
+**测试**（`cargo test --release` 111 项全绿，新增 41 项）：
+
+- 可见性：内存模拟宿主 `SimHost` / `SimIo`（窗口表 + 一次性故障开关 + 在重绘时插入另一条线程的请求）。
+  状态归约规则表逐行；两实例 8⁴ = 4096 条、三实例 11³ = 1331 条穷举序列，每步检查可见数 ≤ 1、
+  无实例想显示时为 0、原子所有权等于唯一可见那条，序列后追加"前台恰一条、后台零条"的收敛阶段；
+  仲裁期间另一实例激活 / 复活返回忙、停用只隐藏自己；所有权转移先收起旧的再显示新的；
+  七种失败各一条"保守 + 可重试"；枚举上下文隔离。
+- 标点：k = 1.0 / 1.5 / 2.0 手算期望表、120 个比例 × 4 个格子扫描、点击区不变、
+  实际渲染出的第三格里墨迹质心句号在中心左、逗号头在中心右。
+- 窗口冒烟测试改用 `show_with_foreground(|| true)`（`cargo test` 进程不在前台，后台激活按设计不显示），
+  并断言隐藏后所有权释放。
+- 预览：`tsf\target\bar-preview*.bmp`，新增 `bar-preview-punct-cn.bmp` / `bar-preview-punct-half.bmp`。
+
+**其他验证**：`rustfmt --edition 2024 --check src\bar.rs` 通过；64 / 32 位 DLL 都能构建；
+`cargo clippy` 在 `bar.rs` 无新问题。clippy 仍因 `lib.rs` 里本次之前就有的 3 个
+`not_unsafe_ptr_arg_deref` 错误（`DllGetClassObject`，2550:13、2554:23、2554:29）退出非零，未修。
+
+**手测清单**（⬜ 待手测，部署后做）：
+
+| # | 操作 | 期望 | 状态 |
+|:--|:--|:--|:--|
+| 1 | 至少两个 GUI 应用间切换 30 次，每次等 700 ms | 前台恰一个浮条，后台零个 | ⬜ |
+| 2 | 在含多个 TSF 线程的应用里切入 / 切出 inklink 各 30 次，每次等 700 ms | 激活后一个，停用后零个 | ⬜ |
+| 3 | 快速交错 Alt+Tab 与 Win+Space | 不稳定出现两条，宿主不崩溃 | ⬜ |
+| 4 | 100% DPI 对比修复前后预览 | 句号 / 点左移 1 px、逗号右移 1 px，纵向 / 尺寸 / 颜色不变 | ⬜ |
+| 5 | 150%、200% DPI | 偏移按 1.5、2.0 缩放，纵向位置不变 | ⬜ |
+| 6 | 100% DPI 点击第三格中心与四个内缩 1 px 的角 | 每次只切换一次标点 | ⬜ |
+
 
 
 ### 纠错探针怎么工作（2026 10 27）

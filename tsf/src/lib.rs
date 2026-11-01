@@ -2535,8 +2535,10 @@ pub extern "system" fn DllCanUnloadNow() -> HRESULT {
     S_FALSE
 }
 
+/// COM 入口：指针全部由调用方（TSF / `regsvr32`）保证有效，用错就是未定义行为，
+/// 所以整个函数标 `unsafe`（clippy 的 `not_unsafe_ptr_arg_deref` 也要求这样）。
 #[unsafe(no_mangle)]
-pub extern "system" fn DllGetClassObject(
+pub unsafe extern "system" fn DllGetClassObject(
     rclsid: *const GUID,
     riid: *const GUID,
     ppv: *mut *mut core::ffi::c_void,
