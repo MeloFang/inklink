@@ -917,10 +917,37 @@ Weasel 那份的 `schema_list` 列了五六套方案，数据已经被裁掉，�
 
 发布包体积：**28.65 MB → 8.87 MB**。
 
-**还没做**：GitHub Actions 出包、安装器改单文件 exe（`SignTool` 只能签 PE）、Release 页与
-SHA256、Top-3 统计（T5f）。
+**已完成：GitHub Actions 出包（`.github\workflows\release.yml`）**
 
+推 `v*` tag 或手动触发，在 `windows-latest` 上跑完整链路：`cargo fmt --check` →
+`cargo clippy -- -D warnings` → `fetch-librime.ps1 -DownloadLexicon` → `build-engine.ps1` →
+`deploy-local.ps1 -NoDeploy`（只构建不部署；CI 机器上没有 TSF 环境）→ `release.ps1` →
+上传 zip + setup.exe + `SHA256SUMS.txt` + `RELEASE-NOTES.md`，推 tag 时挂到 Release。
 
+`fetch-librime.ps1` 为此加了 `-DownloadLexicon`：词库缺失时按 `data\manifest.json` 里的 URL
+下载 `base.dict.yaml` 并校验 SHA256（`0418d510…`，不符就删文件报错）。
+
+**已完成：单文件安装器 `dist\inklink-<版本>-setup.exe`**
+
+为什么必须做：`SignTool` 只能给 PE 签名，而原来的安装方式是 `install.cmd` + `install.ps1`
+两个脚本——脚本签不了，就算签了用户双击的也是 .cmd。所以把「解包 + 写注册表 + 起引擎」
+搬进 `installer\setup`（Rust + windows-sys + flate2，编出来 265 KB 的桩）。
+
+载荷格式（`release.ps1` 生成、`main.rs::read_payload` 读）：
+`deflate([u32 名字长度][名字][u64 数据长度][数据] × N)` + 尾部
+`[u32 N][u64 起始偏移][u64 解压后长度][8 字节 "INKLNK01"]`。名字带 `pf/`（→ Program Files）
+或 `eng/`（→ `C:\inklink-engine`）前缀。**没走 zip**：不想为一个解包动作引 zip 解析库，
+条目名编码的历史坑也多；自己的格式两边都是我们写的。
+
+23 个文件 / 23 MB 裸数据 → 9.11 MB 的 exe。自带 `--extract <目录>` 只解包不安装，
+CI 里拿它做冒烟测试；`--uninstall` 删文件 + 清注册表。
+
+**还没做**：代码签名（SignPath 申请，见下）、Top-3 统计（T5f）、`--uninstall` 挂进
+"应用和功能"列表（现在只能命令行调）。
+
+**签名为什么现在不花钱**：开源项目走 [SignPath Foundation](https://signpath.org/) 可以免费拿到
+OV 级签名，但硬性前提是"构建能从你自己的仓库可验证"——所以上 CI 是申请签名**之前**必须做完的
+那一步。买 OV 证书 $150–300/年，且 2024 起 EV 也不再即时绕过 SmartScreen，不值得现在花。
 
 ### 纠错探针怎么工作（2026 10 27）
 

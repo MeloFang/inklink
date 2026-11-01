@@ -88,3 +88,5 @@ msg.txt
 /ui/badge-dark-x8.png
 # 上游二进制与词库（tools\fetch-librime.ps1 会重新下载，不入库）
 /vendor/
+# 单文件安装器的构建产物
+/installer/setup/target/

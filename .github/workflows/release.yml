@@ -1,0 +1,120 @@
+# 打发布包：推 tag（v*）或手动触发时跑。
+#
+# 这里刻意不用任何第三方 action 去"打包"，全部走仓库里的脚本：
+#   tools\fetch-librime.ps1  取 librime（Weasel 0.17.4，SHA256 写死）
+#   tools\build-engine.ps1   编译 x86 引擎
+#   tools\deploy-local.ps1   跑单测 + 构 64/32 位 DLL（-NoDeploy 只构建）
+#   tools\release.ps1        出 dist\inklink-<版本>.zip + SHA256SUMS.txt
+#
+# 之所以要 CI 出包：SignPath Foundation 给开源项目免费签名的硬性前提之一是
+# "构建必须能从你自己的仓库可验证"，光在本地出包拿不到签名。
+
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      keep_old:
+        description: 'release.ps1 保留几个历史版本'
+        required: false
+        default: '1'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    # 引擎必须 x86（Weasel 分发的 rime.dll 只有 32 位），DLL 必须 64+32 两位，
+    # 所以这里只用 Windows 跑，交叉编译在 windows-latest 上是原生支持的。
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 装 Rust 工具链（含 i686 目标）
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: i686-pc-windows-msvc
+          components: rustfmt, clippy
+
+      - name: 缓存 cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            tsf/target-static
+          key: cargo-${{ runner.os }}-${{ hashFiles('tsf/Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      - name: 格式化检查
+        working-directory: tsf
+        run: cargo fmt --all --check
+
+      - name: clippy
+        working-directory: tsf
+        # 允许既有的 E0133（edition 2024 的 unsafe 内调 unsafe）风格告警，但 error 要拦。
+        run: cargo clippy --all-targets --release -- -D warnings
+
+      - name: 取 librime（Weasel）+ rime-ice 词库
+        shell: powershell
+        run: |
+          .\tools\fetch-librime.ps1 -Dest C:\inklink-engine -DownloadLexicon
+
+      - name: 编译引擎（x86）
+        shell: powershell
+        run: |
+          .\tools\build-engine.ps1 -Dest C:\inklink-engine
+
+      - name: 单测 + 构建 64/32 位 DLL
+        shell: powershell
+        # -NoDeploy：只构建，不往 Program Files 铺、不改注册表（CI 机器上没有 TSF 环境）
+        run: |
+          .\tools\deploy-local.ps1 -NoDeploy -NoBump
+
+      - name: 出包
+        shell: powershell
+        run: |
+          .\tools\release.ps1 -KeepOld ${{ github.event.inputs.keep_old || '1' }}
+
+      - name: 收集产物
+        shell: powershell
+        run: |
+          $v = (Get-Content VERSION -Raw).Trim()
+          "INKLINK_VERSION=$v" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: inklink-${{ env.INKLINK_VERSION }}
+          path: |
+            dist/inklink-${{ env.INKLINK_VERSION }}.zip
+            dist/inklink-${{ env.INKLINK_VERSION }}-setup.exe
+            dist/SHA256SUMS.txt
+            dist/RELEASE-NOTES.md
+          if-no-files-found: error
+
+      - name: 冒烟测试（解包单文件安装器，确认载荷没坏）
+        shell: powershell
+        run: |
+          $exe = "dist\inklink-$env:INKLINK_VERSION-setup.exe"
+          $tmp = Join-Path $env:RUNNER_TEMP 'extract-check'
+          & $exe --extract $tmp
+          $n = (Get-ChildItem $tmp -Recurse -File).Count
+          if ($n -lt 10) { throw "安装器只解出 $n 个文件，载荷看着不对" }
+          if (-not (Test-Path (Join-Path $tmp 'inklink_tsf.dll'))) { throw "解包结果里没有 inklink_tsf.dll" }
+          Write-Host "  解包 $n 个文件，inklink_tsf.dll 在位"
+
+      - name: 挂到 Release（只在推 tag 时）
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/inklink-${{ env.INKLINK_VERSION }}.zip
+            dist/inklink-${{ env.INKLINK_VERSION }}-setup.exe
+            dist/SHA256SUMS.txt
+            dist/RELEASE-NOTES.md
+          body_path: dist/RELEASE-NOTES.md
+          fail_on_unmatched_files: true

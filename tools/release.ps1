@@ -14,6 +14,11 @@ param(
 $ErrorActionPreference = 'Stop'
 . "$PSScriptRoot\version.ps1"
 
+# 本机同时装着 GNU 和 MSVC 两套 Rust。不把 ~\.cargo\bin 放到最前面，cargo 会挑 GNU 那套，
+# 编 windows-sys 时要 dlltool.exe（MSVC 工具链里没有）直接失败。
+# deploy-local.ps1 早就有这行，release.ps1 是后来才开始编 Rust 的，漏了。
+$env:PATH = "$env:USERPROFILE\.cargo\bin;$env:PATH"
+
 $version = Get-InklinkVersion
 $root    = Get-InklinkRepoRoot
 $tsf     = Join-Path $root 'tsf'
@@ -101,6 +106,134 @@ Write-Host "发布包：$zip" -ForegroundColor Green
 Write-Host ("  大小   : {0:N2} MB" -f ($item.Length / 1MB))
 Write-Host "  SHA256 : $hash"
 Write-Host "  解压后 : inklink-$version\install.cmd"
+
+# ── 5b. 附带的两个文件：校验清单 + 发布说明 ─────────────────────
+# 用户下载后能自己核对：`certutil -hashfile inklink-<版本>.zip SHA256` 对着看。
+$distRoot = Join-Path $root 'dist'
+$sums = Join-Path $distRoot 'SHA256SUMS.txt'
+Set-Content -Path $sums -Value ("{0}  inklink-{1}.zip" -f $hash, $version) -Encoding ascii
+Write-Host "  校验清单: $sums"
+
+# 发布说明从 VERSION 与最近一次 git log 生成，避免手写漏项。
+$notes = Join-Path $distRoot 'RELEASE-NOTES.md'
+$recent = & git -C $root log --oneline -12 --no-decorate 2>$null
+$notesBody = @"
+# inklink $version
+
+Windows 中文输入法（TSF）。
+
+## 装哪个
+
+- **``inklink-$version-setup.exe``** —— 推荐。单文件，双击（会弹 UAC）就装完，不用解压。
+- ``inklink-$version.zip`` —— 绿色版，解压后右键 ``install.cmd`` → 以管理员身份运行。
+
+## 安装前
+
+- Windows 10 1809+ / Windows 11，64 位。
+- 安装器会往 ``C:\Program Files\inklink`` 与 ``C:\inklink-engine`` 写文件、注册 TSF 输入法、
+  把引擎路径写进 ``HKLM\SOFTWARE\inklink\EnginePath``，所以需要管理员权限。
+- 装完在「设置 → 时间和语言 → 语言和区域」里添加键盘 → inklink 输入法
+  （安装器能写注册表，但"把输入法挂进你的语言列表"只有系统设置能做）。
+
+## 校验
+
+``````
+certutil -hashfile inklink-$version-setup.exe SHA256
+``````
+
+应当是：
+
+``````
+$hash
+``````
+
+## 本版内容
+
+$($recent -join "`n")
+
+## 许可
+
+GPL-3.0。词库衍生自 [rime-ice](https://github.com/iDvel/rime-ice)（GPL-3.0），
+librime 来自 [Weasel](https://github.com/rime/weasel) 的发行包。
+"@
+Set-Content -Path $notes -Value $notesBody -Encoding utf8
+Write-Host "  发布说明: $notes"
+
+# ── 5c. 单文件安装器 ────────────────────────────────────────────
+# 做法：编一个"只有解包 + 写注册表"的小 exe（installer\setup），
+# 把 files\ 下的所有文件打成自定义档案追加到它末尾。
+# 这样发布出去的就是一个 PE——SignTool 能签，SmartScreen 认得，用户也只下一个文件。
+# 格式（与 installer\setup\src\main.rs 的 read_payload 一一对应）：
+#   deflate( [u32 名字长度][名字 utf8][u64 数据长度][数据] × N )
+#   [u32 N][u64 档案起始偏移][u64 解压后长度][8 字节 "INKLNK01"]
+$setupStub = Join-Path $root 'installer\setup\target\release\inklink-setup.exe'
+Write-Host '  构建安装器…'
+# cargo 会往 stderr 打 "Compiling …"，而脚本开头设了 $ErrorActionPreference='Stop'
+# —— 直接调用会被 PowerShell 包成 NativeCommandError 当场终止。所以临时放宽 + 全流重定向。
+$prevEap = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
+$cargoLog = Join-Path $env:TEMP 'inklink-setup-cargo.log'
+& cargo build --release --manifest-path (Join-Path $root 'installer\setup\Cargo.toml') *> $cargoLog
+$cargoExit = $LASTEXITCODE
+$ErrorActionPreference = $prevEap
+if ($cargoExit -ne 0) {
+    if (Test-Path $cargoLog) { Get-Content $cargoLog | Select-Object -Last 15 | ForEach-Object { Write-Host "    $_" } }
+    throw "安装器构建失败（cargo exit $cargoExit，日志 $cargoLog）"
+}
+if (-not (Test-Path $setupStub)) { throw "安装器构建失败：$setupStub 不存在" }
+
+$stub   = [System.IO.File]::ReadAllBytes($setupStub)
+$ms     = New-Object System.IO.MemoryStream
+$bw     = New-Object System.IO.BinaryWriter($ms)
+$nEntry = 0
+foreach ($f in (Get-ChildItem $files -Recurse -File)) {
+    $rel = $f.FullName.Substring($files.Length + 1).Replace('\', '/')
+    # 装到哪：引擎那一坨（rime*）进 C:\inklink-engine，其余进 Program Files\inklink
+    $prefix = if ($rel -like 'rime/*' -or $rel -eq 'rime-server.exe' -or $rel -eq 'rime.dll') { 'eng/' } else { 'pf/' }
+    $name = [System.Text.Encoding]::UTF8.GetBytes($prefix + $rel)
+    $data = [System.IO.File]::ReadAllBytes($f.FullName)
+    $bw.Write([uint32]$name.Length)
+    $bw.Write($name)
+    $bw.Write([uint64]$data.Length)
+    $bw.Write($data)
+    $nEntry++
+}
+$bw.Flush()
+$rawBlob = $ms.ToArray()
+$bw.Dispose(); $ms.Dispose()
+
+# 整块 deflate：23 MB 裸数据压完 ≈9 MB，下载量差一倍多。
+$packed = New-Object System.IO.MemoryStream
+$ds = New-Object System.IO.Compression.DeflateStream($packed, [System.IO.Compression.CompressionMode]::Compress)
+$ds.Write($rawBlob, 0, $rawBlob.Length)
+$ds.Dispose()
+$payload = $packed.ToArray()
+$packed.Dispose()
+
+$startOffset = [uint64]$stub.Length
+$trailer = New-Object System.IO.MemoryStream
+$tw = New-Object System.IO.BinaryWriter($trailer)
+$tw.Write([uint32]$nEntry)
+$tw.Write([uint64]$startOffset)
+$tw.Write([uint64]$rawBlob.Length)
+$tw.Write([System.Text.Encoding]::ASCII.GetBytes('INKLNK01'))
+$tw.Flush()
+$trailerBytes = $trailer.ToArray()
+$tw.Dispose(); $trailer.Dispose()
+
+$setupExe = Join-Path $distRoot "inklink-$version-setup.exe"
+$final = New-Object System.IO.MemoryStream
+$final.Write($stub, 0, $stub.Length)
+$final.Write($payload, 0, $payload.Length)
+$final.Write($trailerBytes, 0, $trailerBytes.Length)
+[System.IO.File]::WriteAllBytes($setupExe, $final.ToArray())
+$final.Dispose()
+
+$setupItem = Get-Item $setupExe
+$setupHash = (Get-FileHash $setupExe -Algorithm SHA256).Hash
+Write-Host "  单文件安装器: $setupExe" -ForegroundColor Green
+Write-Host ("    {0} 个文件 / {1:N2} MB / SHA256 {2}" -f $nEntry, ($setupItem.Length / 1MB), $setupHash)
+Add-Content -Path $sums -Value ("{0}  inklink-{1}-setup.exe" -f $setupHash, $version) -Encoding ascii
 
 # ── 6. 清理旧产物（dist 每次 60MB 目录 + 27MB zip，不清理会一直堆）──
 # 每个版本是「目录 + zip」一对，所以按版本分组删，不能按文件数删（否则会剩半个版本）。

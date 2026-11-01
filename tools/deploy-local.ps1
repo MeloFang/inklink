@@ -10,7 +10,9 @@
 param(
     [switch]$NoBump,
     [switch]$NoBuild,
-    [switch]$SkipTest
+    [switch]$SkipTest,
+    # 只构建，不往 Program Files 铺、不改注册表、不启引擎（CI 用：那里没有 TSF 环境）
+    [switch]$NoDeploy
 )
 
 $ErrorActionPreference = 'Stop'
@@ -54,6 +56,13 @@ if (-not $NoBuild) {
 }
 
 # ── 部署 ───────────────────────────────────────────────────────
+if ($NoDeploy) {
+    Write-Host "== inklink $version 构建完成（-NoDeploy：没有部署）==" -ForegroundColor Green
+    Write-Host "  $dll64"
+    Write-Host "  $dll32"
+    return
+}
+
 $PF      = 'C:\Program Files\inklink'
 $ENG     = 'C:\inklink-engine'
 $CLSID   = '{8F2A6C1E-4B3D-4F7A-9A21-5C6D7E8F9A0B}'

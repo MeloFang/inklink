@@ -32,6 +32,11 @@ param(
     # rime-ice 词库目录；留空 = <仓库>\data\upstream\ice
     [string]$IceDir,
 
+    # 词库缺失时从 rime-ice 下载 base.dict.yaml（CI 用；本地已有 data\upstream\ice 就不用传）
+    [switch]$DownloadLexicon,
+    [string]$LexiconUrl = 'https://raw.githubusercontent.com/iDvel/rime-ice/main/cn_dicts/base.dict.yaml',
+    [string]$LexiconSha256 = '0418d5103d8e40c8fff4b686a873ad03e9836cd0419ecae0b7e1e2526312dba0',
+
     # 7-Zip 主程序；默认自动找 Program Files 和 PATH。
     [string]$SevenZip,
 
@@ -88,7 +93,19 @@ function Install-Lexicon {
     }
     $base = Join-Path $Ice 'base.dict.yaml'
     if (-not (Test-Path $base)) {
-        throw "没有 rime-ice 词库：$base`n先按 data\manifest.json 里的 url 下载到 $Ice"
+        if (-not $DownloadLexicon) {
+            throw "没有 rime-ice 词库：$base`n先按 data\manifest.json 里的 url 下载到 $Ice，或加 -DownloadLexicon 让脚本下"
+        }
+        New-Item -ItemType Directory -Force $Ice | Out-Null
+        Write-Host "  下载词库 $LexiconUrl" -ForegroundColor Cyan
+        & curl.exe -sSL --retry 3 --retry-delay 2 -o $base $LexiconUrl
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Path $base)) { throw "词库下载失败：$LexiconUrl" }
+        $got = (Get-FileHash $base -Algorithm SHA256).Hash.ToLower()
+        if ($LexiconSha256 -and $got -ne $LexiconSha256) {
+            Remove-Item $base -Force
+            throw "词库 SHA256 不匹配（拿到 $got）。已删掉这个文件——上游可能改过，确认后再更新 manifest 与脚本里的哈希。"
+        }
+        Write-Host "  词库校验通过：$got" -ForegroundColor Green
     }
     Copy-Item $base (Join-Path $DataDir 'base.dict.yaml') -Force
     $stub = @"
