@@ -60,18 +60,20 @@ Copy-Item "$ENG\rime-server.exe" $files -Force
 Copy-Item "$ENG\rime.dll"        $files -Force
 Write-Host '  DLL + 引擎 OK'
 
-# ── 3. rime 数据（排除个人词库与锁文件） ───────────────────────
+# ── 3. rime 数据 ───────────────────────────────────────────────
+# data 目录里的内容由 tools\fetch-librime.ps1 铺好（裁过的配置 + rime-ice 派生的 base.dict.yaml）。
+# 这里先确认那份词库在——不确认的话会打出"能装但候选很差"的包（Weasel 原版繁体词库）。
+$baseDict = Join-Path $ENG 'rime\data\base.dict.yaml'
+if (-not (Test-Path $baseDict)) {
+    throw "引擎目录里没有 base.dict.yaml —— 先用 tools\fetch-librime.ps1 把 data 铺好（否则打包会用 Weasel 原版繁体词库，候选质量明显变差）"
+}
 Copy-Item "$ENG\rime\data" (Join-Path $files 'rime') -Recurse -Force
 $userDst = Join-Path $files 'rime\user'
 New-Item -ItemType Directory -Force $userDst | Out-Null
-# 只带构建产物和 identity，不把开发机的个人词库发给别人
-Copy-Item "$ENG\rime\user\build" $userDst -Recurse -Force -ErrorAction SilentlyContinue
-foreach ($f in 'installation.yaml', 'user.yaml') {
-    $src = Join-Path $ENG "rime\user\$f"
-    if (Test-Path $src) { Copy-Item $src $userDst -Force }
-}
-Get-ChildItem $userDst -Recurse -File -Include *.userdb, *.lock -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
-Write-Host '  rime 数据 OK'
+# 不带 build：那是 librime 按本机词库编译出来的产物（22 MB）。实测全新编译只要 4.4 秒，
+# 带上它既让包大一倍，又会像 1.1.x 那样出现"表比词库新"的悬空状态。
+# 也不带 installation.yaml / user.yaml：里面有本机的 identity，不该发给别人。
+Write-Host '  rime 数据 OK（不含 build，首次启动自动编译 ≈4 秒）'
 
 # ── 4. 模糊音配置（和引擎配置同源，装机即生效，用户不用手跑脚本） ──
 $fuzzyDefault = Join-Path $root 'rime-config\fuzzy.yaml'

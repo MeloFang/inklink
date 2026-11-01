@@ -855,6 +855,73 @@ Obsidian 语料 + AI 兜底，默认关闭联网（符合项目铁律）。
 浮条和 ☰ 菜单最迟 600ms 跟着变。
 
 
+#### P5：发布工程化（进行中，2026-11-02）
+
+目标：任何人 clone 下来能一键复现出可发布的包，且**不再依赖开发机上那份手工攒出来的引擎目录**。
+
+**已完成：`tools\fetch-librime.ps1`**
+
+从 Weasel 安装包里抽 `rime.dll` 与 `rime\data`（librime 官方不发 Windows 二进制，Weasel 是官方
+Windows 前端，它包里那份就是 librime 本体，x86，正是我们要的）。版本与哈希写死在脚本参数里：
+
+```
+Weasel 0.17.4   weasel-0.17.4.0-installer.exe   12,431,118 B
+sha256 cf509534a8f5f8af9c98ed7cbb8f135439f145a8cbe7e50ede42bb5b5ab45c29
+```
+
+下载后校验哈希（不符就删文件重来），7-Zip 解包，按白名单裁 `data`：**90 个文件 13 MB → 15 个 4.16 MB**。
+白名单依据是 schema 引用链（`luna_pinyin_simp` → `luna_pinyin.schema` → `dictionary: luna_pinyin`
+＋ `dependencies: [stroke]` ＋ `import_preset: symbols/default` ＋ simplifier 的 t2s 与 opencc 词典）。
+
+**顺手挖出来的一个坑（重要）**：Weasel 自带的 `luna_pinyin.dict.yaml` 是**繁体原版**
+（`項目` 在、`项目` 不在，简体靠 simplifier 过滤），而且萌典的古籍字排得很前——拿它重建之后
+`xiangmu` 出的是 `㐮㙁`，`项目` 连前 30 都进不去。
+
+更麻烦的是：**1.1.x 线上那份好候选，其实来自一个对不上号的旧编译产物**——
+`C:\inklink-engine\rime\user\build\luna_pinyin.table.bin` 是 12,713 KB、编于 2026-10-24，
+而词库文件是 2025-06-04 的 962 KB。表比词库大十倍，说明它是更早那份**大词库**编出来的，
+词库后来被换掉了但表没重建。也就是说今天好用的候选依赖一个陈旧文件，全新安装会明显退化。
+
+**修法**：词库改用仓库里已有的 rime-ice 派生词库（`data\upstream\ice\base.dict.yaml`，
+16.2 MB，GPL-3.0，来源与哈希见 `data\manifest.json`），再加一个只做挂载的壳：
+
+```yaml
+name: luna_pinyin
+sort: by_weight
+use_preset_vocabulary: false   # essay.txt 已裁掉，开着只会每次启动报错
+import_tables:
+  - base
+...
+```
+
+换回 rime-ice 之后冷启动实测：**4.4 秒**出候选（全新 `rime\user`，含编译），
+`xiangmu → 项目 | 橡木 | 香木 | 向慕`，`zhongguo → 中国`，与线上一致。
+
+**另一个必须换的文件：`default.yaml`**
+
+Weasel 那份的 `schema_list` 列了五六套方案，数据已经被裁掉，留着会有两个后果：每次启动刷一屏
+`missing input schema: bopomofo / cangjie5 / …`，而且**默认方案会落到列表第一个（实测是 bopomofo）**，
+于是打 `xiangmu` 出的是注音候选。所以 `rime-config\default.yaml`（1,258 B）只留
+`schema_list: [luna_pinyin_simp]`，其余（标点、按键、`page_size`）与 Weasel 一致，由脚本覆盖过去。
+
+**已完成：`tools\build-engine.ps1`**
+
+把 `vcvarsall.bat x86` + `cl` 那一串手工命令脚本化，自动找 VS2022/2019 的 `vcvarsall.bat`
+（找不到就查 `vswhere`），编译完可直接 `-Dest` 铺进引擎目录。
+
+**已完成：`tools\release.ps1` 不再打包 `build\`**
+
+`rime\user\build` 是按本机词库编译出来的产物（**22.85 MB**），带上它既让包大一倍，又会重演
+上面那种"表比词库新"的悬空状态。实测全新编译只要 4.4 秒，所以不打进包。同时不再带
+`installation.yaml` / `user.yaml`（里面有本机 identity）。
+
+发布包体积：**28.65 MB → 8.87 MB**。
+
+**还没做**：GitHub Actions 出包、安装器改单文件 exe（`SignTool` 只能签 PE）、Release 页与
+SHA256、Top-3 统计（T5f）。
+
+
+
 ### 纠错探针怎么工作（2026 10 27）
 
 放在 **C++ 引擎侧**（`rime server/rime server.cc` 的 `query()`），不是 DLL 侧：一次管道往返就能把

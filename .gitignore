@@ -38,7 +38,6 @@ Thumbs.db
 /tsf/target/
 /tsf/target-static/
 
-# rime-server 的二进制与数据（从 Weasel 安装包解出，不进 git）
 /rime-server/rime.dll
 /rime-server/rime/
 /rime-server/*.exe
@@ -85,5 +84,7 @@ msg.txt
 
 # 候选窗预览图（`cargo test` 渲的 cand-preview-*.bmp 转出来的 PNG）
 /ui/cand-preview-*.png
-ui/bar-compare-dark.png
+/ui/bar-compare-dark.png
 /ui/badge-dark-x8.png
+# 上游二进制与词库（tools\fetch-librime.ps1 会重新下载，不入库）
+/vendor/
