@@ -70,9 +70,11 @@ inklink_tsf.dll (x64, 进宿主进程)  ──命名管道──▶  rime-server
 
 ## 代码签名
 
-发布包目前**没有**数字签名（自签名对陌生用户等于没有，所以没做）。正在申请 [SignPath Foundation](https://signpath.org/) 给开源项目的免费签名，策略与产物范围见 [`docs/code-signing-policy.md`](docs/code-signing-policy.md)。
+本项目使用 [SignPath Foundation](https://signpath.org/) 为开源项目提供的免费代码签名服务
+（申请中）。策略、签名范围与构建来源见 [`docs/code-signing-policy.md`](docs/code-signing-policy.md)。
 
-在此之前，请用 `SHA256SUMS.txt` 校验下载的包：
+在签名生效之前，发布包没有数字签名（自签名对陌生用户等于没有，所以没做）。
+请用同一次发布的 `SHA256SUMS.txt` 校验下载的包：
 
 ```powershell
 certutil -hashfile inklink-<版本>.zip SHA256

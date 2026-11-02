@@ -160,6 +160,12 @@ $hash
 
 $($recent -join "`n")
 
+## 代码签名
+
+本项目使用 [SignPath Foundation](https://signpath.org/) 为开源项目提供的免费代码签名服务
+（申请中，见 [签名策略](https://github.com/MeloFang/inklink/blob/main/docs/code-signing-policy.md)）。
+在签名生效前请用 `SHA256SUMS.txt` 校验下载的包。
+
 ## 许可
 
 GPL-3.0。词库衍生自 [rime-ice](https://github.com/iDvel/rime-ice)（GPL-3.0），
