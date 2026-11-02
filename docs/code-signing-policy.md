@@ -68,6 +68,22 @@ certutil -hashfile inklink-<版本>-setup.exe SHA256
 - 发布者账户需启用双因素认证（GitHub 账户设置里的 2FA）。
 - 没有推送权限的贡献者走 Pull Request；CI 在合并前跑格式化与 clippy。
 
+## 拿到签名之后怎么接（还没做）
+
+SignPath 审核通过后会给出：一个 GitHub App 安装入口、`SIGNPATH_API_TOKEN`、
+`SIGNPATH_ORGANIZATION_ID`，以及一条"签名请求配置"的 id。接进 CI 的步骤：
+
+1. 在仓库 `Settings → Secrets and variables → Actions` 加 `SIGNPATH_API_TOKEN` 与
+   `SIGNPATH_ORGANIZATION_ID`（不要写进仓库文件）。
+2. 安装 SignPath 的 GitHub App 并授权本仓库。
+3. 在 `.github/workflows/release.yml` 的**出包之后、挂 Release 之前**插入
+   `signpath/github-action-submit-signing-request@v1`，`artifact-configuration-slug` 指向
+   本项目在 SignPath 后台配置的产物清单（就是上面那张"会签名的文件"表）。
+4. 挂 Release 的文件换成**签名后**的产物，并把签名纳入冒烟测试
+   （`signtool verify /pa <文件>` 必须返回 0）。
+
+在 1–3 完成之前，工作流保持现状（不签名），发布不受影响。
+
 ## 报告的漏洞
 
 见 [SECURITY.md](../SECURITY.md)。
