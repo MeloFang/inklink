@@ -105,3 +105,5 @@ msg.txt
 # 设置窗构建产物
 /settings/target/
 /ui/settings-*.png
+# 部署脚本临时输出
+/_deploy.*
