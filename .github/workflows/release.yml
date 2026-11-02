@@ -34,6 +34,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # 打过一次脸：本地 deploy-local.ps1 被执行策略拦下、VERSION 没自增，
+      # 却照样打了 tag → 包里是 1.1.30，Release 标着 v1.1.31。
+      # 所以先卡一道：tag 和 VERSION 必须一致，不一致立刻失败，别等 5 分钟编完才发现。
+      - name: 检查 tag 与 VERSION 是否一致
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          $v = (Get-Content VERSION -Raw).Trim()
+          $tag = "${{ github.ref_name }}" -replace '^v', ''
+          Write-Host "VERSION=$v  tag=v$tag"
+          if ($v -ne $tag) {
+              Write-Error "VERSION ($v) 和 tag (v$tag) 不一致：先跑 tools\deploy-local.ps1 让版本号自增，再打 tag。"
+              exit 1
+          }
+
       - name: 装 Rust 工具链（含 i686 目标）
         uses: dtolnay/rust-toolchain@stable
         with:
