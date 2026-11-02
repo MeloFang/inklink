@@ -101,3 +101,6 @@ msg.txt
 /vendor/
 # 单文件安装器的构建产物
 /installer/setup/target/
+
+# 设置窗构建产物
+/settings/target/

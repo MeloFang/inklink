@@ -47,6 +47,7 @@ inklink/
 │  ├─ src/menu.rs        自绘 ☰ 菜单（不用 TrackPopupMenu，见 ADR-0008）
 │  └─ build.rs           把 VERSION 编进 DLL
 ├─ ui/                   【已退役，源码留作回退】旧独立浮条进程（1.1.10 起不构建/不部署/不自启，见 ADR-0008）
+├─ settings/             设置窗 inklink-settings.exe（P2a：一页原生小窗，只改 HKCU\Software\inklink\Config）
 ├─ rime-server/          C++ 引擎服务（链 librime，x86）
 │  └─ rime-server.cc     协议 [u8 type] + 查询/选词；个人词库学习层 + --selftest
 ├─ rime-config/          引擎侧配置源

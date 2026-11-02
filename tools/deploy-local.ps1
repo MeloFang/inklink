@@ -47,6 +47,15 @@ if (-not $NoBuild) {
         $rc32 = $LASTEXITCODE
     } finally { Pop-Location }
 
+    # 设置窗（P2a）：独立小 exe，跟 DLL 放同一个目录，浮条菜单里的「设置…」会拉起它
+    $settingsDir = Join-Path $root 'settings'
+    if (Test-Path $settingsDir) {
+        Write-Host '[构建] 设置窗' -ForegroundColor White
+        Push-Location $settingsDir
+        try { cargo build --release } finally { Pop-Location }
+        if ($LASTEXITCODE -ne 0) { throw "设置窗构建失败（退出码 $LASTEXITCODE）" }
+    }
+
     if ($rc64 -ne 0 -or $rc32 -ne 0) { throw "构建失败（cargo 退出码 x64=$rc64 x86=$rc32）" }
     # 产物必须是这次构建写出来的，否则等于把旧 DLL 换个新名字部署
     foreach ($p in @($dll64, $dll32)) {
@@ -78,6 +87,14 @@ $ico = Join-Path $root 'installer\inklink.ico'
 if (Test-Path $ico) { Copy-Item $ico (Join-Path $PF 'inklink.ico') -Force
         $badge = Join-Path $root 'installer\inklink-badge.ico'
         if (Test-Path $badge) { Copy-Item $badge (Join-Path $PF 'inklink-badge.ico') -Force } }
+
+# 设置窗：浮条菜单点「设置…」时按 DLL 同目录找它
+$settingsExe = Join-Path $root 'settings\target\release\inklink-settings.exe'
+if (Test-Path $settingsExe) {
+    $dstSet = Join-Path $PF 'inklink-settings.exe'
+    if (Test-Path $dstSet) { Move-Item $dstSet "$dstSet.old" -Force -ErrorAction SilentlyContinue }
+    Copy-Item $settingsExe $dstSet -Force
+}
 
 # 浮条现在画在 DLL 里（宿主进程内，搜狗那种），不再有独立的 inklink-ui.exe。
 Set-ItemProperty "HKLM:\SOFTWARE\Classes\CLSID\$CLSID\InprocServer32" -Name '(default)' -Value $target64

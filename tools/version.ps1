@@ -40,7 +40,8 @@ function Set-InklinkVersion {
     # 只同步实际出货的组件；app/ 已退役，保持原版本号
     $targets = @(
         @{ Path = 'tsf/Cargo.toml'; Pattern = '^version\s*=\s*".*"'; Replacement = "version = `"$Version`"" },
-        @{ Path = 'ui/Cargo.toml';  Pattern = '^version\s*=\s*".*"'; Replacement = "version = `"$Version`"" }
+        @{ Path = 'ui/Cargo.toml';  Pattern = '^version\s*=\s*".*"'; Replacement = "version = `"$Version`"" },
+        @{ Path = 'settings/Cargo.toml'; Pattern = '^version\s*=\s*".*"'; Replacement = "version = `"$Version`"" }
     )
     foreach ($t in $targets) {
         $p = Join-Path $root $t.Path

@@ -38,7 +38,7 @@ use std::cell::Cell;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, Ordering};
 
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
+use windows_sys::Win32::Foundation::{CloseHandle, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
     AC_SRC_ALPHA, AC_SRC_OVER, AlphaBlend, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION,
     BeginPaint, CreateCompatibleDC, CreateDIBSection, CreateFontW, CreateSolidBrush,
@@ -46,7 +46,9 @@ use windows_sys::Win32::Graphics::Gdi::{
     EndPaint, FillRect, GdiFlush, HBITMAP, HBRUSH, HDC, HGDIOBJ, PAINTSTRUCT, SelectObject,
     SetBkMode, SetTextColor, TRANSPARENT,
 };
-use windows_sys::Win32::System::Threading::GetCurrentProcessId;
+use windows_sys::Win32::System::Threading::{
+    CreateProcessW, GetCurrentProcessId, CREATE_NO_WINDOW, PROCESS_INFORMATION, STARTUPINFOW,
+};
 use windows_sys::Win32::UI::HiDpi::GetDpiForSystem;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -1591,7 +1593,56 @@ fn handle_menu(hwnd: HWND, cmd: u32) {
     match cmd {
         crate::menu::CMD_TOGGLE_MODE => toggle_mode(hwnd),
         crate::menu::CMD_TOGGLE_PUNCT => toggle_punct(hwnd),
+        crate::menu::CMD_SETTINGS => open_settings(),
         _ => {}
+    }
+}
+
+/// 打开设置窗（`inklink-settings.exe`，和 DLL 装在同一个目录）。
+///
+/// 用 `CreateProcessW` 而不是 `ShellExecuteW`：后者会走 shell 关联、可能弹 UAC，
+/// 而且我们要的是"同一个目录下的兄弟程序"，路径自己算得出来。
+/// 失败不弹窗（在宿主进程里弹窗会打断用户打字），只写日志。
+fn open_settings() {
+    let dll = crate::registry::dll_path();
+    let dir = match std::path::Path::new(&dll).parent() {
+        Some(d) => d.to_path_buf(),
+        None => {
+            crate::log_line("settings: 拿不到 DLL 目录");
+            return;
+        }
+    };
+    let exe = dir.join("inklink-settings.exe");
+    if !exe.exists() {
+        crate::log_line(&format!("settings: 找不到 {}", exe.display()));
+        return;
+    }
+    let app = wide(&exe.to_string_lossy());
+    let mut si: STARTUPINFOW = unsafe { std::mem::zeroed() };
+    si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
+    let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+    let ok = unsafe {
+        CreateProcessW(
+            app.as_ptr(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            0,
+            CREATE_NO_WINDOW,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            &si,
+            &mut pi,
+        )
+    } != 0;
+    if ok {
+        unsafe {
+            CloseHandle(pi.hProcess);
+            CloseHandle(pi.hThread);
+        }
+        crate::log_line("settings: launched");
+    } else {
+        crate::log_line("settings: CreateProcessW failed");
     }
 }
 

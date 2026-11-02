@@ -63,7 +63,11 @@ Copy-Item (Join-Path $root 'installer\inklink.ico') (Join-Path $files 'inklink.i
 Copy-Item (Join-Path $root 'installer\inklink-badge.ico') (Join-Path $files 'inklink-badge.ico') -Force
 Copy-Item "$ENG\rime-server.exe" $files -Force
 Copy-Item "$ENG\rime.dll"        $files -Force
-Write-Host '  DLL + 引擎 OK'
+# 设置窗（P2a）：和 DLL 同目录，浮条菜单的「设置…」按同目录找它
+$settingsExe = Join-Path $root 'settings\target\release\inklink-settings.exe'
+if (-not (Test-Path $settingsExe)) { throw "没有设置窗产物：$settingsExe（先跑 tools\deploy-local.ps1 或 cargo build -p inklink-settings --release）" }
+Copy-Item $settingsExe (Join-Path $files 'inklink-settings.exe') -Force
+Write-Host '  DLL + 引擎 + 设置窗 OK'
 
 # ── 3. rime 数据 ───────────────────────────────────────────────
 # data 目录里的内容由 tools\fetch-librime.ps1 铺好（裁过的配置 + rime-ice 派生的 base.dict.yaml）。

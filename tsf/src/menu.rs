@@ -148,9 +148,10 @@ fn build_items(chinese: bool, punct: bool) -> Vec<Item> {
         sep(),
         Item {
             id: CMD_SETTINGS,
-            label: "设置…（还没做）".to_string(),
+            // 1.1.30 起真的有设置窗了（inklink-settings.exe，装在同一个目录）。
+            label: "设置…".to_string(),
             checked: false,
-            enabled: false,
+            enabled: true,
             separator: false,
         },
         Item {
@@ -627,16 +628,19 @@ mod tests {
 
     #[test]
     fn disabled_items_are_still_rows() {
-        // 灰掉的项（设置…/版本号）在命中测试里仍然是"行"，只是点击时不派发命令。
+        // 灰掉的「版本号」在命中测试里仍然是"行"，只是点击时不派发命令。
+        // 设置项从 1.1.30 起可点了，所以这里改用版本号那行来验。
         let list = items();
         let (_, _) = menu_size(&list);
+        let about = list.iter().position(|it| it.id == CMD_ABOUT).unwrap();
+        assert!(!list[about].enabled);
         let settings = list.iter().position(|it| it.id == CMD_SETTINGS).unwrap();
-        assert!(!list[settings].enabled);
+        assert!(list[settings].enabled, "设置项现在应该能点");
         let mut top = scale(PAD_Y);
-        for it in list.iter().take(settings) {
+        for it in list.iter().take(about) {
             top += row_height(it);
         }
-        assert_eq!(row_at(&list, top + 1), Some(settings));
+        assert_eq!(row_at(&list, top + 1), Some(about));
     }
 
     #[test]
