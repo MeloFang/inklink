@@ -14,4 +14,4 @@
 
 ## 不在范围内
 
-- 上游组件自身的漏洞（ime.dll 来自 Weasel/librime），请报给上游。
+- 上游组件自身的漏洞（`rime.dll` 来自 Weasel/librime），请报给上游。
