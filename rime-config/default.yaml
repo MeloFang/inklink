@@ -5,6 +5,11 @@ config_version: '0.40'
 
 schema_list:
   - schema: luna_pinyin_simp
+  # 仅供引擎内部使用：同一个词典，但不带模糊音补丁。
+  # 引擎每次查询先问它一遍，把「精确命中」的候选排到模糊命中之前
+  # （否则打 ni 第一个会是模糊音拽进来的「里」）。
+  # 不对外暴露成可选方案 —— DLL 激活时显式选 luna_pinyin_simp。
+  - schema: luna_pinyin_exact
 
 switcher:
   caption: 〔方案選單〕

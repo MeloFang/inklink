@@ -1,0 +1,46 @@
+# Rime schema
+# encoding: utf-8
+#
+# 只给引擎内部用的「精确方案」。
+#
+# 和 luna_pinyin_simp 的唯一差别：**不套模糊音补丁**。
+# 模糊音补丁写在 rime/user/luna_pinyin_simp.custom.yaml 里，只对
+# luna_pinyin_simp 这个 schema_id 生效；这里换个 id，就拿到原始拼音表。
+#
+# 引擎每次查询先问这个会话（精确命中），再问带模糊音的会话，
+# 去重后把模糊命中的接在后面 —— 打 ni 就该先出「你」，而不是「里」。
+
+__include: luna_pinyin.schema:/
+
+schema:
+  schema_id: luna_pinyin_exact
+  name: 朙月拼音·精确
+  version: "0.22"
+  author:
+    - 佛振 <chen.sst@gmail.com>
+  description: |
+    与 luna_pinyin_simp 相同，但不应用模糊音。引擎内部使用，不对外暴露。
+
+switches:
+  - name: ascii_mode
+    reset: 0
+    states: [ 中文, 西文 ]
+  - name: full_shape
+    states: [ 半角, 全角 ]
+  - name: zh_simp
+    reset: 1
+    states: [ 漢字, 汉字 ]
+  - name: ascii_punct
+    states: [ 。，, ．， ]
+
+translator:
+  # 自己的 prism：prism 是按 speller/algebra 编的，借用 simp 那个等于把模糊音带回来。
+  prism: luna_pinyin_exact
+
+simplifier:
+  option_name: zh_simp
+
+key_binder:
+  bindings/+:
+    - { when: always, accept: Control+Shift+4, toggle: zh_simp }
+    - { when: always, accept: Control+Shift+dollar, toggle: zh_simp }

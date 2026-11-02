@@ -82,6 +82,11 @@ static FnGetCommit g_get_commit;
 static FnFreeCommit g_free_commit;
 
 static RimeSessionId g_session = 0;
+// 「精确方案」会话：同一个词典，但 speller/algebra 不带模糊音补丁。
+// 每次查询先问它，让精确命中的候选排在模糊命中之前（否则打 ni 第一个是「里」）。
+static RimeSessionId g_exact = 0;
+// 用户有没有开模糊音。没开的话两个会话候选完全一样，白跑一遍没意义。
+static bool g_fuzzy_on = false;
 static std::mutex g_rime_mutex;
 
 // ───────── 自建用户记忆层 ─────────
@@ -478,6 +483,38 @@ static std::vector<std::string> collect_page0(const std::string& code, size_t ne
     return out;
 }
 
+/// 在指定会话里把候选收集到 max_cands 个（当前页 + 往后翻几页）。
+///
+/// 抽出来是因为现在有两个会话：带模糊音的 g_session 和不带的 g_exact，
+/// 两边都要跑同一套「模拟按键 → 读 context → 翻页」流程。
+static std::vector<std::string> collect_candidates(RimeSessionId session, const std::string& code,
+                                                   size_t max_cands) {
+    std::vector<std::string> out;
+    g_clear(session);
+    if (!g_simulate(session, code.c_str())) {
+        g_clear(session);
+        return out;
+    }
+    for (int page = 0; page < 6 && out.size() < max_cands; page++) {
+        RimeContext ctx;
+        std::memset(&ctx, 0, sizeof(ctx));
+        ctx.data_size = sizeof(RimeContext);
+        if (!g_get_context(session, &ctx)) break;
+        int n = ctx.menu.num_candidates;
+        for (int i = 0; i < n && out.size() < max_cands; i++) {
+            if (ctx.menu.candidates[i].text && ctx.menu.candidates[i].text[0]) {
+                out.push_back(ctx.menu.candidates[i].text);
+            }
+        }
+        bool last = ctx.menu.is_last_page != 0;
+        g_free_context(&ctx);
+        if (last) break;
+        if (!g_simulate(session, "{Page_Down}")) break;
+    }
+    g_clear(session);
+    return out;
+}
+
 /// 一个词在"当前应用"里的排序分。
 ///
 /// 规则：全局次数 + 当前应用次数 ×2 —— 当前应用里的使用次数算双倍。
@@ -826,6 +863,13 @@ static std::string user_dict_path() {
 // ───────────────────────── 查询 ─────────────────────────
 static const int MAX_CANDS = 50;
 
+/// 精确命中最多占前多少个候选位。
+///
+/// 不能把精确会话的 50 个全放前面：那样模糊音就"等于关掉了"——打 ni 想找「里」
+/// 的人得翻十几页。留 15 个（三页）给精确命中，模糊命中的从第 16 位开始接，
+/// 既保证第一屏永远是对的，又不至于让模糊音变成摆设。
+static const size_t EXACT_HEAD = 15;
+
 /// `app` 是发起查询的应用名（exe 名小写），空串表示不知道（老 DLL）。
 static std::vector<std::string> query(const std::string& code, const std::string& app) {
     std::vector<std::string> out;
@@ -861,30 +905,29 @@ static std::vector<std::string> query(const std::string& code, const std::string
         if (!corrected.empty()) logf("correct %s -> %zu words", code.c_str(), corrected.size());
     }
 
-    g_clear(g_session);
-    if (!g_simulate(g_session, flat.c_str())) {
-        g_clear(g_session);
+    // ── 精确优先 ──
+    // 先问「不带模糊音」的会话。开了模糊音时，librime 会把 huang 也匹配到 fang，
+    // 而「放」的频次是「黄」的十倍，结果第一个候选变成「放」。
+    // 两个会话的候选合并时把精确命中的放前面，模糊命中接在后面 ——
+    // 模糊音该起作用的地方（真打错、口音）仍然能兜到，只是不再抢第一屏。
+    std::vector<std::string> exact;
+    if (g_exact && g_fuzzy_on) {
+        exact = collect_candidates(g_exact, flat, EXACT_HEAD);
+    }
+
+    out = collect_candidates(g_session, flat, MAX_CANDS);
+    if (out.empty() && exact.empty()) {
         if (corrected.empty()) return out;
         return corrected;   // 连 rime 都喂不进去，直接给纠错结果
     }
 
-    // 收集当前页 + 往后翻几页，凑够 MAX_CANDS 个候选
-    for (int page = 0; page < 6 && (int)out.size() < MAX_CANDS; page++) {
-        RimeContext ctx;
-        std::memset(&ctx, 0, sizeof(ctx));
-        ctx.data_size = sizeof(RimeContext);
-        if (!g_get_context(g_session, &ctx)) break;
-
-        int n = ctx.menu.num_candidates;
-        for (int i = 0; i < n && (int)out.size() < MAX_CANDS; i++) {
-            if (ctx.menu.candidates[i].text && ctx.menu.candidates[i].text[0]) {
-                out.push_back(ctx.menu.candidates[i].text);
-            }
+    if (!exact.empty()) {
+        std::vector<std::string> merged = exact;
+        for (const std::string& w : out) {
+            if (std::find(merged.begin(), merged.end(), w) == merged.end()) merged.push_back(w);
         }
-        bool last = ctx.menu.is_last_page != 0;
-        g_free_context(&ctx);
-        if (last) break;
-        if (!g_simulate(g_session, "{Page_Down}")) break;
+        if (merged.size() > (size_t)MAX_CANDS) merged.resize(MAX_CANDS);
+        out.swap(merged);
     }
 
     // 合并纠错结果：探针只在"原串根本切不干净"时才跑，此时 rime 那串候选是拿多余
@@ -1281,6 +1324,31 @@ int main(int argc, char** argv) {
         return 3;
     }
     select_schema(g_session, "luna_pinyin_simp");
+
+    // 第二个会话：不带模糊音补丁的方案，用来做「精确优先」排序。
+    // 选不上（老引擎目录里没有这个 schema）就退化成单会话，功能不受影响。
+    g_exact = create_session();
+    if (g_exact && select_schema(g_exact, "luna_pinyin_exact")) {
+        logf("exact session=%u ready", (unsigned)g_exact);
+    } else {
+        logf("exact schema unavailable -> exact-first disabled");
+        g_exact = 0;
+    }
+    // 模糊音补丁打到 user/luna_pinyin_simp.custom.yaml。没有它（或全被注释掉）
+    // 说明用户没开模糊音，两个会话结果一样，没必要多跑一遍。
+    {
+        std::string custom = user_dir + "\\luna_pinyin_simp.custom.yaml";
+        FILE* f = fopen(custom.c_str(), "rb");
+        if (f) {
+            std::string content;
+            char buf[4096];
+            size_t n;
+            while ((n = fread(buf, 1, sizeof(buf), f)) > 0) content.append(buf, n);
+            fclose(f);
+            g_fuzzy_on = content.find("pinyin:/") != std::string::npos;
+        }
+        logf("fuzzy_on=%d", (int)g_fuzzy_on);
+    }
     logf("session=%u ready", (unsigned)g_session);
 
     // NULL DACL：允许其它用户/进程连接（输入法会被不同权限的应用调用）

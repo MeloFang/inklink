@@ -283,6 +283,16 @@ if (Test-Path $defaultYaml) {
     Write-Host "  警告：没找到 rime-config\default.yaml，保留 Weasel 那份（多方案会变慢）" -ForegroundColor Yellow
 }
 
+# 「精确方案」：和 luna_pinyin_simp 同一个词典，但不带模糊音补丁。
+# 引擎用它做「精确优先」排序（打 ni 先出「你」而不是「里」）。
+$exactYaml = Join-Path (Split-Path -Parent $PSScriptRoot) 'rime-config\luna_pinyin_exact.schema.yaml'
+if (Test-Path $exactYaml) {
+    Copy-Item $exactYaml (Join-Path $dataDest 'luna_pinyin_exact.schema.yaml') -Force
+    Write-Host "  luna_pinyin_exact.schema.yaml -> 精确优先用的无模糊音方案" -ForegroundColor Green
+} else {
+    Write-Host "  警告：没找到 rime-config\luna_pinyin_exact.schema.yaml，精确优先会退化成单方案" -ForegroundColor Yellow
+}
+
 $left = Get-ChildItem $dataDest -Recurse -File
 Write-Host "== 完成 ==" -ForegroundColor Cyan
 $left | Sort-Object FullName | ForEach-Object {
