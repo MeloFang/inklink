@@ -14,9 +14,7 @@
 use std::cell::RefCell;
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
-use windows_sys::Win32::Graphics::Gdi::{
-    GetStockObject, DEFAULT_GUI_FONT, HGDIOBJ,
-};
+use windows_sys::Win32::Graphics::Gdi::{GetStockObject, DEFAULT_GUI_FONT, HGDIOBJ};
 use windows_sys::Win32::System::Registry::{
     RegCloseKey, RegCreateKeyExW, RegQueryValueExW, RegSetValueExW, HKEY, HKEY_CURRENT_USER,
     KEY_READ, KEY_WRITE, REG_DWORD, REG_OPTION_NON_VOLATILE,
@@ -24,9 +22,9 @@ use windows_sys::Win32::System::Registry::{
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, GetWindowTextW,
     IsDialogMessageW, MessageBoxW, PostQuitMessage, RegisterClassW, SendMessageW, SetWindowTextW,
-    ShowWindow, TranslateMessage, BS_AUTOCHECKBOX, BM_GETCHECK, BM_SETCHECK, CW_USEDEFAULT, ES_NUMBER,
-    MB_ICONERROR, MB_OK, MSG, SW_SHOW, WNDCLASSW, WM_COMMAND, WM_CREATE, WM_DESTROY, WS_BORDER,
-    WS_CAPTION, WS_CHILD, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE, WS_OVERLAPPED,
+    ShowWindow, TranslateMessage, BM_GETCHECK, BM_SETCHECK, BS_AUTOCHECKBOX, CW_USEDEFAULT,
+    ES_NUMBER, MB_ICONERROR, MB_OK, MSG, SW_SHOW, WM_COMMAND, WM_CREATE, WM_DESTROY, WNDCLASSW,
+    WS_BORDER, WS_CAPTION, WS_CHILD, WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
 };
 
 const KEY_PATH: &str = r"Software\inklink\Config";
@@ -99,12 +97,8 @@ fn text_of(h: HWND) -> String {
 
 /// 解析并夹到合法区间。空白直接当默认值（用户清空输入框是常见操作）。
 fn parse_in(h: HWND, what: &str, range: (u32, u32)) -> Result<u32, String> {
-    parse_clamped(&text_of(h), range).ok_or_else(|| {
-        format!(
-            "{what} 要在 {} 到 {} 之间。",
-            range.0, range.1
-        )
-    })
+    parse_clamped(&text_of(h), range)
+        .ok_or_else(|| format!("{what} 要在 {} 到 {} 之间。", range.0, range.1))
 }
 
 /// 空白 → `None` 由调用方决定；这里只做"能不能解析成区间内的数"。
@@ -205,7 +199,13 @@ fn load_config() -> Config {
             .filter(|v| *v <= UNDO_RANGE.1)
             .unwrap_or(DEF_UNDO);
         RegCloseKey(h);
-        Config { dark, learn, cols, rows, undo_ms: undo }
+        Config {
+            dark,
+            learn,
+            cols,
+            rows,
+            undo_ms: undo,
+        }
     }
 }
 
@@ -231,14 +231,24 @@ fn wide_static(s: &str) -> &'static [u16] {
     Box::leak(wide(s).into_boxed_slice())
 }
 
-unsafe fn child(class: &str, text: &str, style: u32, x: i32, y: i32, w: i32, h: i32,
-                 parent: HWND, id: usize) -> HWND {
+unsafe fn child(
+    class: &str,
+    text: &str,
+    style: u32,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    parent: HWND,
+    id: usize,
+) -> HWND {
     let cls = wide(class);
     CreateWindowExW(
         0,
         cls.as_ptr(),
         wide_static(text).as_ptr(),
-        WS_CHILD | WS_VISIBLE | style,        x,
+        WS_CHILD | WS_VISIBLE | style,
+        x,
         y,
         w,
         h,
@@ -270,12 +280,32 @@ unsafe fn build_ui(hwnd: HWND) {
         h
     };
     let edit = |t: &str, x: i32, y: i32, w: i32, id: usize| {
-        let h = child("EDIT", t, WS_BORDER | WS_TABSTOP | ES_NUMBER as u32, x, y, w, 22, hwnd, id);
+        let h = child(
+            "EDIT",
+            t,
+            WS_BORDER | WS_TABSTOP | ES_NUMBER as u32,
+            x,
+            y,
+            w,
+            22,
+            hwnd,
+            id,
+        );
         SendMessageW(h, 0x0030, font as usize, 1);
         h
     };
     let check = |t: &str, x: i32, y: i32, w: i32, id: usize| {
-        let h = child("BUTTON", t, WS_TABSTOP | BS_AUTOCHECKBOX as u32, x, y, w, 20, hwnd, id);
+        let h = child(
+            "BUTTON",
+            t,
+            WS_TABSTOP | BS_AUTOCHECKBOX as u32,
+            x,
+            y,
+            w,
+            20,
+            hwnd,
+            id,
+        );
         add(h);
         h
     };
@@ -306,7 +336,17 @@ unsafe fn build_ui(hwnd: HWND) {
     label("撤回窗口（毫秒，0 = 关掉撤回）", 16, 112, 240);
     let undo = edit(&c.undo_ms.to_string(), 16, 134, 80, ID_UNDO);
 
-    let status = child("STATIC", "改完点保存，下一次按键就生效，不用重启。", 0, 16, 166, 300, 18, hwnd, 0);
+    let status = child(
+        "STATIC",
+        "改完点保存，下一次按键就生效，不用重启。",
+        0,
+        16,
+        166,
+        300,
+        18,
+        hwnd,
+        0,
+    );
     add(status);
 
     button("保存", 16, 196, 76, ID_SAVE);
@@ -329,17 +369,29 @@ fn on_save(hwnd: HWND) {
     match read_form(&ui) {
         Ok(c) => {
             if save_config(c) {
-                UI.with(|u| unsafe { set_text(u.borrow().status, "已保存 —— 下一次按键生效。") });
+                UI.with(|u| unsafe {
+                    set_text(u.borrow().status, "已保存 —— 下一次按键生效。")
+                });
             } else {
                 unsafe {
                     let msg = wide("写注册表失败。\n\n可能是权限问题，试试以管理员身份运行。");
-                    MessageBoxW(hwnd, msg.as_ptr(), wide("inklink").as_ptr(), MB_OK | MB_ICONERROR);
+                    MessageBoxW(
+                        hwnd,
+                        msg.as_ptr(),
+                        wide("inklink").as_ptr(),
+                        MB_OK | MB_ICONERROR,
+                    );
                 }
             }
         }
         Err(e) => unsafe {
             let msg = wide(&e);
-            MessageBoxW(hwnd, msg.as_ptr(), wide("inklink").as_ptr(), MB_OK | MB_ICONERROR);
+            MessageBoxW(
+                hwnd,
+                msg.as_ptr(),
+                wide("inklink").as_ptr(),
+                MB_OK | MB_ICONERROR,
+            );
         },
     }
 }
@@ -404,7 +456,8 @@ fn main() {
                 std::ptr::null_mut(),
                 windows_sys::Win32::UI::WindowsAndMessaging::IDC_ARROW,
             ),
-            hbrBackground: (windows_sys::Win32::Graphics::Gdi::COLOR_WINDOW + 1) as *mut core::ffi::c_void,
+            hbrBackground: (windows_sys::Win32::Graphics::Gdi::COLOR_WINDOW + 1)
+                as *mut core::ffi::c_void,
             lpszMenuName: std::ptr::null(),
             lpszClassName: cls.as_ptr(),
         };
