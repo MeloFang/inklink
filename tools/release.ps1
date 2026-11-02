@@ -72,6 +72,11 @@ $baseDict = Join-Path $ENG 'rime\data\base.dict.yaml'
 if (-not (Test-Path $baseDict)) {
     throw "引擎目录里没有 base.dict.yaml —— 先用 tools\fetch-librime.ps1 把 data 铺好（否则打包会用 Weasel 原版繁体词库，候选质量明显变差）"
 }
+# 单字表同理：没有 8105.dict.yaml 的话，装出来的输入法打单个字（zi/wo/de）一个候选都没有。
+$charsDict = Join-Path $ENG 'rime\data\8105.dict.yaml'
+if (-not (Test-Path $charsDict)) {
+    throw "引擎目录里没有 8105.dict.yaml —— 单音节（zi/wo/de）会查不到候选，先用 tools\fetch-librime.ps1 铺好 data"
+}
 Copy-Item "$ENG\rime\data" (Join-Path $files 'rime') -Recurse -Force
 $userDst = Join-Path $files 'rime\user'
 New-Item -ItemType Directory -Force $userDst | Out-Null

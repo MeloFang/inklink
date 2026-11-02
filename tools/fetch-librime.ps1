@@ -36,6 +36,10 @@ param(
     [switch]$DownloadLexicon,
     [string]$LexiconUrl = 'https://raw.githubusercontent.com/iDvel/rime-ice/main/cn_dicts/base.dict.yaml',
     [string]$LexiconSha256 = '0418d5103d8e40c8fff4b686a873ad03e9836cd0419ecae0b7e1e2526312dba0',
+    # 单字表：base 里只有词、没有常用单字。少了它 `zi`/`wo`/`de` 这类**单音节**查询
+    # 会一个候选都拿不到（多音节词还能命中），表现就是"打单个字什么都没出来"。
+    [string]$CharsUrl = 'https://raw.githubusercontent.com/iDvel/rime-ice/main/cn_dicts/8105.dict.yaml',
+    [string]$CharsSha256 = '1f9a42b91dea6982baee2551981780271aeffd78876662b9c9f324e56b37b120',
 
     # 7-Zip 主程序；默认自动找 Program Files 和 PATH。
     [string]$SevenZip,
@@ -69,6 +73,8 @@ $KeepData = @(
     'luna_pinyin.dict.yaml'     # Weasel 原版；下面会被 rime-ice 派生的壳覆盖（-NoRimeIce 时才留它）
     'luna_pinyin.schema.yaml'
     'luna_pinyin_simp.schema.yaml'
+    'base.dict.yaml'            # rime-ice 词库（Install-Lexicon 铺进来，必须留，否则被裁掉）
+    '8105.dict.yaml'            # rime-ice 常用单字表；没了单音节查询（zi/wo/de）全空
     'stroke.dict.yaml'          # luna_pinyin 依赖 stroke（` 反查），删了 librime 会报缺依赖
     'stroke.schema.yaml'
     'pinyin.yaml'
@@ -108,12 +114,32 @@ function Install-Lexicon {
         Write-Host "  词库校验通过：$got" -ForegroundColor Green
     }
     Copy-Item $base (Join-Path $DataDir 'base.dict.yaml') -Force
+
+    # 常用单字表（8105）。没有它单音节查询会全空——`zi` 只回一个原始 "zi"。
+    $chars = Join-Path $Ice '8105.dict.yaml'
+    if (-not (Test-Path $chars)) {
+        if (-not $DownloadLexicon) {
+            throw "没有单字表：$chars`n先按 data\manifest.json 里的 url 下载到 $Ice，或加 -DownloadLexicon 让脚本下"
+        }
+        Write-Host "  下载单字表 $CharsUrl" -ForegroundColor Cyan
+        & curl.exe -sSL --retry 3 --retry-delay 2 -o $chars $CharsUrl
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Path $chars)) { throw "单字表下载失败：$CharsUrl" }
+        $gotC = (Get-FileHash $chars -Algorithm SHA256).Hash.ToLower()
+        if ($CharsSha256 -and $gotC -ne $CharsSha256) {
+            Remove-Item $chars -Force
+            throw "单字表 SHA256 不匹配（拿到 $gotC）。已删掉——上游可能改过，确认后再更新 manifest 与脚本里的哈希。"
+        }
+        Write-Host "  单字表校验通过：$gotC" -ForegroundColor Green
+    }
+    Copy-Item $chars (Join-Path $DataDir '8105.dict.yaml') -Force
+
     $stub = @"
 # Rime dictionary
 # encoding: utf-8
 #
-# inklink 主词库挂载点：词条全在 base.dict.yaml（rime-ice 派生，GPL-3.0）。
-# 这个壳只负责让 luna_pinyin.schema.yaml 的 `dictionary: luna_pinyin` 找到东西。
+# inklink 主词库挂载点：词条在 base.dict.yaml（rime-ice 派生，GPL-3.0），
+# 常用单字在 8105.dict.yaml。这个壳只负责让 luna_pinyin.schema.yaml 的
+# `dictionary: luna_pinyin` 找到东西。
 #
 # use_preset_vocabulary 关掉：它会把 essay.txt 一起编进表，而发布包里没有 essay.txt。
 name: luna_pinyin
@@ -122,12 +148,13 @@ sort: by_weight
 use_preset_vocabulary: false
 import_tables:
   - base
+  - 8105
 ...
 "@
     # 必须无 BOM：librime 解析 yaml 时 BOM 会被当成内容的一部分。
     [System.IO.File]::WriteAllText((Join-Path $DataDir 'luna_pinyin.dict.yaml'), $stub, (New-Object System.Text.UTF8Encoding($false)))
     $kb = [int]((Get-Item $base).Length / 1KB)
-    Write-Host "  词库 -> base.dict.yaml ($kb KB) + luna_pinyin 挂载壳" -ForegroundColor Green
+    Write-Host "  词库 -> base.dict.yaml ($kb KB) + 8105.dict.yaml + luna_pinyin 挂载壳" -ForegroundColor Green
 }
 
 function Resolve-SevenZip {
