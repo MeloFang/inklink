@@ -17,7 +17,8 @@
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering};
 
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, SIZE, WPARAM};
+use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
+use windows_sys::Win32::System::Threading::GetCurrentProcessId;
 use windows_sys::Win32::Graphics::Gdi::{
     BeginPaint, CreateFontW, CreatePen, CreateRoundRectRgn, CreateSolidBrush, DT_LEFT,
     DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawTextW, EndPaint, FillRect, GetDC, GetStockObject,
@@ -25,10 +26,11 @@ use windows_sys::Win32::Graphics::Gdi::{
     SelectObject, SetBkMode, SetTextColor, SetWindowRgn, TRANSPARENT,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, GetClientRect, IsWindowVisible, MA_NOACTIVATE,
-    RegisterClassW, SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOZORDER, SetWindowPos,
-    ShowWindow, WM_ERASEBKGND, WM_LBUTTONDOWN, WM_MOUSEACTIVATE, WM_PAINT, WNDCLASSW,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, GetClientRect, GetForegroundWindow,
+    GetWindowThreadProcessId, IsWindowVisible, MA_NOACTIVATE, RegisterClassW, SW_HIDE,
+    SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOZORDER, SetWindowPos, ShowWindow, WindowFromPoint,
+    WM_ERASEBKGND, WM_LBUTTONDOWN, WM_MOUSEACTIVATE, WM_PAINT, WNDCLASSW, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
 static HWND_CELL: AtomicIsize = AtomicIsize::new(0);
@@ -193,6 +195,24 @@ pub fn show(
             caret.2,
             candidates.len(),
             IsWindowVisible(hwnd as HWND)
+        ));
+        // 排障第二行：窗口说自己可见、用户却看不见时，看这两条就够定位——
+        // `under` 是不是自己（被别的窗口盖住会不同）、前台窗口属于哪个进程
+        // （宿主不在前台时，弹窗再 topmost 也可能被全屏/独占窗口挡掉）。
+        let mut fg_pid = 0u32;
+        let fg = GetForegroundWindow();
+        GetWindowThreadProcessId(fg, &mut fg_pid);
+        let under = WindowFromPoint(POINT {
+            x: x + w / 2,
+            y: y + h / 2,
+        });
+        crate::log_line(&format!(
+            "cand probe under={} self={} fg={} fgpid={} me={}",
+            under as isize,
+            hwnd as isize,
+            fg as isize,
+            fg_pid,
+            GetCurrentProcessId()
         ));
     }
 }
