@@ -1038,7 +1038,14 @@ static bool wait_readable(HANDLE p, DWORD ms) {
 /// 老 DLL 不会发这一段，所以先 `wait_readable` 探测 —— 没有就当空串，
 /// 绝不能死等（否则又是一次"两边互等，UI 线程挂死"）。
 static std::string read_app(HANDLE p) {
-    if (!wait_readable(p, 100)) return std::string();
+    // 只等 5ms，不是 100ms。
+    //
+    // 当前 DLL 把 `[type][len][code]` 和 `[app_len][app]` 一次 WriteFile 全写出来，
+    // 到这里 PeekNamedPipe 立刻就能看到字节，根本不用等。等 100ms 的意义只在
+    // "老 DLL 完全不发 app 段"那种情况 —— 而那会让**每次查询都白等 100ms**
+    // （实测：不带 app 段 108ms，带 app 段 2ms）。
+    // 5ms 足够覆盖管道里跨两次写到达的极端情况，又不至于把老客户端拖慢一个数量级。
+    if (!wait_readable(p, 5)) return std::string();
     uint16_t alen = 0;
     if (!read_exact(p, &alen, 2)) return std::string();
     if (alen == 0 || alen > 256) return std::string();
