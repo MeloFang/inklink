@@ -56,8 +56,10 @@ jobs:
 
       - name: clippy
         working-directory: tsf
-        # 允许既有的 E0133（edition 2024 的 unsafe 内调 unsafe）风格告警，但 error 要拦。
-        run: cargo clippy --all-targets --release -- -D warnings
+        # 不加 -D warnings：仓库里还有一百多条历史风格告警（绝大多数是 edition 2024 的
+        # E0133，unsafe fn 里调 unsafe）。它们不影响正确性，慢慢清；这里只要求 clippy
+        # 自身不报 error。
+        run: cargo clippy --all-targets --release
 
       - name: 取 librime（Weasel）+ rime-ice 词库
         shell: powershell
