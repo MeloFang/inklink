@@ -1,6 +1,17 @@
-# === 词库资源（不进 git，见 ADR-0003） ===
-data/
+# === 词库资源（见 ADR-0003） ===
+# 除下面两个例外文件外都不入库。
+data/*
+!data/upstream/
+data/upstream/*
+!data/upstream/ice/
+data/upstream/ice/*
+# 例外：这两份是**构建输入**（GPL-3.0，来源与哈希见 data/manifest.json），必须入库。
+# 上游 rime-ice 的 main 会变（2026-11-02 就改过一次），只按 URL 下载会让 CI 打出
+# 与本地验证过的完全不同的包。
+!data/upstream/ice/base.dict.yaml
+!data/upstream/ice/8105.dict.yaml
 *.dict.yaml
+!data/upstream/ice/*.dict.yaml
 base.tsv
 
 # === Rust / Tauri ===

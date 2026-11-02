@@ -1,0 +1,8 @@
+# 词库是构建输入，字节必须原样（sha256 与 data/manifest.json 对得上）。
+# 不加这条的话 core.autocrlf 会在签出时把 LF 换成 CRLF，哈希就变了。
+data/upstream/ice/*.dict.yaml -text
+
+# 产物与二进制
+*.ico binary
+*.png binary
+*.zip binary
