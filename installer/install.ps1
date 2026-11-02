@@ -99,7 +99,10 @@ foreach ($root in @('HKLM:\SOFTWARE\Microsoft\CTF\TIP', 'HKLM:\SOFTWARE\Wow6432N
     New-Item -Path $lp -Force | Out-Null
     Set-ItemProperty $lp -Name '(default)'  -Value 'inklink 输入法'
     Set-ItemProperty $lp -Name 'Enable'     -Value 1 -Type DWord
-    Set-ItemProperty $lp -Name 'IconFile'   -Value $dll64
+    # 语言列表里那一行的小图标。这里指向**单独的 .ico**，不是 DLL——
+    # DLL 里没有编图标资源（build.rs 只写版本号），指过去等于没有，
+    # 系统就退回显示「简体」两个字。用 .ico 还有个好处：DLL 换版本名时它不会失效。
+    Set-ItemProperty $lp -Name 'IconFile'   -Value (Join-Path $PF 'inklink.ico')
     Set-ItemProperty $lp -Name 'IconIndex'  -Value 0 -Type DWord
 }
 

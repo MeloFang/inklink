@@ -363,7 +363,10 @@ fn install() -> Result<(), String> {
         let lp = format!(r"{tip}\LanguageProfile\0x00000804\{PROFILE}");
         let _ = reg_sz(HKEY_LOCAL_MACHINE, &lp, None, "inklink 输入法");
         let _ = reg_dword(HKEY_LOCAL_MACHINE, &lp, "Enable", 1);
-        let _ = reg_sz(HKEY_LOCAL_MACHINE, &lp, Some("IconFile"), &dll64.to_string_lossy());
+        // 指向单独的 .ico，不是 DLL：DLL 里没有编图标资源（build.rs 只写版本号），
+        // 指过去语言列表会退回显示「简体」两个字；.ico 也不会因 DLL 换版本名而失效。
+        let icon = pf.join("inklink.ico");
+        let _ = reg_sz(HKEY_LOCAL_MACHINE, &lp, Some("IconFile"), &icon.to_string_lossy());
         let _ = reg_dword(HKEY_LOCAL_MACHINE, &lp, "IconIndex", 0);
     }
 

@@ -83,6 +83,22 @@ if (Test-Path $ico) { Copy-Item $ico (Join-Path $PF 'inklink.ico') -Force
 Set-ItemProperty "HKLM:\SOFTWARE\Classes\CLSID\$CLSID\InprocServer32" -Name '(default)' -Value $target64
 Set-ItemProperty "HKLM:\SOFTWARE\Classes\Wow6432Node\CLSID\$CLSID\InprocServer32" -Name '(default)' -Value $target32
 
+# 语言列表里那一行的小图标指到 inklink.ico。
+# 不指 DLL：DLL 里没有编图标资源（build.rs 只写版本号），指过去系统会退回显示
+# 「简体」两个字；而且每次部署 DLL 都换文件名，指 DLL 的话 IconFile 立刻变成死路径
+# （2026-11-02 就是这么坏的：安装器写的是不带版本号的 inklink_tsf.dll，部署后那个文件没了）。
+$iconPath = Join-Path $PF 'inklink.ico'
+if (Test-Path $iconPath) {
+    $profile = '{1B2C3D4E-5F60-4718-9A2B-3C4D5E6F7081}'
+    foreach ($root in @('HKLM:\SOFTWARE\Microsoft\CTF\TIP', 'HKLM:\SOFTWARE\Wow6432Node\Microsoft\CTF\TIP')) {
+        $lp = "$root\$CLSID\LanguageProfile\0x00000804\$profile"
+        if (Test-Path $lp) {
+            Set-ItemProperty $lp -Name 'IconFile'  -Value $iconPath
+            Set-ItemProperty $lp -Name 'IconIndex' -Value 0 -Type DWord
+        }
+    }
+}
+
 # ── 清理旧 DLL ─────────────────────────────────────────────────
 # DLL 被加载后不能热替换，所以每次部署都是新文件名 + 改注册表，旧文件会一直堆着。
 # 这里删掉注册表已经不再引用的 inklink_tsf*.dll（包括 v19 时代的旧命名）。
