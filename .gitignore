@@ -104,3 +104,4 @@ msg.txt
 
 # 设置窗构建产物
 /settings/target/
+/ui/settings-*.png
