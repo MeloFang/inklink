@@ -99,15 +99,17 @@ jobs:
           if-no-files-found: error
 
       - name: 冒烟测试（解包单文件安装器，确认载荷没坏）
-        shell: powershell
+        shell: pwsh
+        # 内联脚本一律写 ASCII：runner 把 run: 块落成无 BOM 的 .ps1，
+        # Windows PowerShell 5.1 会按 ANSI(GBK) 读，中文直接变乱码并报语法错。
         run: |
           $exe = "dist\inklink-$env:INKLINK_VERSION-setup.exe"
           $tmp = Join-Path $env:RUNNER_TEMP 'extract-check'
           & $exe --extract $tmp
           $n = (Get-ChildItem $tmp -Recurse -File).Count
-          if ($n -lt 10) { throw "安装器只解出 $n 个文件，载荷看着不对" }
-          if (-not (Test-Path (Join-Path $tmp 'inklink_tsf.dll'))) { throw "解包结果里没有 inklink_tsf.dll" }
-          Write-Host "  解包 $n 个文件，inklink_tsf.dll 在位"
+          if ($n -lt 10) { throw "installer only extracted $n files" }
+          if (-not (Test-Path (Join-Path $tmp 'inklink_tsf.dll'))) { throw "inklink_tsf.dll missing" }
+          Write-Host "extracted $n files, inklink_tsf.dll present"
 
       - name: 挂到 Release（只在推 tag 时）
         if: startsWith(github.ref, 'refs/tags/v')
