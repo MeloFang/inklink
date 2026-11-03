@@ -13,7 +13,9 @@
 //! 时退回默认值；注册表读取是原子的，也没有"文件被另一个进程写到一半"的问题。
 //! 等 P2 设置台做出来，它只是这个注册表键的编辑器，读写仍然走这里。
 
-use windows_sys::Win32::System::Registry::{KEY_READ, RegCloseKey};
+use windows_sys::Win32::System::Registry::{
+    KEY_READ, KEY_WRITE, REG_DWORD, RegCloseKey, RegSetValueExW,
+};
 
 use crate::state;
 
@@ -128,6 +130,32 @@ pub fn snapshot() -> Config {
         );
         RegCloseKey(key);
         cfg
+    }
+}
+
+/// 写 `Dark`。浮条上那个太阳/月亮格子用它。
+///
+/// 失败不报错：写不进去时下一次 `snapshot()` 仍读到旧值，
+/// 表现出来就是"点了没反应"，和 `state::set_chinese` 那边的降级一致。
+pub fn set_dark(on: bool) {
+    unsafe {
+        let Some(key) = state::open_key_path(KEY_PATH, KEY_READ | KEY_WRITE) else {
+            return;
+        };
+        let value = if on { 1u32 } else { 0u32 };
+        let name: Vec<u16> = VALUE_DARK
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        RegSetValueExW(
+            key,
+            name.as_ptr(),
+            0,
+            REG_DWORD,
+            &value as *const u32 as *const u8,
+            4,
+        );
+        RegCloseKey(key);
     }
 }
 

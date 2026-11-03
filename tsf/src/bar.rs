@@ -122,6 +122,8 @@ const SEP_GAP: i32 = 6;
 const SEP_W: i32 = 1;
 const W_MODE: i32 = 34;
 const W_PUNCT: i32 = 34;
+/// 主题格：亮色画太阳、暗色画月牙，点一下就切换。
+const W_THEME: i32 = 34;
 const W_MENU: i32 = 30;
 
 // COLORREF 是 0x00BBGGRR（低字节是红）
@@ -178,22 +180,28 @@ fn scale(v: i32) -> i32 {
     (v * dpi + 48) / 96
 }
 
-/// 四个可点的地方：品牌标、中文/英文、中文标点/半角、菜单。纯函数，可单测。
+/// 五个可点的地方：品牌标、中文/英文、中文标点/半角、**亮/暗切换**、菜单。纯函数，可单测。
 ///
 /// 品牌标和第一格状态之间多留一道竖线（`SEP_W` 宽，两边各 `SEP_GAP`），
 /// 和搜狗浮条一样给"品牌 | 状态"一个视觉分隔。竖线本身不是可点区域。
-fn item_rects() -> [RECT; 4] {
+fn item_rects() -> [RECT; 5] {
     let pad = scale(PAD);
     let gap = scale(GAP);
     let h = scale(ITEM_H);
     let sep_total = scale(SEP_GAP) * 2 + scale(SEP_W);
-    let widths = [scale(W_BRAND), scale(W_MODE), scale(W_PUNCT), scale(W_MENU)];
+    let widths = [
+        scale(W_BRAND),
+        scale(W_MODE),
+        scale(W_PUNCT),
+        scale(W_THEME),
+        scale(W_MENU),
+    ];
     let mut rects = [RECT {
         left: 0,
         top: 0,
         right: 0,
         bottom: 0,
-    }; 4];
+    }; 5];
     let mut x = pad;
     for (i, w) in widths.iter().enumerate() {
         rects[i] = RECT {
@@ -211,7 +219,7 @@ fn item_rects() -> [RECT; 4] {
 }
 
 fn window_size() -> (i32, i32) {
-    let last = item_rects()[3];
+    let last = item_rects()[4];
     let pad = scale(PAD);
     (last.right + pad, last.bottom + pad)
 }
@@ -1248,6 +1256,68 @@ unsafe fn draw_menu_glyph(hdc: HDC, r: &RECT, color: u32) {
     }
 }
 
+/// 画主题格：亮色一个太阳（实心圆 + 四道短光），暗色一个月牙（圆 - 一个底色圆）。
+///
+/// 用 `fill_round_aa` 画圆，和整条的圆角同一套抗锯齿；
+/// 直接用 GDI 的 `Ellipse` 在 8px 直径下会变成一块方砧。
+unsafe fn draw_theme_glyph(c: &mut Canvas, r: &RECT, dark: bool, fg: u32, bg: u32) {
+    let (cw, ch) = (c.w, c.h);
+    let cx = (r.left + r.right) / 2;
+    let cy = (r.top + r.bottom) / 2;
+    let d = scale(4);
+    let disc = RECT {
+        left: cx - d,
+        top: cy - d,
+        right: cx + d,
+        bottom: cy + d,
+    };
+    fill_round_aa(c.pixels(), cw, ch, &disc, d as f32, fg);
+    if dark {
+        // 月牙：用底色在右上方盖一个偏移的圆，剩下一个弯钩。
+        let cut = RECT {
+            left: disc.left + scale(2),
+            top: disc.top - scale(2),
+            right: disc.right + scale(2),
+            bottom: disc.bottom - scale(2),
+        };
+        fill_round_aa(c.pixels(), cw, ch, &cut, d as f32, bg);
+    } else {
+        // 太阳：四道光线，每道 1.5px 宽。
+        let ray_in = d + scale(2);
+        let ray_out = d + scale(4);
+        let th = scale(2).max(1);
+        let bars = [
+            RECT {
+                left: cx + ray_in,
+                top: cy - th / 2,
+                right: cx + ray_out,
+                bottom: cy - th / 2 + th,
+            },
+            RECT {
+                left: cx - ray_out,
+                top: cy - th / 2,
+                right: cx - ray_in,
+                bottom: cy - th / 2 + th,
+            },
+            RECT {
+                left: cx - th / 2,
+                top: cy + ray_in,
+                right: cx - th / 2 + th,
+                bottom: cy + ray_out,
+            },
+            RECT {
+                left: cx - th / 2,
+                top: cy - ray_out,
+                right: cx - th / 2 + th,
+                bottom: cy - ray_in,
+            },
+        ];
+        for b in bars {
+            fill_rect(c.dc, &b, fg);
+        }
+    }
+}
+
 fn get_font() -> HGDIOBJ {
     make_font(&FONT, 17)
 }
@@ -1486,7 +1556,7 @@ unsafe fn paint_bar(c: &mut Canvas, hover: i32, dark: bool) {
 
     // 悬停只在当前格后面垫一层浅色圆角，不改文字颜色。
     // 只缩 1px：格高 28、品牌标 24，缩多了垫底会被品牌标整个盖住，悬停没反馈。
-    if (0..4).contains(&hover) {
+    if (0..5).contains(&hover) {
         let r = inset(&rects[hover as usize], scale(1));
         fill_round_aa(c.pixels(), w, h, &r, scale(6) as f32, pal.hover);
     }
@@ -1523,8 +1593,11 @@ unsafe fn paint_bar(c: &mut Canvas, hover: i32, dark: bool) {
     let punct_fg = if punct { pal.accent } else { pal.dim };
     draw_glyphs_aa(hdc, &cell, &punct_glyphs(&cell, punct, dpi_k()), punct_fg);
 
-    // 第四格：菜单。
-    draw_menu_glyph(hdc, &rects[3], pal.text);
+    // 第四格：亮/暗切换。图标画的是**当前**主题（亮= 太阳，暗= 月牙）。
+    draw_theme_glyph(c, &rects[3], dark, pal.text, pal.bg);
+
+    // 第五格：菜单。
+    draw_menu_glyph(hdc, &rects[4], pal.text);
 
     // 外形：圆角 + 描边，都抗锯齿。描边 1px（高 DPI 跟着放大）。
     let border_w = scale(1).max(1) as f32;
@@ -1580,6 +1653,15 @@ fn toggle_punct(hwnd: HWND) {
     let on = !crate::state::punctuation();
     crate::state::set_punctuation(on);
     crate::log_line(&format!("bar toggle punct -> {on}"));
+    redraw(hwnd);
+}
+
+/// 切亮/暗。状态存在注册表的 `Config\Dark`，和设置窗里那个复选框是同一个值——
+/// 浮条点一下、设置窗里也会跟着变（下次打开时现读）。
+fn toggle_theme(hwnd: HWND) {
+    let on = !crate::config::snapshot().dark;
+    crate::config::set_dark(on);
+    crate::log_line(&format!("bar toggle theme -> dark={on}"));
     redraw(hwnd);
 }
 
@@ -1729,11 +1811,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             } else {
                 match pressed {
                     // 品牌标：等同点 ☰，把菜单弹出来（投递到队列，不在这里直接弹）
-                    0 | 3 => {
+                    0 | 4 => {
                         PostMessageW(hwnd, WM_OPEN_MENU, 0, 0);
                     }
                     1 => toggle_mode(hwnd),
                     2 => toggle_punct(hwnd),
+                    3 => toggle_theme(hwnd),
                     _ => {}
                 }
             }
@@ -3746,9 +3829,9 @@ mod tests {
     }
 
     #[test]
-    fn 四格从左到右不重叠() {
+    fn 五格从左到右不重叠() {
         let rects = item_rects();
-        for i in 1..4 {
+        for i in 1..5 {
             assert!(
                 rects[i].left >= rects[i - 1].right,
                 "第 {i} 格左边要 >= 上一格右边"
@@ -3759,7 +3842,7 @@ mod tests {
     #[test]
     fn 窗口尺寸等于最后一格右边加内边距() {
         let (w, h) = window_size();
-        let last = item_rects()[3];
+        let last = item_rects()[4];
         let pad = scale(PAD);
         assert_eq!(w, last.right + pad);
         assert_eq!(h, last.bottom + pad);
@@ -3774,7 +3857,7 @@ mod tests {
             assert_eq!(hit_test(cx, cy), i as i32, "第 {i} 格左上角内侧");
         }
         assert_eq!(hit_test(-5, -5), -1, "负坐标不该命中");
-        let last = rects[3];
+        let last = rects[4];
         assert_eq!(
             hit_test(last.right + 5, last.top + 1),
             -1,
