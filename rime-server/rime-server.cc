@@ -19,6 +19,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 #include <mutex>
@@ -863,6 +864,38 @@ static std::string user_dict_path() {
 // ───────────────────────── 查询 ─────────────────────────
 static const int MAX_CANDS = 50;
 
+/// 多音节输入里的单字候选是噪音。
+///
+/// librime 对 `xiangmu` 这种两音节的输入，会把第一个音节的单字也列进来
+/// （想/向/相/像/象/响/香/降/项/乡/享/翔/箱/祥/详——实测恰好 15 个），排在词后面像刷屏。
+/// 单音节输入（`ni`）不能剔，那就是它本身该给的东西。
+///
+/// 两个保护：
+///   - 多字候选不夯 3 个时不剔（不能把列表剔空）——`pikeqiu` 只有 3 个词，
+///     大量单字正是用户抱怨的那种刷屏，3 个也该剔；
+///   - 用户真选过的单字（`keep`）不剔——那是他明确表达过的偏好。
+/// 返回剔掉了几个。
+static size_t prune_single_chars(std::vector<std::string>& cands, size_t syllables,
+                                 const std::set<std::string>& keep) {
+    if (syllables < 2) return 0;
+    size_t multi = 0;
+    for (const auto& w : cands) {
+        if (utf8_char_count(w) >= 2) ++multi;
+    }
+    if (multi < 3) return 0;
+
+    size_t before = cands.size();
+    cands.erase(std::remove_if(cands.begin(), cands.end(),
+                               [&](const std::string& w) {
+                                   if (utf8_char_count(w) >= 2) return false;
+                                   if (ascii_only(w)) return false;
+                                   return keep.find(w) == keep.end();
+                               }),
+                cands.end());
+    return before - cands.size();
+}
+
+
 /// 精确命中最多占前多少个候选位。
 ///
 /// 不能把精确会话的 50 个全放前面：那样模糊音就"等于关掉了"——打 ni 想找「里」
@@ -973,6 +1006,26 @@ static std::vector<std::string> query(const std::string& code, const std::string
             }
         }
     }
+    // 多音节输入里的单字噪音（`xiangmu` 后面那 15 个想/向/相/…）在用户词库加权之前先剔掉。
+    // 为什么放在 boost 前：boost 只会把用户选过的词往前挪，
+    // 不会新增候选，所以先剔后挪的结果与反过来一样，但少一次遍历。
+    {
+        std::set<std::string> keep;
+        {
+            std::lock_guard<std::mutex> lock(g_user_mutex);
+            const std::string exact = normalize_boundaries(code);
+            const std::string flatk = strip_separators(exact);
+            for (const std::string* k : {&exact, &flatk}) {
+                auto it = g_user.find(*k);
+                if (it == g_user.end()) continue;
+                for (const auto& kv : it->second) keep.insert(kv.first);
+            }
+        }
+        const size_t syllables = split_lengths(strip_separators(code)).size();
+        const size_t removed = prune_single_chars(out, syllables, keep);
+        if (removed) logf("prune single: %zu (code=%s)", removed, code.c_str());
+    }
+
     // 用户词库：这个拼音下用户选过的词提前（次数多的更前）。
     // 放在纠错/英文兜底之后、返回之前 —— 用户的手动选择优先级最高。
     // 传**带边界**的原始码：`xi'an` 下学过的「西安」只在打 `xi'an` 时提前，
@@ -1225,6 +1278,30 @@ static int run_selftest() {
     bw.apps["weixin"] = 2;
     ck(boost_score(bw, "weixin") == 9, "boost_score: own app doubled");
     ck(boost_score(bw, "code") == 5, "boost_score: other app counts global only");
+    // 单字噪音：多音节输入里的单字要剔，但不能剔空、也不能剔用户选过的
+    {
+        std::vector<std::string> v = {"项目", "橡木", "香木", "向慕", "向暮",
+                                      "想", "向", "相", "像", "象"};
+        std::set<std::string> keep;
+        ck(prune_single_chars(v, 2, keep) == 5, "prune_single_chars: 两音节剔掉单字");
+        ck(v.size() == 5, "prune_single_chars: 只剩多字候选");
+
+        std::vector<std::string> one = {"你", "尼", "泥", "逆", "拟", "腻"};
+        ck(prune_single_chars(one, 1, keep) == 0, "prune_single_chars: 单音节不剔");
+        ck(one.size() == 6, "prune_single_chars: 单音节保留全部");
+
+        std::vector<std::string> few = {"项目", "橡木", "想", "向"};
+        ck(prune_single_chars(few, 2, keep) == 0, "prune_single_chars: 多字不夯 5 个时不剔");
+
+        std::vector<std::string> kept = {"项目", "橡木", "香木", "向慕", "向暮",
+                                         "想", "向"};
+        std::set<std::string> liked = {"想"};
+        ck(prune_single_chars(kept, 2, liked) == 1, "prune_single_chars: 用户选过的单字保留");
+
+        std::vector<std::string> eng = {"项目", "橡木", "香木", "向慕", "向暮", "github"};
+        ck(prune_single_chars(eng, 2, keep) == 0, "prune_single_chars: 英文原样不动");
+    }
+
     ck(boost_score(bw, "") == 5, "boost_score: unknown app counts global only");
 
     UserWord once;
