@@ -137,6 +137,15 @@ enum EditAction {
         expect: String,
         text: String,
     },
+    /// 撤回上一次 AI 写入：删掉插入的那段，必要时把原文写回去。
+    ///
+    /// 参数是 `(要恢复的原文, 插入的 UTF-16 长度, 写入后光标所在的锚点)`。
+    /// 锚点对不上（用户点过别处 / 又打了字）就什么也不做，只写日志。
+    AiRevert {
+        original: String,
+        inserted: i32,
+        end_anchor: i32,
+    },
 }
 
 struct TextServiceInner {
@@ -179,6 +188,8 @@ struct TextServiceInner {
     sentence_mark: Mutex<Option<CommitMark>>,
     /// 攒着还没执行的退格次数（自己删字用，见 EditAction::DeleteBack）
     pending_backspace: Mutex<usize>,
+    /// 刚写回的 AI 结果（用于"两秒内按退格撤回"）
+    ai_undo: Mutex<Option<AiUndo>>,
 }
 
 #[implement(
@@ -217,6 +228,7 @@ impl TextService {
                 sentence: Mutex::new(None),
                 sentence_mark: Mutex::new(None),
                 pending_backspace: Mutex::new(0),
+                ai_undo: Mutex::new(None),
             },
         }
     }
@@ -280,6 +292,52 @@ impl TextService {
             .lock()
             .unwrap_or_else(|p| p.into_inner());
         sent.as_ref().map(|m| !m.expired()).unwrap_or(false)
+    }
+
+    /// 有没有"刚写回、还能撤回"的 AI 结果。
+    fn ai_undo_pending(&self) -> bool {
+        let g = self.inner.ai_undo.lock().unwrap_or_else(|p| p.into_inner());
+        g.as_ref().map(|u| !u.expired()).unwrap_or(false)
+    }
+
+    /// 取走 AI 撤回标记（过期就当成没有）。只撤一次。
+    fn take_ai_undo(&self) -> Option<(String, i32, i32)> {
+        let mut g = self.inner.ai_undo.lock().unwrap_or_else(|p| p.into_inner());
+        match g.as_ref() {
+            Some(u) if !u.expired() => {
+                let out = (u.original.clone(), u.inserted, u.end_anchor);
+                *g = None;
+                Some(out)
+            }
+            Some(_) => {
+                *g = None;
+                None
+            }
+            None => None,
+        }
+    }
+
+    /// 忘掉 AI 撤回标记（用户又按了别的键）。
+    fn clear_ai_undo(&self) {
+        *self.inner.ai_undo.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    }
+
+    /// 写回成功后挂上撤回标记：`undo_window` 内按一次退格就能还原。
+    ///
+    /// 撤回窗口配置成 0（关掉误选撤回）时也不挂 —— 两个超时一个语义，别让用户猜。
+    fn arm_ai_undo(&self, original: &str, inserted: i32, end_anchor: i32) {
+        let Some(window) = crate::config::snapshot().undo_window() else {
+            return;
+        };
+        if inserted <= 0 {
+            return;
+        }
+        *self.inner.ai_undo.lock().unwrap_or_else(|p| p.into_inner()) = Some(AiUndo {
+            original: original.to_string(),
+            inserted,
+            end_anchor,
+            deadline: std::time::Instant::now() + window,
+        });
     }
 
     /// 记一次退格。返回需要撤回学习的 `(码, 词)` 列表 —— 删掉最后一个词时
@@ -417,6 +475,37 @@ impl CommitMark {
     fn expired(&self) -> bool {
         std::time::Instant::now() > self.deadline
     }
+}
+
+/// 刚写回的 AI 结果，等着看用户是不是要撤回。
+///
+/// 为什么不用应用自己的 Ctrl+Z：TSF 的 `SetText` 有没有进宿主的撤销栈，各家不一样
+/// （Electron 系尤其不可靠）。这里只做一件确定的事——**两秒内按一次退格，把我们刚写的
+/// 那段换成原文**——判据和"误选撤回"一致，用户也不用记新的快捷键。
+struct AiUndo {
+    /// 覆盖掉的原文；续写是空串（只需要删掉插入的那段）。
+    original: String,
+    /// 插入的 UTF-16 长度（ACP 的锚点单位就是 UTF-16）。
+    inserted: i32,
+    /// 写入完成后光标所在的锚点，撤回前必须还对得上。
+    end_anchor: i32,
+    deadline: std::time::Instant,
+}
+
+impl AiUndo {
+    fn expired(&self) -> bool {
+        std::time::Instant::now() > self.deadline
+    }
+}
+
+/// 撤回时要覆盖的区间：从 `end_anchor - inserted` 起、长度 `inserted`。
+///
+/// 抽成纯函数是因为它决定"会不会删错地方"：锚点不够长、长度为 0 都必须拒绝。
+fn revert_extent(end_anchor: i32, inserted: i32) -> Option<(i32, i32)> {
+    if inserted <= 0 || end_anchor < inserted {
+        return None;
+    }
+    Some((end_anchor - inserted, inserted))
 }
 
 /// 记一次退格到某个槽位上。
@@ -1343,11 +1432,32 @@ impl ITfEditSession_Impl for TextService_Impl {
                 expect,
                 text,
             } => {
-                let why = apply_ai_result(&ctx, ec, action, &expect, &text);
+                let (why, end_anchor) = apply_ai_result(&ctx, ec, action, &expect, &text);
+                if why == "ok" {
+                    // 续写只需要删掉插入的那段；翻译/改写还要把原文写回去
+                    let original = if ai::replaces_selection(action) {
+                        expect.as_str()
+                    } else {
+                        ""
+                    };
+                    let inserted = text.encode_utf16().count() as i32;
+                    if let Some(anchor) = end_anchor {
+                        self.arm_ai_undo(original, inserted, anchor);
+                    }
+                }
                 log_line(&format!(
                     "ai: apply action={} -> {why}",
                     ai::action_name(action)
                 ));
+                Ok(())
+            }
+            EditAction::AiRevert {
+                original,
+                inserted,
+                end_anchor,
+            } => {
+                let why = revert_ai_result(&ctx, ec, &original, inserted, end_anchor);
+                log_line(&format!("ai: revert -> {why}"));
                 Ok(())
             }
         }
@@ -1468,7 +1578,7 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
             .unwrap_or_else(|p| p.into_inner())
             .is_empty();
         // 刚上屏、可能被撤回的词，要先把退格抢过来数一下
-        let undo = !composing && self.undo_pending();
+        let undo = !composing && (self.undo_pending() || self.ai_undo_pending());
         // 全局状态（注册表）：中英模式 + 中文标点开关，所有应用一致。
         let (chinese_mode, punct_mode) = state::snapshot();
         // 标点开关关掉时，空闲态干脆不认领标点键：应用自己出半角标点。
@@ -1546,6 +1656,17 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                 .unwrap_or_else(|p| p.into_inner())
                 .is_empty();
             if !composing {
+                // AI 结果优先还账：刚写回两秒内按退格 = 把那段换成原文。
+                if let Some((original, inserted, end_anchor)) = self.take_ai_undo() {
+                    self.clear_commit_mark();
+                    log_line(&format!("ai-undo requested inserted={inserted}"));
+                    self.request_edit(EditAction::AiRevert {
+                        original,
+                        inserted,
+                        end_anchor,
+                    });
+                    return Ok(BOOL(1));
+                }
                 let had_mark = self.undo_pending();
                 for (code, word) in self.count_backspace() {
                     log_line(&format!("unlearn code={code} word={word}"));
@@ -1569,6 +1690,7 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
             }
         } else {
             self.clear_commit_mark();
+            self.clear_ai_undo();
         }
 
         // Ctrl/Alt/Win 组合键：整体放行给应用（Ctrl+A/C/V/X/Z 等快捷键）。
@@ -2538,14 +2660,65 @@ fn apply_ai_result(
     action: u8,
     expect: &str,
     text: &str,
-) -> &'static str {
+) -> (&'static str, Option<i32>) {
     let current = selection_text(ctx, ec);
     if current.trim() != expect.trim() {
-        return "selection changed";
+        return ("selection changed", None);
     }
     let utf16: Vec<u16> = text.encode_utf16().collect();
     let mut sel = [TF_SELECTION::default()];
     let mut fetched = 0u32;
+    // SAFETY: 标准 TSF 编辑操作，全部在同一个编辑会话内
+    unsafe {
+        if ctx
+            .GetSelection(ec, TF_DEFAULT_SELECTION, &mut sel, &mut fetched)
+            .is_err()
+        {
+            return ("GetSelection failed", None);
+        }
+        let Some(range) = sel[0].range.as_ref() else {
+            return ("no range", None);
+        };
+        if !ai::replaces_selection(action) && range.Collapse(ec, TF_ANCHOR_END).is_err() {
+            return ("collapse failed", None);
+        }
+        if range.SetText(ec, 0, &utf16).is_err() {
+            return ("SetText failed", None);
+        }
+        let _ = range.Collapse(ec, TF_ANCHOR_END);
+        let caret = [TF_SELECTION {
+            range: std::mem::ManuallyDrop::new(Some(range.clone())),
+            style: Default::default(),
+        }];
+        if ctx.SetSelection(ec, &caret).is_err() {
+            return ("SetSelection failed", None);
+        }
+        // 记下写入后的锚点，撤回时要靠它确认"光标还在我们放的地方"
+        let mut anchor = None;
+        if let Ok(acp) = range.cast::<ITfRangeACP>() {
+            let (mut a, mut c) = (0i32, 0i32);
+            if acp.GetExtent(&mut a, &mut c).is_ok() && c == 0 {
+                anchor = Some(a);
+            }
+        }
+        ("ok", anchor)
+    }
+}
+
+/// 撤回一次 AI 写入：删掉插入的那段，把原文写回去。
+fn revert_ai_result(
+    ctx: &ITfContext,
+    ec: u32,
+    original: &str,
+    inserted: i32,
+    end_anchor: i32,
+) -> &'static str {
+    let Some((start, len)) = revert_extent(end_anchor, inserted) else {
+        return "nothing to revert";
+    };
+    let mut sel = [TF_SELECTION::default()];
+    let mut fetched = 0u32;
+    let utf16: Vec<u16> = original.encode_utf16().collect();
     // SAFETY: 标准 TSF 编辑操作，全部在同一个编辑会话内
     unsafe {
         if ctx
@@ -2557,8 +2730,18 @@ fn apply_ai_result(
         let Some(range) = sel[0].range.as_ref() else {
             return "no range";
         };
-        if !ai::replaces_selection(action) && range.Collapse(ec, TF_ANCHOR_END).is_err() {
-            return "collapse failed";
+        let Ok(acp) = range.cast::<ITfRangeACP>() else {
+            return "no acp";
+        };
+        let (mut anchor, mut cch) = (0i32, 0i32);
+        if acp.GetExtent(&mut anchor, &mut cch).is_err() {
+            return "GetExtent failed";
+        }
+        if cch != 0 || anchor != end_anchor {
+            return "caret moved";
+        }
+        if acp.SetExtent(start, len).is_err() {
+            return "SetExtent failed";
         }
         if range.SetText(ec, 0, &utf16).is_err() {
             return "SetText failed";
@@ -3820,5 +4003,19 @@ mod punct_claim_tests {
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|| dll.to_string());
         assert_eq!(super::registry::icon_path_for(dll), expected);
+    }
+}
+
+#[cfg(test)]
+mod ai_undo_tests {
+    use super::*;
+
+    #[test]
+    fn 撤回区间要落在合法位置上() {
+        assert_eq!(revert_extent(10, 3), Some((7, 3)));
+        assert_eq!(revert_extent(3, 3), Some((0, 3)), "正好在文档开头也行");
+        assert_eq!(revert_extent(2, 3), None, "锚点不够长，必须拒绝");
+        assert_eq!(revert_extent(10, 0), None, "没插入东西，不能删");
+        assert_eq!(revert_extent(0, 1), None);
     }
 }

@@ -205,6 +205,9 @@ pub fn start(action: u8, text: &str) -> Option<u32> {
         action_name(action),
         text.chars().count()
     ));
+    // 浮条上盖一行"翻译中…"：模型慢的时候用户至少知道点的那一下生效了。
+    // 15 秒是个上限，正常请求回来会立刻被"完成/失败"覆盖。
+    crate::bar::set_status(&format!("{}中…", action_name(action)), 15_000);
     let _ = ipc::ai_request(seq, hwnd as u32, action, text);
     Some(seq)
 }
@@ -221,6 +224,8 @@ pub fn on_done(seq: u32) {
     let (state, text) = ipc::ai_result(seq);
     match state {
         1 if !text.trim().is_empty() => {
+            // 提示"可以撤回"：后面那两秒内按一次退格就能还原（见 lib.rs 的 AiUndo）
+            crate::bar::set_status("完成 · 退格可撤回", 2_500);
             let out = clip_chars(&text, MAX_RESULT_CHARS);
             crate::log_line(&format!(
                 "ai: done seq={seq} action={} chars={}",
@@ -229,9 +234,18 @@ pub fn on_done(seq: u32) {
             ));
             apply(job.action, &job.source, out);
         }
-        1 => crate::log_line(&format!("ai: seq={seq} 返回空文本，丢掉")),
-        2 => crate::log_line(&format!("ai: seq={seq} 失败：{text}")),
-        other => crate::log_line(&format!("ai: seq={seq} 未知状态 {other}")),
+        1 => {
+            crate::bar::set_status("AI 没返回内容", 2_500);
+            crate::log_line(&format!("ai: seq={seq} 返回空文本，丢掉"));
+        }
+        2 => {
+            crate::bar::set_status("AI 失败（详见日志）", 3_000);
+            crate::log_line(&format!("ai: seq={seq} 失败：{text}"));
+        }
+        other => {
+            crate::bar::set_status("AI 没响应", 3_000);
+            crate::log_line(&format!("ai: seq={seq} 未知状态 {other}"));
+        }
     }
 }
 

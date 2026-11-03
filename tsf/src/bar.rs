@@ -37,6 +37,7 @@
 use std::cell::Cell;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, Ordering};
+use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{
     CloseHandle, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM,
@@ -68,7 +69,15 @@ const CLASS_NAME: &str = "inklink-bar";
 /// 弹菜单走这条自投递消息，**不在鼠标消息里直接弹**：菜单要自己跑一个嵌套消息循环，
 /// 直接在 `WM_LBUTTONUP` 里进会重入 wndproc，历史教训是崩在 user32。投到队列尾部再弹就干净。
 const WM_OPEN_MENU: u32 = WM_APP + 20;
+/// 状态条变了（AI 处理中/失败），让窗口过程在编辑会话之外重画一次。
+const WM_STATUS: u32 = WM_APP + 21;
 static MENU_OPEN: AtomicBool = AtomicBool::new(false);
+
+/// 临时盖在浮条上的一行字（AI 的"翻译中… / 失败"）。
+///
+/// 为什么不另开一个提示窗口：浮条本来就在屏幕上、而且 AI 就是从它上面的菜单点出来的，
+/// 用户点完菜单眼睛还在附近；再加一个窗口就多一套生命周期和 DPI 适配。
+static STATUS: Mutex<Option<(String, Instant)>> = Mutex::new(None);
 
 /// 看门狗的定时器 ID（`WM_TIMER` 的 wParam）。
 const TIMER_WATCH: usize = 1;
@@ -1608,12 +1617,72 @@ unsafe fn paint_bar(c: &mut Canvas, hover: i32, dark: bool) {
     // 第五格：菜单。
     draw_menu_glyph(hdc, &rects[4], pal.text);
 
+    // 状态字盖住整条（AI 处理中 / 失败）。放在 apply_frame 之前：
+    // 圆角外的那几个像素必须保持透明，否则窗口会露出方形底。
+    if let Some(text) = status_text() {
+        let full = RECT {
+            left: 0,
+            top: 0,
+            right: w,
+            bottom: h,
+        };
+        fill_rect(hdc, &full, pal.bg);
+        draw_text_centered(hdc, &full, &text, pal.text, font);
+    }
+
     // 外形：圆角 + 描边，都抗锯齿。描边 1px（高 DPI 跟着放大）。
     let border_w = scale(1).max(1) as f32;
     apply_frame(c.pixels(), w, h, scale(RADIUS) as f32, border_w, pal.border);
 }
 
 /// 画一帧并交给系统合成。窗口尺寸取 `window_size()`，位置不动（`pptDst` 传空）。
+/// 在浮条上盖一行状态字，`ttl_ms` 之后自动消失（0 = 立刻清掉）。
+pub fn set_status(text: &str, ttl_ms: u64) {
+    {
+        let mut g = STATUS.lock().unwrap_or_else(|p| p.into_inner());
+        if ttl_ms == 0 {
+            *g = None;
+        } else {
+            *g = Some((
+                text.to_string(),
+                Instant::now() + Duration::from_millis(ttl_ms),
+            ));
+        }
+    }
+    let hwnd = our_hwnd();
+    if (hwnd as isize) != 0 {
+        // 从编辑会话里调用时不能直接画（那会在 TSF 回调里做 GDI），投递到窗口队列
+        unsafe {
+            PostMessageW(hwnd, WM_STATUS, 0, 0);
+        }
+    }
+}
+
+/// 当前还没过期的状态字。过期的顺手清掉。
+fn status_text() -> Option<String> {
+    let mut g = STATUS.lock().unwrap_or_else(|p| p.into_inner());
+    match g.as_ref() {
+        Some((text, until)) if Instant::now() < *until => Some(text.clone()),
+        Some(_) => {
+            *g = None;
+            None
+        }
+        None => None,
+    }
+}
+
+/// 看门狗用：把已经过期的状态清掉，返回"清掉了"（调用方据此重画）。
+fn clear_expired_status() -> bool {
+    let mut g = STATUS.lock().unwrap_or_else(|p| p.into_inner());
+    match g.as_ref() {
+        Some((_, until)) if Instant::now() >= *until => {
+            *g = None;
+            true
+        }
+        _ => false,
+    }
+}
+
 unsafe fn present(hwnd: HWND) -> bool {
     let (w, h) = window_size();
     let Some(mut c) = Canvas::new(w, h) else {
@@ -1853,6 +1922,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             0
         }
+        WM_STATUS => {
+            redraw(hwnd);
+            0
+        }
         crate::ai::WM_AI_DONE => {
             // 引擎的后台线程发完 HTTP 了：这里取结果并排一次写回（见 ai.rs / lib.rs）。
             // 只做内存读 + 排一个编辑会话，不阻塞宿主。
@@ -1880,6 +1953,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 {
                     redraw(hwnd);
                 }
+            }
+            // 状态字到点了就擦掉（否则会一直盖着浮条）
+            if clear_expired_status() {
+                redraw(hwnd);
             }
             0
         }
