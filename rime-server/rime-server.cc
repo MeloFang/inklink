@@ -11,6 +11,7 @@
 //   cl /nologo /utf-8 /EHsc /std:c++17 /O2 /MD rime-server.cc advapi32.lib /Fe:rime-server.exe
 
 #include <windows.h>
+#include <winhttp.h>
 #include <sddl.h>
 #include <algorithm>
 #include <array>
@@ -1132,6 +1133,263 @@ static void write_response(HANDLE p, const std::vector<std::string>& cands) {
     FlushFileBuffers(p);
 }
 
+// ───────────────────── AI（P4）：翻译 / 改写 / 续写 ─────────────────────
+//
+// 协议：
+//   6 = 发起   [u32 seq][u32 hwnd][u8 action][u16 len][text]   -> []
+//   7 = 取结果 [u32 seq]                                       -> [u8 state][u16 len][text]
+//       state: 0 还在跑 / 1 好了 / 2 失败（text 是原因，给日志看）
+//
+// 为什么是"发起 + 再取"两趟，而不是一次把结果等回来：
+// DLL 跑在别人的 UI 线程上，一次 HTTP 要几秒，直接等就是把用户的窗口挂住。
+// 所以引擎在后台线程里发请求，完了 PostMessage 通知那个 HWND，DLL 收到消息再来取
+// （那时结果已经在内存里，取一次是微秒级）。DLL 里始终不起线程、不阻塞——铁律第一条。
+//
+// 触发入口在浮条的 ☰ 菜单（AI 那一组），作用对象是**当前组合串**。
+
+enum AiAction { AI_TRANSLATE = 0, AI_REWRITE = 1, AI_CONTINUE = 2 };
+
+struct AiJob {
+    int state = 0;      // 0 跑着 / 1 好了 / 2 失败
+    std::string text;   // 结果，或错误原因
+};
+
+static std::mutex g_ai_mutex;
+static std::map<uint32_t, AiJob> g_ai;
+
+/// 从注册表读一项字符串配置；没有就返回空。
+static std::string reg_string(HKEY root, const char* path, const char* name) {
+    HKEY key = nullptr;
+    if (RegOpenKeyExA(root, path, 0, KEY_READ, &key) != ERROR_SUCCESS) return {};
+    char buf[1024] = {0};
+    DWORD cb = sizeof(buf) - 1;
+    DWORD type = 0;
+    std::string out;
+    if (RegQueryValueExA(key, name, nullptr, &type, reinterpret_cast<LPBYTE>(buf), &cb) ==
+            ERROR_SUCCESS &&
+        (type == REG_SZ || type == REG_EXPAND_SZ)) {
+        out.assign(buf, cb);
+        while (!out.empty() && (out.back() == '\0' || out.back() == '\r' || out.back() == '\n')) {
+            out.pop_back();
+        }
+    }
+    RegCloseKey(key);
+    return out;
+}
+
+static DWORD reg_dword(HKEY root, const char* path, const char* name, DWORD fallback) {
+    HKEY key = nullptr;
+    if (RegOpenKeyExA(root, path, 0, KEY_READ, &key) != ERROR_SUCCESS) return fallback;
+    DWORD v = fallback, cb = sizeof(v), type = 0;
+    if (RegQueryValueExA(key, name, nullptr, &type, reinterpret_cast<LPBYTE>(&v), &cb) !=
+            ERROR_SUCCESS ||
+        type != REG_DWORD) {
+        v = fallback;
+    }
+    RegCloseKey(key);
+    return v;
+}
+
+struct AiConfig {
+    bool enabled = false;
+    std::string endpoint;
+    std::string model;
+};
+
+static AiConfig ai_config() {
+    AiConfig c;
+    c.enabled = reg_dword(HKEY_CURRENT_USER, "Software\\inklink\\Config", "AI_Enable", 0) != 0;
+    c.endpoint = reg_string(HKEY_CURRENT_USER, "Software\\inklink\\Config", "AI_Endpoint");
+    c.model = reg_string(HKEY_CURRENT_USER, "Software\\inklink\\Config", "AI_Model");
+    if (c.endpoint.empty()) c.endpoint = "http://127.0.0.1:11434";
+    if (c.model.empty()) c.model = "qwen2.5:7b";
+    while (!c.endpoint.empty() && c.endpoint.back() == '/') c.endpoint.pop_back();
+    return c;
+}
+
+static std::string json_escape(const std::string& s) {
+    std::string out;
+    out.reserve(s.size() + 8);
+    for (char ch : s) {
+        switch (ch) {
+            case '"': out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\n': out += "\\n"; break;
+            case '\r': out += "\\r"; break;
+            case '\t': out += "\\t"; break;
+            default:
+                if (static_cast<unsigned char>(ch) < 0x20) {
+                    char buf[8];
+                    snprintf(buf, sizeof(buf), "\\u%04x", ch);
+                    out += buf;
+                } else {
+                    out += ch;
+                }
+        }
+    }
+    return out;
+}
+
+/// 按动作拼提示词。要求"只输出结果"——模型的解释会混进用户的正文里。
+static std::string ai_prompt(int action, const std::string& text) {
+    std::string head;
+    switch (action) {
+        case AI_REWRITE:
+            head = "把下面这段中文改写得更通顺自然，保持原意和语气，只输出改写后的正文：\n";
+            break;
+        case AI_CONTINUE:
+            head = "接着下面这段中文往下写一句，风格保持一致，只输出续写的那一句：\n";
+            break;
+        default: head = "把下面这段内容翻译成中文，只输出译文：\n";
+    }
+    return head + text;
+}
+
+/// 最小的 JSON 字符串取值：找 "response":"..." 或 "content":"..."。
+/// 不引 JSON 库——只要一个字段，而且 Ollama 的响应结构是固定的。
+static std::string json_field(const std::string& body, const char* name) {
+    // 冒号两侧可能有空格（Ollama 的 python 客户端就带），这里一路跳过
+    std::string key = std::string(1, '"') + name + std::string(1, '"');
+    size_t pos = body.find(key);
+    if (pos == std::string::npos) return {};
+    pos += key.size();
+    auto skip_ws = [&]() {
+        while (pos < body.size()) {
+            char c2 = body[pos];
+            if (c2 == ' ' || c2 == '\t' || c2 == '\n' || c2 == '\r') {
+                ++pos;
+            } else {
+                break;
+            }
+        }
+    };
+    skip_ws();
+    if (pos >= body.size() || body[pos] != ':') return {};
+    ++pos;
+    skip_ws();
+    if (pos >= body.size() || body[pos] != '"') return {};
+    ++pos;
+    std::string out;
+    for (size_t i = pos; i < body.size(); ++i) {
+        char ch = body[i];
+        if (ch == '"') break;
+        if (ch == '\\' && i + 1 < body.size()) {
+            char nx = body[++i];
+            switch (nx) {
+                case 'n': out += '\n'; break;
+                case 'r': out += '\r'; break;
+                case 't': out += '\t'; break;
+                case '"': out += '"'; break;
+                case '\\': out += '\\'; break;
+                case '/': out += '/'; break;
+                case 'u': {
+                    // 只处理 ASCII 区间的 \uXXXX；中文一般直接是 UTF-8，走不到这里
+                    if (i + 4 < body.size()) {
+                        int code = std::strtol(body.substr(i + 1, 4).c_str(), nullptr, 16);
+                        if (code < 0x80) out += static_cast<char>(code);
+                        i += 4;
+                    }
+                    break;
+                }
+                default: out += nx;
+            }
+            continue;
+        }
+        out += ch;
+    }
+    return out;
+}
+
+/// POST 一段 JSON 到 http://host:port/path。成功返回 true，body 写进 out。
+static bool http_post_json(const std::string& url, const std::string& body, std::string* out) {
+    std::string rest = url;
+    const std::string scheme = "http://";
+    if (rest.rfind(scheme, 0) == 0) rest = rest.substr(scheme.size());
+    size_t slash = rest.find('/');
+    std::string hostport = slash == std::string::npos ? rest : rest.substr(0, slash);
+    std::string path = slash == std::string::npos ? "/" : rest.substr(slash);
+    size_t colon = hostport.find(':');
+    std::string host = colon == std::string::npos ? hostport : hostport.substr(0, colon);
+    int port = colon == std::string::npos ? 80 : std::atoi(hostport.c_str() + colon + 1);
+    if (host.empty()) return false;
+    std::wstring whost(host.begin(), host.end());
+    std::wstring wpath(path.begin(), path.end());
+
+    HINTERNET session = WinHttpOpen(L"inklink/1.0", WINHTTP_ACCESS_TYPE_NO_PROXY,
+                                    WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!session) return false;
+    // 不走系统代理：目标是本机 Ollama，挂上代理反而连不上
+    WinHttpSetTimeouts(session, 3000, 3000, 30000, 30000);
+    bool ok = false;
+    HINTERNET conn = WinHttpConnect(session, whost.c_str(), static_cast<INTERNET_PORT>(port), 0);
+    if (conn) {
+        HINTERNET req = WinHttpOpenRequest(conn, L"POST", wpath.c_str(), nullptr,
+                                           WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, 0);
+        if (req) {
+            const wchar_t* headers = L"Content-Type: application/json\r\n";
+            if (WinHttpSendRequest(req, headers, static_cast<DWORD>(-1L),
+                                   const_cast<char*>(body.data()),
+                                   static_cast<DWORD>(body.size()),
+                                   static_cast<DWORD>(body.size()), 0) &&
+                WinHttpReceiveResponse(req, nullptr)) {
+                DWORD status = 0, len = sizeof(status);
+                WinHttpQueryHeaders(req, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                                    WINHTTP_HEADER_NAME_BY_INDEX, &status, &len,
+                                    WINHTTP_NO_HEADER_INDEX);
+                std::string data;
+                DWORD avail = 0;
+                do {
+                    if (!WinHttpQueryDataAvailable(req, &avail)) break;
+                    if (avail == 0) break;
+                    std::string chunk(avail, '\0');
+                    DWORD got = 0;
+                    if (!WinHttpReadData(req, &chunk[0], avail, &got) || got == 0) break;
+                    data.append(chunk.data(), got);
+                } while (true);
+                if (status >= 200 && status < 300) {
+                    *out = data;
+                    ok = true;
+                } else {
+                    *out = "HTTP " + std::to_string(status) + " " + data.substr(0, 200);
+                }
+            } else {
+                *out = "WinHttp 请求失败: " + std::to_string(GetLastError());
+            }
+            WinHttpCloseHandle(req);
+        }
+        WinHttpCloseHandle(conn);
+    }
+    WinHttpCloseHandle(session);
+    return ok;
+}
+
+static void ai_set(uint32_t seq, int state, const std::string& text) {
+    std::lock_guard<std::mutex> lock(g_ai_mutex);
+    AiJob& job = g_ai[seq];
+    job.state = state;
+    job.text = text;
+}
+
+static void ai_worker(uint32_t seq, uint32_t hwnd, int action, std::string text) {
+    const AiConfig cfg = ai_config();
+    std::string body = "{\"model\":\"" + json_escape(cfg.model) + "\",\"prompt\":\"" +
+                       json_escape(ai_prompt(action, text)) + "\",\"stream\":false}";
+    std::string resp;
+    const bool ok = http_post_json(cfg.endpoint + "/api/generate", body, &resp);
+    std::string result = ok ? json_field(resp, "response") : resp;
+    if (ok && result.empty()) result = json_field(resp, "content");   // OpenAI 兼容端点
+    if (ok && result.empty()) {
+        ai_set(seq, 2, "模型没返回内容");
+    } else {
+        ai_set(seq, ok ? 1 : 2, result);
+    }
+    logf("ai seq=%u action=%d ok=%d len=%zu", seq, action, ok ? 1 : 0, result.size());
+    if (hwnd) {
+        PostMessageW(reinterpret_cast<HWND>(static_cast<uintptr_t>(hwnd)), WM_APP + 30,
+                     static_cast<WPARAM>(seq), 0);
+    }
+}
+
 static void serve_client(HANDLE p) {
     // 协议 v2：首字节是消息类型
     //   1 = 查询: [u32 len][UTF-8 拼音]  -> [u32 count] + 候选
@@ -1168,6 +1426,56 @@ static void serve_client(HANDLE p) {
         if (wlen > 0 && !read_exact(p, &word[0], wlen)) return;
         select_candidate(index, code, word, read_app(p));
         write_response(p, {});
+        return;
+    }
+
+    if (type == 6) {
+        // 发起 AI 请求：[u32 seq][u32 hwnd][u8 action][u16 len][text]
+        uint32_t seq = 0, hwnd = 0;
+        uint8_t action = 0;
+        uint16_t len = 0;
+        if (!read_exact(p, &seq, 4) || !read_exact(p, &hwnd, 4) || !read_exact(p, &action, 1) ||
+            !read_exact(p, &len, 2)) {
+            return;
+        }
+        std::string text(len, '\0');
+        if (len > 0 && !read_exact(p, &text[0], len)) return;
+        if (!ai_config().enabled) {
+            ai_set(seq, 2, "AI 没开（设置里勾上「启用 AI」）");
+        } else if (text.empty()) {
+            ai_set(seq, 2, "没有可处理的文字");
+        } else {
+            ai_set(seq, 0, "");
+            std::thread(ai_worker, seq, hwnd, static_cast<int>(action), text).detach();
+        }
+        write_response(p, {});
+        return;
+    }
+
+    if (type == 7) {
+        // 取结果：[u32 seq] -> [u8 state][u16 len][text]
+        uint32_t seq = 0;
+        if (!read_exact(p, &seq, 4)) return;
+        int state = 3;
+        std::string text;
+        {
+            std::lock_guard<std::mutex> lock(g_ai_mutex);
+            auto it = g_ai.find(seq);
+            if (it != g_ai.end()) {
+                state = it->second.state;
+                text = it->second.text;
+                if (state != 0) g_ai.erase(it);   // 取走就清，免得越积越多
+            }
+        }
+        if (text.size() > 60000) text.resize(60000);
+        std::vector<uint8_t> out;
+        out.push_back(static_cast<uint8_t>(state));
+        uint16_t n = static_cast<uint16_t>(text.size());
+        out.push_back(static_cast<uint8_t>(n & 0xFF));
+        out.push_back(static_cast<uint8_t>(n >> 8));
+        out.insert(out.end(), text.begin(), text.end());
+        write_all(p, out.data(), static_cast<DWORD>(out.size()));
+        FlushFileBuffers(p);
         return;
     }
 

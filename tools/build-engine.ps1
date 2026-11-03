@@ -57,7 +57,7 @@ Write-Host "  vcvarsall: $vc" -ForegroundColor DarkGray
 
 # 用 cmd 串起来跑：vcvarsall 是批处理，必须 call 之后在同一个 cmd 进程里再调 cl，
 # 否则环境变量过期（这是 PowerShell 里跑 MSVC 的老坑）。
-$cmd = 'call "{0}" x86 >nul && cd /d "{1}" && cl /nologo /utf-8 /EHsc /std:c++17 /O2 /MD rime-server.cc advapi32.lib /Fe:rime-server.exe' -f $vc, $src
+$cmd = 'call "{0}" x86 >nul && cd /d "{1}" && cl /nologo /utf-8 /EHsc /std:c++17 /O2 /MD rime-server.cc advapi32.lib winhttp.lib user32.lib /Fe:rime-server.exe' -f $vc, $src
 & cmd.exe /c $cmd
 if ($LASTEXITCODE -ne 0) { throw "编译失败 (exit $LASTEXITCODE)" }
 
