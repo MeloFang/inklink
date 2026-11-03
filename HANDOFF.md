@@ -598,8 +598,8 @@ DLL 被加载后无法卸载：脚本每次用**新文件名 + 改注册表**，
 ### 怎么验（不用真模型）
 
 ```powershell
-# 1. 起一个假 Ollama（返回「你好」，并把提示词记到 C:\dsh\work\ai-mock.log）
-python C:\dsh\work\ai-mock.py 11435
+# 1. 起一个假 Ollama（返回「你好」，并把提示词记到 %TEMP%\inklink-mock-ollama.log）
+python tools\mock-ollama.py 11435
 
 # 2. 指向它（也可以直接在设置窗里填）
 Set-ItemProperty 'HKCU:\Software\inklink\Config' AI_Enable 1 -Type DWord
@@ -607,7 +607,7 @@ Set-ItemProperty 'HKCU:\Software\inklink\Config' AI_Endpoint 'http://127.0.0.1:1
 Set-ItemProperty 'HKCU:\Software\inklink\Config' AI_Model 'mock'
 
 # 3. 走管道验证引擎（不涉及 UI）
-powershell -ExecutionPolicy Bypass -File C:\dsh\work\probe-ai.ps1 -Action 0 -Text hello
+powershell -ExecutionPolicy Bypass -File tools\probe-ai.ps1 -Action 0 -Text hello
 
 # 4. 真 UI：记事本打 hello → 回车 → Ctrl+A → 浮条 ☰ → 翻译选中文字
 #    成功时 DLL 日志（C:\Users\Public\inklink-tsf-<pid>.log）是：

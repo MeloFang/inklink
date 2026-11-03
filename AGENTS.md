@@ -60,6 +60,8 @@ inklink/
 │  ├─ apply-fuzzy.ps1    按 fuzzy.yaml 生成 rime custom.yaml 并重启引擎验证
 │  ├─ engine-pipe.ps1    命名管道客户端（诊断/验证，可 dot-source）
 │  ├─ probe-legacy-select.ps1  回归探针：老协议选词不会让引擎死锁
+│  ├─ probe-ai.ps1       AI 探针：协议 6/7 走一遍（配合 mock-ollama.py）
+│  ├─ mock-ollama.py     假 Ollama 端点：验证 AI 通路，不需要真模型
 │  ├─ draw-logo.py       几何重绘产品标记：输出 docs\brand\ink-mark.svg + installer\inklink.ico/png
 │  ├─ config.ps1         读写用户配置（HKCU\Software\inklink\Config，故意全 ASCII）
 │  └─ release.ps1        打 dist\inklink-<版本>.zip

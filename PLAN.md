@@ -905,7 +905,7 @@ P4a 把引擎侧（协议 6/7 + WinHTTP + 后台线程 + `PostMessage` 通知）
 状态与顺序、未启用时多一行灰字且点不中；协议 6/7 的字节布局、结果解析（三种状态 / 短报文 /
 长度写大）、超长文本按 UTF-8 边界截断；设置窗的地址/模型留空回默认。
 
-**验收（真机跑通）**：本机假 Ollama（`C:\dsh\work\ai-mock.py`，`/api/generate` 返回
+**验收（真机跑通）**：本机假 Ollama（`tools\mock-ollama.py`，`/api/generate` 返回
 `{"response":"你好"}`）→ 记事本打 `hello` + 回车原样上屏 → Ctrl+A 选中 → 点浮条 ☰ →
 点「翻译选中文字」。DLL 日志：
 
