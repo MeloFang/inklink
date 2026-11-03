@@ -123,56 +123,7 @@ $sums = Join-Path $distRoot 'SHA256SUMS.txt'
 Set-Content -Path $sums -Value ("{0}  inklink-{1}.zip" -f $hash, $version) -Encoding ascii
 Write-Host "  校验清单: $sums"
 
-# 发布说明从 VERSION 与最近一次 git log 生成，避免手写漏项。
-$notes = Join-Path $distRoot 'RELEASE-NOTES.md'
-$recent = & git -C $root log --oneline -12 --no-decorate 2>$null
-$notesBody = @"
-# inklink $version
 
-Windows 中文输入法（TSF）。
-
-## 装哪个
-
-- **``inklink-$version-setup.exe``** —— 推荐。单文件，双击（会弹 UAC）就装完，不用解压。
-- ``inklink-$version.zip`` —— 绿色版，解压后右键 ``install.cmd`` → 以管理员身份运行。
-
-## 安装前
-
-- Windows 10 1809+ / Windows 11，64 位。
-- 安装器会往 ``C:\Program Files\inklink`` 与 ``C:\inklink-engine`` 写文件、注册 TSF 输入法、
-  把引擎路径写进 ``HKLM\SOFTWARE\inklink\EnginePath``，所以需要管理员权限。
-- 装完在「设置 → 时间和语言 → 语言和区域」里添加键盘 → inklink 输入法
-  （安装器能写注册表，但"把输入法挂进你的语言列表"只有系统设置能做）。
-
-## 校验
-
-``````
-certutil -hashfile inklink-$version-setup.exe SHA256
-``````
-
-应当是：
-
-``````
-$hash
-``````
-
-## 本版内容
-
-$($recent -join "`n")
-
-## 代码签名
-
-本项目使用 [SignPath Foundation](https://signpath.org/) 为开源项目提供的免费代码签名服务
-（申请中，见 [签名策略](https://github.com/MeloFang/inklink/blob/main/docs/code-signing-policy.md)）。
-在签名生效前请用 `SHA256SUMS.txt` 校验下载的包。
-
-## 许可
-
-GPL-3.0。词库衍生自 [rime-ice](https://github.com/iDvel/rime-ice)（GPL-3.0），
-librime 来自 [Weasel](https://github.com/rime/weasel) 的发行包。
-"@
-Set-Content -Path $notes -Value $notesBody -Encoding utf8
-Write-Host "  发布说明: $notes"
 
 # ── 5c. 单文件安装器 ────────────────────────────────────────────
 # 做法：编一个"只有解包 + 写注册表"的小 exe（installer\setup），
@@ -249,6 +200,65 @@ $setupHash = (Get-FileHash $setupExe -Algorithm SHA256).Hash
 Write-Host "  单文件安装器: $setupExe" -ForegroundColor Green
 Write-Host ("    {0} 个文件 / {1:N2} MB / SHA256 {2}" -f $nEntry, ($setupItem.Length / 1MB), $setupHash)
 Add-Content -Path $sums -Value ("{0}  inklink-{1}-setup.exe" -f $setupHash, $version) -Encoding ascii
+
+# 发布说明从 VERSION 与最近一次 git log 生成，避免手写漏项。
+# 放在安装器打包之后：说明里的哈希必须覆盖用户真正会下载的那两个文件。
+# git 的输出是 UTF-8，而 Windows PowerShell 5.1 按控制台代码页解码 —— 不临时改
+# OutputEncoding，中文提交信息在说明里就是一堆乱码（1.1.37 踩过）。
+$notes = Join-Path $distRoot 'RELEASE-NOTES.md'
+$prevEnc = [Console]::OutputEncoding
+[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false
+$recent = & git -C $root log --oneline -12 --no-decorate 2>$null
+[Console]::OutputEncoding = $prevEnc
+$notesBody = @"
+# inklink $version
+
+Windows 中文输入法（TSF）。
+
+## 装哪个
+
+- **``inklink-$version-setup.exe``** —— 推荐。单文件，双击（会弹 UAC）就装完，不用解压。
+- ``inklink-$version.zip`` —— 绿色版，解压后右键 ``install.cmd`` → 以管理员身份运行。
+
+## 安装前
+
+- Windows 10 1809+ / Windows 11，64 位。
+- 安装器会往 ``C:\Program Files\inklink`` 与 ``C:\inklink-engine`` 写文件、注册 TSF 输入法、
+  把引擎路径写进 ``HKLM\SOFTWARE\inklink\EnginePath``，所以需要管理员权限。
+- 装完在「设置 → 时间和语言 → 语言和区域」里添加键盘 → inklink 输入法
+  （安装器能写注册表，但"把输入法挂进你的语言列表"只有系统设置能做）。
+
+## 校验
+
+``````
+certutil -hashfile inklink-$version-setup.exe SHA256
+certutil -hashfile inklink-$version.zip SHA256
+``````
+
+应当是（也写在 ``SHA256SUMS.txt`` 里）：
+
+``````
+$setupHash  inklink-$version-setup.exe
+$hash  inklink-$version.zip
+``````
+
+## 本版内容
+
+$($recent -join "`n")
+
+## 代码签名
+
+本项目使用 [SignPath Foundation](https://signpath.org/) 为开源项目提供的免费代码签名服务
+（申请中，见 [签名策略](https://github.com/MeloFang/inklink/blob/main/docs/code-signing-policy.md)）。
+在签名生效前请用 ``SHA256SUMS.txt`` 校验下载的包。
+
+## 许可
+
+GPL-3.0。词库衍生自 [rime-ice](https://github.com/iDvel/rime-ice)（GPL-3.0），
+librime 来自 [Weasel](https://github.com/rime/weasel) 的发行包。
+"@
+Set-Content -Path $notes -Value $notesBody -Encoding utf8
+Write-Host "  发布说明: $notes"
 
 # ── 6. 清理旧产物（dist 每次 60MB 目录 + 27MB zip，不清理会一直堆）──
 # 每个版本是「目录 + zip」一对，所以按版本分组删，不能按文件数删（否则会剩半个版本）。
