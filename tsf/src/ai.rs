@@ -66,7 +66,7 @@ pub struct Job {
     started: Instant,
 }
 
-static NEXT_SEQ: AtomicU32 = AtomicU32::new(1);
+static NEXT_SEQ: AtomicU32 = AtomicU32::new(0);   // 0 = 还没播种
 static JOBS: Mutex<Vec<Job>> = Mutex::new(Vec::new());
 
 type StartFn = fn(usize, u8);
@@ -128,9 +128,33 @@ pub fn enabled() -> bool {
     }
 }
 
+/// 序号种子：**跨进程也得独一无二**。
+///
+/// 引擎的结果表是 `std::map<u32, AiJob>`，只按 seq 索引；而 DLL 在每个宿主进程里各有一份，
+/// 记事本、微信、浏览器会同时存在。如果都从 1 开始数，两个进程各发一次 AI 就会撞号 ——
+/// 后一个覆盖前一个的条目，取结果时会拿到别人的（甚至被清掉）。所以种子混进 PID 和
+/// 当前时间的低 16 位；同进程内仍然只是自增，靠 `fetch_add` 保证不重。
+fn seed_from(pid: u32, nanos: u32) -> u32 {
+    let v = (pid << 16) ^ (nanos & 0xFFFF);
+    if v == 0 { 1 } else { v }
+}
+
+fn seed_seq() -> u32 {
+    let pid = std::process::id();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    seed_from(pid, nanos)
+}
+
 fn next_seq() -> u32 {
+    if NEXT_SEQ.load(Ordering::Relaxed) == 0 {
+        // 播种可能被两条线程同时撞上：比较交换，只有一份生效
+        let _ = NEXT_SEQ.compare_exchange(0, seed_seq(), Ordering::Relaxed, Ordering::Relaxed);
+    }
     let s = NEXT_SEQ.fetch_add(1, Ordering::Relaxed);
-    // 0 留给"还没分配"，回绕到 0 就跳过
+    // 0 留给"还没播种"，回绕到 0 就跳过
     if s == 0 {
         NEXT_SEQ.store(2, Ordering::Relaxed);
         1
@@ -274,11 +298,23 @@ mod tests {
     }
 
     #[test]
-    fn 序号从一开头且不重复() {
+    fn 序号不重复且不为零() {
         let a = next_seq();
         let b = next_seq();
         assert!(a >= 1 && b >= 1);
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn 种子混进进程号避免跨进程撞号() {
+        // 两个进程的 PID 不同 → 种子不同（同 nanos 也不撞）
+        let a = seed_from(0x1234, 0x5678);
+        let b = seed_from(0x1235, 0x5678);
+        assert_ne!(a, b);
+        assert_ne!(a, 0);
+        assert_ne!(seed_from(0, 0), 0, "全零也要退化成非零");
+        // nanos 不同 → 种子不同
+        assert_ne!(seed_from(0x1234, 1), seed_from(0x1234, 2));
     }
 
     #[test]

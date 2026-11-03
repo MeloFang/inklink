@@ -113,7 +113,7 @@ powershell -ExecutionPolicy Bypass -File tools\release.ps1
 $env:PATH = "$env:USERPROFILE\.cargo\bin;$env:PATH"
 
 cd C:\dsh\work\inklink\tsf
-cargo test --release                       # 137 个单测（按键认领 / 标点 / 引号 / 拼音切分 / 音节分隔显示 / 分词边界 / 分段上屏 / 误选撤回 / 整句上报 / 候选窗摆放与点击 / 注入退格抑制 / 显示属性 / 全局状态缺省值 / 配置默认值与夹取 / 浮条与菜单布局 / 浮条创建显示绘制 / 浮条外观预览 / 浮条两套主题对比度 / 标点符号的距离场内外 / 品牌标取哪一帧 / 浮条圆角抗锯齿 / 浮条可见性仲裁 / 标点横向错开 / 候选窗两套主题 / AI 菜单启用态与命令映射 / 协议 6-7 报文与解析）
+cargo test --release                       # 138 个单测（按键认领 / 标点 / 引号 / 拼音切分 / 音节分隔显示 / 分词边界 / 分段上屏 / 误选撤回 / 整句上报 / 候选窗摆放与点击 / 注入退格抑制 / 显示属性 / 全局状态缺省值 / 配置默认值与夹取 / 浮条与菜单布局 / 浮条创建显示绘制 / 浮条外观预览 / 浮条两套主题对比度 / 标点符号的距离场内外 / 品牌标取哪一帧 / 浮条圆角抗锯齿 / 浮条可见性仲裁 / 标点横向错开 / 候选窗两套主题 / AI 菜单启用态与命令映射 / 协议 6-7 报文与解析 / AI 序号跨进程播种）
 cargo build --release --lib --target-dir target-static
 cargo build --release --lib --target i686-pc-windows-msvc --target-dir target-static
 ```
