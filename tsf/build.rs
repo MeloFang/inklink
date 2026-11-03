@@ -30,7 +30,9 @@ fn main() {
 
 fn embed_icon(icon: &PathBuf) {
     let Some(rc) = find_rc() else {
-        println!("cargo:warning=没找到 Windows SDK 的 rc.exe，DLL 里不会编进图标（语言列表会显示「简体」）");
+        println!(
+            "cargo:warning=没找到 Windows SDK 的 rc.exe，DLL 里不会编进图标（语言列表会显示「简体」）"
+        );
         return;
     };
     let out = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
@@ -38,7 +40,10 @@ fn embed_icon(icon: &PathBuf) {
     // rc.exe 只认反斜杠路径，而且不认 canonicalize 加上的 `\\?\` 前缀（会直接报错退出）
     let icon_abs = std::fs::canonicalize(icon).unwrap_or_else(|_| icon.to_path_buf());
     let icon_str = icon_abs.display().to_string();
-    let icon_str = icon_str.strip_prefix(r"\\?\").unwrap_or(&icon_str).to_string();
+    let icon_str = icon_str
+        .strip_prefix(r"\\?\")
+        .unwrap_or(&icon_str)
+        .to_string();
     let script = format!("1 ICON \"{icon_str}\"\n");
     if std::fs::write(&rcfile, script).is_err() {
         println!("cargo:warning=写 icon.rc 失败，跳过图标");
