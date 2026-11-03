@@ -716,7 +716,10 @@ mod tests {
             .filter(|it| crate::ai::action_for_cmd(it.id).is_some())
             .map(|it| it.id)
             .collect();
-        assert_eq!(order, vec![CMD_AI_TRANSLATE, CMD_AI_REWRITE, CMD_AI_CONTINUE]);
+        assert_eq!(
+            order,
+            vec![CMD_AI_TRANSLATE, CMD_AI_REWRITE, CMD_AI_CONTINUE]
+        );
 
         let off = build_items(true, true, false);
         for id in [CMD_AI_TRANSLATE, CMD_AI_REWRITE, CMD_AI_CONTINUE] {

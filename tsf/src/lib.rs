@@ -785,11 +785,7 @@ impl TextService_Impl {
     /// 那一次更新挤掉（表现为"打着打着拼音不刷新了"）。宁可丢掉 AI 结果。
     fn request_edit_if_idle(&self, action: EditAction) -> bool {
         {
-            let mut slot = self
-                .inner
-                .pending
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
+            let mut slot = self.inner.pending.lock().unwrap_or_else(|p| p.into_inner());
             if slot.is_some() {
                 return false;
             }

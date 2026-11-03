@@ -25,8 +25,8 @@
 //! 所以这里所有错误路径都只 `log_line`，一个返回值都不往上抛。
 
 use std::cell::Cell;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use windows_sys::Win32::System::Registry::KEY_READ;
@@ -66,7 +66,7 @@ pub struct Job {
     started: Instant,
 }
 
-static NEXT_SEQ: AtomicU32 = AtomicU32::new(0);   // 0 = 还没播种
+static NEXT_SEQ: AtomicU32 = AtomicU32::new(0); // 0 = 还没播种
 static JOBS: Mutex<Vec<Job>> = Mutex::new(Vec::new());
 
 type StartFn = fn(usize, u8);
