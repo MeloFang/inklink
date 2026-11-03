@@ -555,3 +555,25 @@ DLL 被加载后无法卸载：脚本每次用**新文件名 + 改注册表**，
   等 100ms 没有就走老协议），DLL 侧所有管道读也改成 `read_exact_timeout()`（`QUERY_TIMEOUT_MS = 150`、
   `SELECT_TIMEOUT_MS = 100`），任何情况下都不许无限阻塞 UI 线程。
   回归探针：`tools\probe-legacy-select.ps1`（写 5 字节老报文，期望 100ms 内收到响应）。
+
+## 十、P4b（AI 的界面）接手要点
+
+P4a 已经把引擎侧打通并验证过，**不要再动引擎**。剩下的全在 `tsf/` 里：
+
+1. **拿得到选区**：`TextService_Impl::request_edit` / `store_context` / `ITfEditSession_Impl` 都在
+   `tsf/src/lib.rs`（约 727 行起）。编辑会话是**单槽位**的（`inner.pending` 一次只放一个
+   `EditAction`），AI 的读/写要各排一次队，不能并发塞。
+2. **读选中文字**：新加一个 `EditAction::ReadSelection`，在 `DoEditSession` 里
+   `ctx.GetSelection(ec, TF_DEFAULT_SELECTION, &mut sel, &mut fetched)` → `range.GetText(ec, 0, buf, ...)`，
+   把结果塞进一个 `Mutex<Option<String>>` 槽位（会话里不能阻塞）。
+3. **写回**：复用 `EditAction::Insert(String)`（已经有，见 `lib.rs:118`）——它对当前选区
+   `SetText`，等于替换选区。
+4. **菜单**：`tsf/src/menu.rs` 加三项（翻译/改写/续写），`bar.rs::handle_menu` 派发；
+   `bar.rs` 的 wndproc 收到 `WM_APP + 30` 时调 `ai::on_done(seq)`。
+5. **DLL 侧发请求**：`ipc` 发 `[u8 6][u32 seq][u32 bar_hwnd][u8 action][u16 len][text]`，
+   结果用 `[u8 7][u32 seq]` 取，返回 `[u8 state][u16 len][text]`（state 0 跑着 / 1 好了 / 2 失败）。
+6. **设置窗**：`settings/src/main.rs` 加「启用 AI」勾选 + 地址 + 模型两个输入框
+   （注册表值 `AI_Enable` 是 DWORD，`AI_Endpoint`/`AI_Model` 是 SZ）。
+
+验收：记事本里选中 `hello` → 浮条 ☰ → 翻译 → 变成「你好」。失败时必须静默（只写日志），
+绝不能让输入法卡住或吞按键。
