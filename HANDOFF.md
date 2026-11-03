@@ -1,6 +1,6 @@
 # 续接文档：inklink
 
-> **最后更新**：2026-11-02 ｜ **当前阶段**：M0/M1 完成，产品化 P0–P1、P3、P5 已做完 ｜ **总体进度**：M0 ✅ M1 ✅ P1 ✅ P2a ✅ P3 ✅ P5 ✅（仓库已公开，CI 出过 v1.1.27/28/29）｜ 1.1.30 加了 **P2a 单页设置窗**（`inklink-settings.exe`，浮条 ☰ 菜单里的「设置…」拉起它）｜ 下一步 P2b 六页设置台（Tauri，动手前开 ADR）或 P4 AI 的壳 ｜ **已知问题**：单次查询引擎侧 ~2ms（带 app 段），老客户端 15ms
+> **最后更新**：2026-11-03 ｜ **当前阶段**：M0/M1 完成，产品化 P0–P1、P3、P4、P5 已做完 ｜ **总体进度**：M0 ✅ M1 ✅ P1 ✅ P2a ✅ P3 ✅ **P4a ✅ P4b ✅（1.1.36）** P5 ✅（仓库已公开，CI 出过 v1.1.27/28/29）｜ 下一步 P2b 六页设置台（Tauri，动手前开 ADR）或 M2/M3 的实体 ｜ **已知问题**：单次查询引擎侧 ~2ms（带 app 段），老客户端 15ms；AI 失败静默、无进度提示，选区 >2000 字不处理
 
 ---
 
@@ -556,24 +556,85 @@ DLL 被加载后无法卸载：脚本每次用**新文件名 + 改注册表**，
   `SELECT_TIMEOUT_MS = 100`），任何情况下都不许无限阻塞 UI 线程。
   回归探针：`tools\probe-legacy-select.ps1`（写 5 字节老报文，期望 100ms 内收到响应）。
 
-## 十、P4b（AI 的界面）接手要点
+## 十、P4b（AI 的界面）—— 已完成（1.1.36）
 
-P4a 已经把引擎侧打通并验证过，**不要再动引擎**。剩下的全在 `tsf/` 里：
+> 上一版这里写的是"接手要点"。P4b 已按那份要点做完并真机验证，这一节改成**现状 + 坑**。
+> 引擎侧（P4a）**一行没动**：协议 6/7、WinHTTP、后台线程、`WM_APP + 30` 通知都是 1.1.34 的。
 
-1. **拿得到选区**：`TextService_Impl::request_edit` / `store_context` / `ITfEditSession_Impl` 都在
-   `tsf/src/lib.rs`（约 727 行起）。编辑会话是**单槽位**的（`inner.pending` 一次只放一个
-   `EditAction`），AI 的读/写要各排一次队，不能并发塞。
-2. **读选中文字**：新加一个 `EditAction::ReadSelection`，在 `DoEditSession` 里
-   `ctx.GetSelection(ec, TF_DEFAULT_SELECTION, &mut sel, &mut fetched)` → `range.GetText(ec, 0, buf, ...)`，
-   把结果塞进一个 `Mutex<Option<String>>` 槽位（会话里不能阻塞）。
-3. **写回**：复用 `EditAction::Insert(String)`（已经有，见 `lib.rs:118`）——它对当前选区
-   `SetText`，等于替换选区。
-4. **菜单**：`tsf/src/menu.rs` 加三项（翻译/改写/续写），`bar.rs::handle_menu` 派发；
-   `bar.rs` 的 wndproc 收到 `WM_APP + 30` 时调 `ai::on_done(seq)`。
-5. **DLL 侧发请求**：`ipc` 发 `[u8 6][u32 seq][u32 bar_hwnd][u8 action][u16 len][text]`，
-   结果用 `[u8 7][u32 seq]` 取，返回 `[u8 state][u16 len][text]`（state 0 跑着 / 1 好了 / 2 失败）。
-6. **设置窗**：`settings/src/main.rs` 加「启用 AI」勾选 + 地址 + 模型两个输入框
-   （注册表值 `AI_Enable` 是 DWORD，`AI_Endpoint`/`AI_Model` 是 SZ）。
+### 链路
 
-验收：记事本里选中 `hello` → 浮条 ☰ → 翻译 → 变成「你好」。失败时必须静默（只写日志），
-绝不能让输入法卡住或吞按键。
+```
+☰ 菜单「翻译/改写/续写」
+  → ai::from_menu(action)                     tsf/src/ai.rs
+  → TextService 排 EditAction::ReadSelection  （单槽位，忙就跳过）
+  → DoEditSession: GetSelection → GetText → ai::start
+  → ipc 协议 6 → 引擎后台线程打 HTTP → PostMessage(bar hwnd, WM_APP+30, seq)
+  → bar 的 wndproc 调 ai::on_done(seq)
+  → ipc 协议 7 取回文本（内存读）
+  → TextService 排 EditAction::AiApply → SetText 写回
+```
+
+### 代码落点
+
+| 文件 | 作用 |
+|:---|:---|
+| `tsf/src/ai.rs`（新） | 动作编号、命令映射、任务记账（seq → 原文）、线程局部服务指针、`WM_AI_DONE`、`on_done` |
+| `tsf/src/ipc.rs` | `ai_request()`（协议 6）/ `ai_result()`（协议 7）+ 报文与解析的纯函数和单测 |
+| `tsf/src/lib.rs` | `EditAction::ReadSelection` / `AiApply`、`request_edit_if_idle()`、`current_context()`、`selection_text()`、`apply_ai_result()`、两个 thunk |
+| `tsf/src/menu.rs` | 三个 AI 菜单项（命令 10/11/12）；AI 没启用时灰掉 + 一行说明 |
+| `tsf/src/bar.rs` | `handle_menu` 派发 AI、`WM_AI_DONE` 分支、`bar::hwnd()` |
+| `settings/src/main.rs` | 「启用 AI」+ 接口地址 + 模型名，读写 `AI_Enable`/`AI_Endpoint`/`AI_Model` |
+
+### 设计上要记住的四条
+
+1. **读和写各排一次编辑会话**，都用 `request_edit_if_idle()`：槽位占着就放弃，绝不挤掉
+   用户正在打的那次组合串更新。AI 结果晚几秒才到，这期间用户很可能在打字。
+2. **写回前核对选区**：重新读一遍选区，和发起时的原文比对，不一样就丢掉（只写日志）。
+   同时 `is_composing()` 为真也丢掉 —— 不能把译文插进拼音中间。
+3. **只有续写不替换**：`ai::replaces_selection()`；续写把选区塌到末尾再插入。
+4. **服务指针按线程存**（`thread_local!`）：TSF 按线程激活，浮条也是按线程一条；
+   存进程级会在浏览器那种多线程宿主里把结果交给另一条线程的服务实例。
+
+### 怎么验（不用真模型）
+
+```powershell
+# 1. 起一个假 Ollama（返回「你好」，并把提示词记到 C:\dsh\work\ai-mock.log）
+python C:\dsh\work\ai-mock.py 11435
+
+# 2. 指向它（也可以直接在设置窗里填）
+Set-ItemProperty 'HKCU:\Software\inklink\Config' AI_Enable 1 -Type DWord
+Set-ItemProperty 'HKCU:\Software\inklink\Config' AI_Endpoint 'http://127.0.0.1:11435'
+Set-ItemProperty 'HKCU:\Software\inklink\Config' AI_Model 'mock'
+
+# 3. 走管道验证引擎（不涉及 UI）
+powershell -ExecutionPolicy Bypass -File C:\dsh\work\probe-ai.ps1 -Action 0 -Text hello
+
+# 4. 真 UI：记事本打 hello → 回车 → Ctrl+A → 浮条 ☰ → 翻译选中文字
+#    成功时 DLL 日志（C:\Users\Public\inklink-tsf-<pid>.log）是：
+#      ai: start seq=1 action=翻译 chars=5
+#      ai: done  seq=1 action=翻译 chars=2
+#      ai: apply action=翻译 -> ok
+```
+
+1.1.36 的实测结果：记事本里 `hello` 被替换成「你好」，假 Ollama 收到的提示词正好是
+`把下面这段内容翻译成中文，只输出译文：` + 换行 + `hello`。截图在
+`C:\dsh\work\shots\`（`1-selected.png` / `2-menu.png` / `3-result-translate.png`）。
+
+### 这一轮踩到的坑（测试环境，不是产品 bug）
+
+- **Win11 记事本会恢复上次没保存的标签**：第一次自动化跑出来的选区是 `deactivate\rhello`
+  （上一轮留下的 `inklink-tsf-*.log` 的内容），看着"翻译成功"其实替换错了对象。
+  自动化必须先 `Ctrl+A` + `Delete` 清空文档。
+- **DSH 里的 PowerShell 是 DPI unaware 的**：`GetWindowRect` 给 96 DPI 虚拟坐标，
+  `Screen.Bounds` 是 1536×864，截屏只抓到左上角一块。脚本里先 `SetProcessDPIAware()`。
+- **前台锁**：用户在 WPS 里干活时 `SetForegroundWindow` 会静默失败，`Win+Space` 全打在
+  别人的窗口里。自动化要先核对 `GetForegroundWindow()`，不对就别往下按键。
+- 顺带记一笔：**别在用户正在用电脑的时候跑 UI 自动化**。这次就因为前台是 WPS 表格，
+  半途停了下来，改用管道 + 一次干净的前台窗口把验收跑完。
+
+### 还没做的（留给 P6 / M3）
+
+- 失败没有可见反馈（只有日志）；要不要在浮条上加一个短暂的"处理中/失败"状态，等有人抱怨再说。
+- 结果写进文档后**不能撤回**（它不属于组合串，`UndoMs` 那套管不到）。
+- 没有"翻译整段/逐句对照"这类更强的交互；现在只处理 ≤2000 字的选区。
+- 流式输出没接（引擎是一次性 `stream:false`）。

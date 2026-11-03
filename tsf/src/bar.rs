@@ -247,6 +247,15 @@ fn our_hwnd() -> HWND {
     HWND_CELL.with(|c| c.get()) as HWND
 }
 
+/// 本线程的浮条窗口句柄（0 = 还没建）。
+///
+/// AI 用它当"结果好了叫我"的收件地址：引擎会把 `WM_APP + 30` 投到这个窗口
+/// （见 `ai.rs` 的 `WM_AI_DONE`）。必须是本线程那条，别的线程的窗口不会把消息
+/// 派发到我们的窗口过程。
+pub fn hwnd() -> isize {
+    our_hwnd() as isize
+}
+
 fn set_our_hwnd(hwnd: HWND) {
     HWND_CELL.with(|c| c.set(hwnd as isize));
 }
@@ -1674,6 +1683,11 @@ struct DragState {
 static DRAG: Mutex<Option<DragState>> = Mutex::new(None);
 
 fn handle_menu(hwnd: HWND, cmd: u32) {
+    if let Some(action) = crate::ai::action_for_cmd(cmd) {
+        // 读选区、发请求都在输入服务的编辑会话里做（见 lib.rs 的 start_ai）
+        crate::ai::from_menu(action);
+        return;
+    }
     match cmd {
         crate::menu::CMD_TOGGLE_MODE => toggle_mode(hwnd),
         crate::menu::CMD_TOGGLE_PUNCT => toggle_punct(hwnd),
@@ -1828,13 +1842,21 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 let mut wr: RECT = std::mem::zeroed();
                 GetWindowRect(hwnd, &mut wr);
                 let (chinese, punct) = crate::state::snapshot();
-                let cmd = crate::menu::popup(hwnd, wr.left, wr.top, chinese, punct);
+                // AI 有没有启用现读注册表：菜单每次弹出都可能是刚在设置里勾上的
+                let ai = crate::ai::enabled();
+                let cmd = crate::menu::popup(hwnd, wr.left, wr.top, chinese, punct, ai);
                 MENU_OPEN.store(false, Ordering::SeqCst);
                 if cmd != 0 {
                     crate::log_line(&format!("bar: menu choice {cmd}"));
                 }
                 handle_menu(hwnd, cmd);
             }
+            0
+        }
+        crate::ai::WM_AI_DONE => {
+            // 引擎的后台线程发完 HTTP 了：这里取结果并排一次写回（见 ai.rs / lib.rs）。
+            // 只做内存读 + 排一个编辑会话，不阻塞宿主。
+            crate::ai::on_done(wparam as u32);
             0
         }
         WM_TIMER => {

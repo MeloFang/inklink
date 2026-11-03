@@ -23,6 +23,7 @@ use windows::Win32::UI::TextServices::{
     TF_ANCHOR_START, TF_DEFAULT_SELECTION, TF_ES_ASYNC, TF_ES_READWRITE, TF_SELECTION,
 };
 use windows::core::BOOL;
+mod ai;
 mod bar;
 mod candwin;
 mod config;
@@ -124,6 +125,18 @@ enum EditAction {
     InsertPunct(String, String),
     /// 自己删掉光标前的一个字（误选撤回时用，见 `OnKeyDown` 的退格分支）
     DeleteBack,
+    /// 读出当前选中的文字，然后请引擎做 AI（翻译/改写/续写，参数是动作编号）。
+    ///
+    /// 为什么读选区要占一个编辑会话：`ITfContext::GetSelection` 必须在编辑会话里
+    /// 拿着 `ec` 调，按键线程上没有。读完顺手把请求发出去 —— 发请求只是写管道，
+    /// 不等模型（引擎那边是后台线程）。
+    ReadSelection(u8),
+    /// 把 AI 结果写回文档。`expect` 是发起时选中的原文，用来核对"用户有没有改过选区"。
+    AiApply {
+        action: u8,
+        expect: String,
+        text: String,
+    },
 }
 
 struct TextServiceInner {
@@ -584,6 +597,37 @@ unsafe extern "system" fn cand_click_thunk(ctx: usize, index: usize) {
         let _ = svc.handle_cand_click(index);
     }
 }
+
+/// AI 的"从菜单发起"跳板：`ai::from_menu` 在浮条窗口过程里调进来。
+///
+/// 只是个转发，真正的活（读选区）在编辑会话里做 —— 见 `start_ai`。
+///
+/// # Safety
+/// `ctx` 必须是 `advise_keys` 里存进去的 `TextService_Impl` 指针，生命周期由
+/// `unadvise_keys` 的清除保证。纯 Rust ABI，进程内部调用，不跨越 FFI 边界。
+fn ai_start_thunk(ctx: usize, action: u8) {
+    if ctx == 0 {
+        return;
+    }
+    unsafe {
+        let svc = &*(ctx as *const TextService_Impl);
+        svc.start_ai(action);
+    }
+}
+
+/// AI 的"写回结果"跳板：`ai::on_done` 取回文字后调进来。
+///
+/// # Safety
+/// 同 [`ai_start_thunk`]。
+fn ai_apply_thunk(ctx: usize, action: u8, expect: &str, text: &str) {
+    if ctx == 0 {
+        return;
+    }
+    unsafe {
+        let svc = &*(ctx as *const TextService_Impl);
+        svc.apply_ai(action, expect, text);
+    }
+}
 impl TextService_Impl {
     /// 挂上按键接收器：TSF 把按键通过 `ITfKeystrokeMgr` 分发给注册的 sink。
     /// 幂等——Activate/ActivateEx 可能被反复调用，重复挂载会让同一按键触发多次回调。
@@ -618,6 +662,10 @@ impl TextService_Impl {
         // 候选窗点鼠标选词：回调跳板带上自己，窗口过程只要把下标送回来。
         // 只在激活期间有效（`unadvise_keys` 里拆掉）。
         candwin::set_click_handler(cand_click_thunk, self as *const TextService_Impl as usize);
+        // AI 的两个跳板（菜单发起 / 结果写回）。按线程存：TSF 按线程激活，
+        // 一个进程里可能有好几条线程各有自己的服务实例。
+        let me = self as *const TextService_Impl as usize;
+        ai::set_service(ai_start_thunk, me, ai_apply_thunk, me);
 
         // 把自己作为按键 sink 挂上去（传引用，而不是把 owned 接口交给 Param）
         let sink: ITfKeyEventSink = self.to_interface();
@@ -652,6 +700,7 @@ impl TextService_Impl {
         *self.inner.keystroke_mgr.lock().unwrap() = None;
         *self.inner.thread_mgr.lock().unwrap() = None;
         candwin::clear_click_handler();
+        ai::clear_service();
     }
 
     /// 选完一个候选后的统一收尾：记"可能被撤回"的标记、记整句学习、提交编辑动作。
@@ -726,10 +775,50 @@ impl TextService_Impl {
     /// 把一个动作交给编辑会话执行（异步，安全，不阻塞按键线程）。
     fn request_edit(&self, action: EditAction) {
         *self.inner.pending.lock().unwrap_or_else(|p| p.into_inner()) = Some(action);
+        self.poke_session();
+    }
+
+    /// 同上，但**槽位占着就不排**（返回 false）。
+    ///
+    /// AI 的两步（读选区、写回）都要用它：编辑会话只有一个槽位，AI 结果晚几秒才到，
+    /// 这期间用户很可能正在打字、槽位里躺着一个组合串更新。这时候硬塞会把用户的
+    /// 那一次更新挤掉（表现为"打着打着拼音不刷新了"）。宁可丢掉 AI 结果。
+    fn request_edit_if_idle(&self, action: EditAction) -> bool {
+        {
+            let mut slot = self
+                .inner
+                .pending
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if slot.is_some() {
+                return false;
+            }
+            *slot = Some(action);
+        }
+        self.poke_session();
+        true
+    }
+
+    /// 通知 TSF"有个编辑会话要跑"。槽位已经填好，这里只负责敲一下门。
+    fn poke_session(&self) {
         let tid = *self.inner.tid.lock().unwrap();
         if tid == 0 {
             return;
         }
+        let Some(ctx) = self.current_context() else {
+            return;
+        };
+        let sink: ITfEditSession = self.to_interface();
+        // SAFETY: 标准 TSF 编辑会话请求，sink 生命周期由 COM 引用计数管理
+        let _ = unsafe { ctx.RequestEditSession(tid, &sink, TF_ES_ASYNC | TF_ES_READWRITE) };
+    }
+
+    /// 拿当前输入上下文：优先用 `OnKeyDown` 存下来的，没有再问线程焦点。
+    ///
+    /// 为什么要有第二条：AI 是"鼠标选中文字 → 点浮条"，用户可能一次键都没按过，
+    /// 这时 `context` 还是空的。以前这条只服务打字路径，缺了也没什么；AI 缺了就是
+    /// 点了菜单毫无反应。`ITfThreadMgr::GetFocus` 只是读焦点，不涉及编辑会话，安全。
+    fn current_context(&self) -> Option<ITfContext> {
         if let Some(ctx) = self
             .inner
             .context
@@ -737,9 +826,58 @@ impl TextService_Impl {
             .unwrap_or_else(|p| p.into_inner())
             .clone()
         {
-            let sink: ITfEditSession = self.to_interface();
-            // SAFETY: 标准 TSF 编辑会话请求，sink 生命周期由 COM 引用计数管理
-            let _ = unsafe { ctx.RequestEditSession(tid, &sink, TF_ES_ASYNC | TF_ES_READWRITE) };
+            return Some(ctx);
+        }
+        let mgr = self
+            .inner
+            .thread_mgr
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()?;
+        // SAFETY: 只读查询焦点文档管理器；拿到的是活着的上下文，随后由调用方排队
+        unsafe {
+            let doc = mgr.GetFocus().ok()?;
+            doc.GetTop().ok()
+        }
+    }
+
+    /// 现在有没有正在打的拼音（组合串非空）。
+    ///
+    /// AI 写回前要看一眼：用户等待结果的那几秒里要是已经开始打下一句，
+    /// 结果写进去就会插在拼音中间。此时直接丢弃（只记日志）比"改错地方"好。
+    fn is_composing(&self) -> bool {
+        !self
+            .inner
+            .buffer
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_empty()
+    }
+
+    /// 菜单点了翻译/改写/续写：排一次"读选区"。
+    fn start_ai(&self, action: u8) {
+        if self.is_composing() {
+            log_line("ai: 正在打拼音，先不读选区");
+            return;
+        }
+        if !self.request_edit_if_idle(EditAction::ReadSelection(action)) {
+            log_line("ai: 编辑会话正忙，跳过这次请求");
+        }
+    }
+
+    /// 引擎把结果送回来了：排一次"写回"。
+    fn apply_ai(&self, action: u8, expect: &str, text: &str) {
+        if self.is_composing() {
+            log_line("ai: 正在打拼音，结果丢掉（不往组合串中间塞字）");
+            return;
+        }
+        let action_desc = ai::action_name(action);
+        if !self.request_edit_if_idle(EditAction::AiApply {
+            action,
+            expect: expect.to_string(),
+            text: text.to_string(),
+        }) {
+            log_line(&format!("ai: 编辑会话正忙，{action_desc}结果丢掉"));
         }
     }
 
@@ -865,13 +1003,8 @@ impl ITfEditSession_Impl for TextService_Impl {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clone();
-        let ctx = self
-            .inner
-            .context
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .clone();
-        let Some(ctx) = ctx else {
+        // 和 poke_session 用同一个取法：AI 可能在一次键都没按过时发起（详见 current_context）
+        let Some(ctx) = self.current_context() else {
             return Ok(());
         };
 
@@ -1186,6 +1319,39 @@ impl ITfEditSession_Impl for TextService_Impl {
                     }
                 }
                 log_line(&format!("delete-back -> {why}"));
+                Ok(())
+            }
+            EditAction::ReadSelection(action) => {
+                // 读选区必须在编辑会话里做（要 ec）。读完顺手把请求发出去：
+                // `ai::start` 只写管道、不等模型，几毫秒就回来。
+                let text = selection_text(&ctx, ec);
+                let chars = text.chars().count();
+                if chars == 0 || text.trim().is_empty() {
+                    log_line("ai: 没有选中文字");
+                    return Ok(());
+                }
+                if chars > ai::MAX_INPUT_CHARS {
+                    log_line(&format!(
+                        "ai: 选区太长（{chars} 字 > {}），不做",
+                        ai::MAX_INPUT_CHARS
+                    ));
+                    return Ok(());
+                }
+                if ai::start(action, &text).is_none() {
+                    log_line("ai: 请求没发出去");
+                }
+                Ok(())
+            }
+            EditAction::AiApply {
+                action,
+                expect,
+                text,
+            } => {
+                let why = apply_ai_result(&ctx, ec, action, &expect, &text);
+                log_line(&format!(
+                    "ai: apply action={} -> {why}",
+                    ai::action_name(action)
+                ));
                 Ok(())
             }
         }
@@ -2325,6 +2491,92 @@ fn text_ext_pos(ctx: &ITfContext, ec: u32, range: &ITfRange) -> Option<CaretPos>
         // 顶边和底边都给出去：候选窗在屏幕底部时要往上翻
         Some((rect.left, rect.top, rect.bottom))
     }
+}
+
+/// 读出当前选区的文字（只在编辑会话里调）。
+///
+/// 没有选区、读不到、宿主不支持，一律返回空串 —— 调用方按"没有选中文字"处理。
+/// 缓冲区给 8192 个 UTF-16 单元：AI 只处理 2000 字以内的选区，这个上限远大于它，
+/// 真遇到超长选区也只是被截断（读和写回用的是同一个上限，比对仍然成立）。
+fn selection_text(ctx: &ITfContext, ec: u32) -> String {
+    let mut sel = [TF_SELECTION::default()];
+    let mut fetched = 0u32;
+    // SAFETY: 标准 TSF 查询，处于编辑会话内
+    unsafe {
+        if ctx
+            .GetSelection(ec, TF_DEFAULT_SELECTION, &mut sel, &mut fetched)
+            .is_err()
+        {
+            return String::new();
+        }
+        match sel[0].range.as_ref() {
+            Some(range) => range_text(ec, range),
+            None => String::new(),
+        }
+    }
+}
+
+/// 读一个 range 里的文字。
+fn range_text(ec: u32, range: &ITfRange) -> String {
+    let mut buf = vec![0u16; 8192];
+    let mut got = 0u32;
+    // SAFETY: 缓冲区是我们自己的，长度按元素个数传给 TSF
+    let ok = unsafe { range.GetText(ec, 0, &mut buf, &mut got).is_ok() };
+    if !ok {
+        return String::new();
+    }
+    let n = (got as usize).min(buf.len());
+    String::from_utf16_lossy(&buf[..n])
+}
+
+/// 把 AI 结果写回当前选区。
+///
+/// 两条安全线：
+/// 1. **选区必须还是原来那段文字**。结果回来要几秒，这期间用户可能已经点了别处、
+///    重选了别的段落。拿旧结果去改新选区就是改错地方 —— 直接丢掉（只写日志）。
+/// 2. `continue` 是"接在后面"：先把选区塌到末尾，再在光标处插入；
+///    翻译/改写则是替换整个选区。
+fn apply_ai_result(
+    ctx: &ITfContext,
+    ec: u32,
+    action: u8,
+    expect: &str,
+    text: &str,
+) -> &'static str {
+    let current = selection_text(ctx, ec);
+    if current.trim() != expect.trim() {
+        return "selection changed";
+    }
+    let utf16: Vec<u16> = text.encode_utf16().collect();
+    let mut sel = [TF_SELECTION::default()];
+    let mut fetched = 0u32;
+    // SAFETY: 标准 TSF 编辑操作，全部在同一个编辑会话内
+    unsafe {
+        if ctx
+            .GetSelection(ec, TF_DEFAULT_SELECTION, &mut sel, &mut fetched)
+            .is_err()
+        {
+            return "GetSelection failed";
+        }
+        let Some(range) = sel[0].range.as_ref() else {
+            return "no range";
+        };
+        if !ai::replaces_selection(action) && range.Collapse(ec, TF_ANCHOR_END).is_err() {
+            return "collapse failed";
+        }
+        if range.SetText(ec, 0, &utf16).is_err() {
+            return "SetText failed";
+        }
+        let _ = range.Collapse(ec, TF_ANCHOR_END);
+        let caret = [TF_SELECTION {
+            range: std::mem::ManuallyDrop::new(Some(range.clone())),
+            style: Default::default(),
+        }];
+        if ctx.SetSelection(ec, &caret).is_err() {
+            return "SetSelection failed";
+        }
+    }
+    "ok"
 }
 
 /// 把一段文字插到光标处（没有选区就是纯插入，有选区就是替换）。

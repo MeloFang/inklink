@@ -694,7 +694,7 @@ Obsidian 语料 + AI 兜底，默认关闭联网（符合项目铁律）。
 | **P2b** | 设置台：六页（输入/候选窗/模糊音/词库/AI/关于），每项标"何时生效" | 改模糊音 → 自动重启引擎并验证 | ⬜ 等 P4 把配置撑起来 |
 | **P3** | 配置生效：候选窗外观（含暗色）、每页候选数、撤回窗口、学习开关 | 改外观立即生效（DLL 热读） | ✅ 1.1.21 |
 | **P4a** | AI 引擎通路：协议 6/7、WinHTTP 打 Ollama、后台线程 + PostMessage 通知、`AI_Enable/AI_Endpoint/AI_Model` 配置 | 假 Ollama 端到端拿到正确文本 | ✅ 1.1.34 |
-| **P4b** | AI 的界面：☰ 菜单三项、读选中文字（`ITfContext` + 编辑会话 `GetText`）、结果写回选区、设置窗三个字段 | 记事本选中 hello → 菜单翻译 → 变成你好 | ⬜ 下一步（见 HANDOFF 第十节） |
+| **P4b** | AI 的界面：☰ 菜单三项、读选中文字（`ITfContext` + 编辑会话 `GetText`）、结果写回选区、设置窗三个字段 | 记事本选中 hello → 菜单翻译 → 变成你好 | ✅ 1.1.36（见下文 P4b 记录） |
 | **P5** | 发布工程化：一键取 librime、裁 `rime\data`、CI 出包、单文件安装器 | 干净机器 Actions 一键出包装上即可打字 | ✅ 1.1.27（签名待 SignPath 审核） |
 | **P6** | M2 语料 → M3 AI 实体 → T5e 个人云 | 见 `PRODUCT.md` 成功标准 | ⬜ |
 
@@ -855,6 +855,84 @@ Obsidian 语料 + AI 兜底，默认关闭联网（符合项目铁律）。
 
 **验收**：`.\tools\config.ps1 -Dark 1` 之后下一次按键候选窗就是暗色，不用重启任何程序；
 浮条和 ☰ 菜单最迟 600ms 跟着变。
+
+
+#### P4b：AI 的界面（2026-11-03，✅ 1.1.36 已部署）
+
+P4a 把引擎侧（协议 6/7 + WinHTTP + 后台线程 + `PostMessage` 通知）做完了，这一层只补 DLL 侧：
+菜单入口、读选区、写回、设置项。**引擎一行没动。**
+
+```
+☰ 菜单（翻译/改写/续写）
+  → ai::from_menu(action)
+  → TextService 排一次 EditAction::ReadSelection      （单槽位，忙就跳过）
+  → DoEditSession 里 GetSelection → GetText → ai::start
+  → ipc 协议 6 →[管道]→ 引擎后台线程打 HTTP
+  → 引擎 PostMessage(bar hwnd, WM_APP+30, seq)
+  → bar 的 wndproc 调 ai::on_done(seq)
+  → ipc 协议 7 取回文本（内存读，微秒级）
+  → TextService 排一次 EditAction::AiApply → SetText 写回
+```
+
+**为什么读和写各排一次队**：编辑会话只有一个槽位（`TextServiceInner::pending`），而
+"读选区"必须拿 `ec`、"发请求"不能在按键线程等 HTTP、"写回"又必须回到编辑会话。三段只能
+拆开排。AI 的两段用新加的 `request_edit_if_idle()`：**槽位占着就放弃**，不能把用户正在
+打的那次组合串更新挤掉（挤掉的症状是"打着打着拼音不刷新了"）。
+
+**写回的两条安全线**（都在 `lib.rs`）：
+
+1. **核对选区**：结果回来要几秒，期间用户可能点了别处、重选了别的段落。写回前重新读一遍
+   选区，和发起时的原文（`Job.source`）逐字比对（忽略首尾空白），不一样就只写日志、丢掉。
+2. **正在打拼音就丢**：`is_composing()` 为真时结果不进文档 —— 否则会插到组合串中间。
+
+**续写不替换**：`ai::replaces_selection(action)` 只对翻译/改写为真。续写先把选区塌到末尾，
+再在光标处插入；译文/改写稿才顶掉原文。
+
+**为什么服务指针按线程存**：TSF 按线程激活（浮条也是按线程一条）。`ai.rs` 用 `thread_local!`
+存 `(thunk, ctx)`：本线程的浮条窗口收消息、本线程的窗口过程转给本线程的 `TextService`。
+存进程级就会在浏览器那种多线程宿主里把消息交给另一条线程的服务实例。
+
+**菜单**（`menu.rs`）：插在「中文标点」和「设置…」之间一组三项。AI 未启用时三项灰掉，
+并多一行灰字「（先到设置里启用 AI）」——否则用户只会觉得点了没反应。命令 ID 用 10/11/12，
+和协议里的动作字节 0/1/2 分开（`ai::action_for_cmd` 负责翻译）。
+
+**设置窗**（`settings/src/main.rs`）：加「启用 AI」勾选 + 接口地址 + 模型名，写
+`AI_Enable`(DWORD) / `AI_Endpoint`(SZ) / `AI_Model`(SZ)，**默认值跟引擎完全一致**
+（`http://127.0.0.1:11434`、`qwen2.5:7b`，清空输入框就落回默认）。窗口 320×270 → 424×420。
+
+**测试**（`cargo test --release` **137 项全绿**，新增 15 项）：命令↔动作映射、只有续写不替换、
+按字符截断不切坏汉字、序号不重复、任务记满一次就清、过期任务被扫掉；菜单三个 AI 项的启用
+状态与顺序、未启用时多一行灰字且点不中；协议 6/7 的字节布局、结果解析（三种状态 / 短报文 /
+长度写大）、超长文本按 UTF-8 边界截断；设置窗的地址/模型留空回默认。
+
+**验收（真机跑通）**：本机假 Ollama（`C:\dsh\work\ai-mock.py`，`/api/generate` 返回
+`{"response":"你好"}`）→ 记事本打 `hello` + 回车原样上屏 → Ctrl+A 选中 → 点浮条 ☰ →
+点「翻译选中文字」。DLL 日志：
+
+```
+commit-raw hello
+menu: closed chosen=10
+ai: start seq=1 action=翻译 chars=5
+ai: done seq=1 action=翻译 chars=2
+ai: apply action=翻译 -> ok
+```
+
+假 Ollama 那侧收到的提示词正好是 `…只输出译文：` + 换行 + `hello`，文档里的 `hello` 变成 `你好`。
+
+**两个测试自身的坑**（跟产品无关，但下次别踩）：
+
+- **Windows 11 记事本会恢复上次的未保存标签**。第一次自动化跑出来的选区是
+  `deactivate\rhello`（上一次留下的 `inklink-tsf-*.log` 的内容），看着"翻译成功了"其实
+  替换错了对象。脚本必须先 `Ctrl+A` + `Delete` 清空文档再打字。
+- **DSH 里的 PowerShell 是 DPI unaware 的**：`GetWindowRect` 拿到的是 96 DPI 虚拟坐标，
+  `Screen.Bounds` 却是 1536×864，截屏只抓到屏幕左上角一块。脚本里先
+  `SetProcessDPIAware()` 再算坐标/截屏，点击坐标才和窗口布局对得上。
+- 另外：`Win+Space` 切输入法需要窗口真的在前台。用户在 WPS 里干活时前台锁生效，
+  `SetForegroundWindow` 会静默失败（拿到的是 WPS 的 hwnd），自动化会一直在别的应用里
+  切输入法。脚本要先核对 `GetForegroundWindow()`，不对就别往下按键。
+
+**已知限制**：AI 失败一律静默（只写日志，不弹窗、不吃键）；没有"正在处理"的进度提示；
+选区大于 2000 字不处理；把结果敲进文档之后不能再撤回（它不属于输入法的组合串）。
 
 
 #### P5：发布工程化（进行中，2026-11-02）

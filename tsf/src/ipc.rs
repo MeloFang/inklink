@@ -25,6 +25,10 @@ pub const PIPE_NAME: &str = r"\\.\pipe\inklink-engine";
 const QUERY_TIMEOUT_MS: u32 = 150;
 /// 选词上报的超时预算：它只是"记账"，丢了也只影响下次排序，绝不能拖住用户。
 const SELECT_TIMEOUT_MS: u32 = 100;
+/// AI 报文的超时预算。发请求和取结果都**不等 HTTP**——引擎把活丢给后台线程，
+/// 这里只是"写进去 / 读回来"，正常几十微秒。300ms 是保险丝：万一引擎没起，
+/// 点菜单最多卡这么一下，绝不会像 1.0.1 那样把宿主的 UI 线程挂死。
+const AI_TIMEOUT_MS: u32 = 300;
 
 /// 连上引擎；`timeout_ms` 内没有可用实例就返回 `None`。
 ///
@@ -430,6 +434,110 @@ pub fn unlearn(code: &str, word: &str) {
     }
 }
 
+/// 协议 6 的报文：发起一次 AI 请求。
+///
+/// `[u8 6][u32 seq][u32 hwnd][u8 action][u16 len][text]`
+///
+/// `hwnd` 是浮条的窗口句柄：引擎处理完会 `PostMessageW(hwnd, WM_APP + 30, seq, 0)`
+/// 通知我们回来取结果。传 0 就等于"不用通知"，结果只能靠下一次主动轮询（当前不用）。
+fn ai_request_bytes(seq: u32, hwnd: u32, action: u8, text: &[u8]) -> Vec<u8> {
+    let mut req = Vec::with_capacity(12 + text.len());
+    req.push(6u8);
+    req.extend_from_slice(&seq.to_le_bytes());
+    req.extend_from_slice(&hwnd.to_le_bytes());
+    req.push(action);
+    req.extend_from_slice(&(text.len() as u16).to_le_bytes());
+    req.extend_from_slice(text);
+    req
+}
+
+/// 协议 7 的报文：取一次 AI 结果。`[u8 7][u32 seq]`
+fn ai_result_bytes(seq: u32) -> [u8; 5] {
+    let mut req = [0u8; 5];
+    req[0] = 7;
+    req[1..].copy_from_slice(&seq.to_le_bytes());
+    req
+}
+
+/// 解析协议 7 的响应：`[u8 state][u16 len][text]`。
+///
+/// 状态：0 = 还在跑 / 1 = 好了 / 2 = 失败（text 是原因）。长度比实际数据大时按实际截断，
+/// 不 panic —— 这段跑在别人进程里。
+fn parse_ai_result(body: &[u8]) -> (u8, String) {
+    if body.len() < 3 {
+        return (3, String::new());
+    }
+    let state = body[0];
+    let want = u16::from_le_bytes([body[1], body[2]]) as usize;
+    let text = &body[3..body.len().min(3 + want)];
+    (state, String::from_utf8_lossy(text).into_owned())
+}
+
+/// 按字节上限截断，但不切开一个 UTF-8 字符。
+///
+/// 协议里长度是 `u16`，所以极端长文（>64KB）必须先截；截在半个汉字上会让引擎
+/// 收到非法 UTF-8，宁可少一个字也不能发出坏数据。
+fn clip_utf8(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = 0;
+    for (idx, ch) in s.char_indices() {
+        if idx + ch.len_utf8() > max_bytes {
+            break;
+        }
+        end = idx + ch.len_utf8();
+    }
+    &s[..end]
+}
+
+/// 发起一次 AI 请求（协议 6）。返回是否真的写到了引擎。
+///
+/// **不等模型**：引擎收到就起后台线程，这里读掉那个空响应就走。成功与否只影响日志。
+pub fn ai_request(seq: u32, hwnd: u32, action: u8, text: &str) -> bool {
+    let text = clip_utf8(text, u16::MAX as usize);
+    let req = ai_request_bytes(seq, hwnd, action, text.as_bytes());
+    // SAFETY: 句柄在本函数内配对关闭；读带超时
+    unsafe {
+        let Some(pipe) = open_pipe(AI_TIMEOUT_MS) else {
+            return false;
+        };
+        write_all(pipe, &req);
+        // 引擎会回一个空的候选列表（4 字节 0），读掉它，别让服务端卡在 flush
+        let mut len_buf = [0u8; 4];
+        let _ = read_exact_timeout(pipe, &mut len_buf, AI_TIMEOUT_MS);
+        let _ = CloseHandle(pipe);
+    }
+    true
+}
+
+/// 取一次 AI 结果（协议 7）。返回 `(state, text)`；管道不通时 state = 3。
+pub fn ai_result(seq: u32) -> (u8, String) {
+    // SAFETY: 句柄在本函数内配对关闭；读带超时
+    unsafe {
+        let Some(pipe) = open_pipe(AI_TIMEOUT_MS) else {
+            return (3, String::new());
+        };
+        write_all(pipe, &ai_result_bytes(seq));
+        let mut head = [0u8; 3];
+        if !read_exact_timeout(pipe, &mut head, AI_TIMEOUT_MS) {
+            let _ = CloseHandle(pipe);
+            return (3, String::new());
+        }
+        let len = u16::from_le_bytes([head[1], head[2]]) as usize;
+        let mut body = vec![0u8; len];
+        if len > 0 && !read_exact_timeout(pipe, &mut body, AI_TIMEOUT_MS) {
+            let _ = CloseHandle(pipe);
+            return (3, String::new());
+        }
+        let _ = CloseHandle(pipe);
+        // 拼回头部交给同一个解析器，保证"读"和"测"走同一段逻辑
+        let mut frame = head.to_vec();
+        frame.extend_from_slice(&body);
+        parse_ai_result(&frame)
+    }
+}
+
 /// 把文本送进当前获得焦点的应用（在光标处插入）。
 /// 保留作回退：T4 之后主路径是 ITfRange::SetText，若某些应用不配合可回退到 SendInput。
 #[allow(dead_code)]
@@ -569,5 +677,68 @@ unsafe fn write_all(pipe: HANDLE, buf: &[u8]) {
             break;
         }
         offset += written as usize;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ai_发起报文的字段顺序() {
+        let req = ai_request_bytes(0x11223344, 0x55667788, 2, "你好".as_bytes());
+        assert_eq!(req[0], 6, "类型字节");
+        assert_eq!(&req[1..5], &0x11223344u32.to_le_bytes(), "seq");
+        assert_eq!(&req[5..9], &0x55667788u32.to_le_bytes(), "hwnd");
+        assert_eq!(req[9], 2, "action");
+        assert_eq!(
+            &req[10..12],
+            &6u16.to_le_bytes(),
+            "长度按字节（你好 = 6 字节）"
+        );
+        assert_eq!(&req[12..], "你好".as_bytes());
+    }
+
+    #[test]
+    fn ai_取结果报文的字段顺序() {
+        let req = ai_result_bytes(0x0A0B0C0D);
+        assert_eq!(req[0], 7);
+        assert_eq!(&req[1..], &0x0A0B0C0Du32.to_le_bytes());
+    }
+
+    #[test]
+    fn 解析结果三种状态() {
+        let mut body = vec![1u8];
+        body.extend_from_slice(&("你好".len() as u16).to_le_bytes());
+        body.extend_from_slice("你好".as_bytes());
+        assert_eq!(parse_ai_result(&body), (1, "你好".to_string()));
+
+        assert_eq!(parse_ai_result(&[0, 0, 0]), (0, String::new()));
+        assert_eq!(
+            parse_ai_result(&[2, 3, 0, b'b', b'a', b'd']),
+            (2, "bad".to_string())
+        );
+    }
+
+    #[test]
+    fn 解析结果遇到短报文不崩() {
+        assert_eq!(parse_ai_result(&[]), (3, String::new()));
+        assert_eq!(parse_ai_result(&[1]), (3, String::new()));
+    }
+
+    #[test]
+    fn 解析结果长度写大了也不越界() {
+        // 声称 10 字节，实际只有 2 字节
+        let (state, text) = parse_ai_result(&[1, 10, 0, b'o', b'k']);
+        assert_eq!(state, 1);
+        assert_eq!(text, "ok");
+    }
+
+    #[test]
+    fn 超长文本按字节截但不切坏汉字() {
+        assert_eq!(clip_utf8("你好", 6), "你好");
+        assert_eq!(clip_utf8("你好", 3), "你", "3 字节只放得下一个汉字");
+        assert_eq!(clip_utf8("你好", 2), "", "第二个字节切在字中间，宁可不要");
+        assert_eq!(clip_utf8("abc", 2), "ab");
     }
 }

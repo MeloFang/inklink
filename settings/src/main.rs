@@ -1,15 +1,16 @@
-//! inklink 设置 —— 一页原生小窗，只改 `HKCU\Software\inklink\Config` 那五个值。
+//! inklink 设置 —— 一页原生小窗，只改 `HKCU\Software\inklink\Config` 里那几个值。
 //!
-//! 为什么是这么小一个程序：现在可配的就五项（暗色、列数、行数、撤回窗口、学习开关），
-//! 为五项做六页设置台是过度设计。等 P4/P6 把配置撑到几十项、需要分组和长列表时，
-//! 再考虑换 webview 那套（见 PLAN.md 的 P2b）。
+//! 为什么是这么小一个程序：现在可配的就八项（暗色、列数、行数、撤回窗口、学习开关，
+//! 加上 P4b 的 AI 三项），为八项做六页设置台是过度设计。等 P6 把配置撑到几十项、
+//! 需要分组和长列表时，再考虑换 webview 那套（见 PLAN.md 的 P2b）。
 //!
 //! 为什么用系统控件而不是自绘：浮条和候选窗自绘是因为它们要跟着主题变、还要在
 //! 宿主进程里跑（不能引 UI 框架）；设置窗是独立进程、一天用一次，系统控件够用。
 //! 代价是它不跟暗色 —— 这一点写进 README 比让用户猜好。
 //!
-//! 值的读写规则与 `tsf/src/config.rs` 必须一致，否则设置台和 DLL 会各说各话：
-//! 都写 DWORD，`Dark`/`Learn` 用 0/1，列数 3–9、行数 1–9、撤回窗口 0–10000。
+//! 值的读写规则与 `tsf/src/config.rs`、`tsf/src/ai.rs` 必须一致，否则设置台和 DLL
+//! 会各说各话：`Dark`/`Learn`/`AI_Enable` 是 DWORD（0/1），列数 3–9、行数 1–9、
+//! 撤回窗口 0–10000，`AI_Endpoint`/`AI_Model` 是 SZ（引擎自己读那两个）。
 
 use std::cell::RefCell;
 
@@ -17,14 +18,14 @@ use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{GetStockObject, DEFAULT_GUI_FONT, HGDIOBJ};
 use windows_sys::Win32::System::Registry::{
     RegCloseKey, RegCreateKeyExW, RegQueryValueExW, RegSetValueExW, HKEY, HKEY_CURRENT_USER,
-    KEY_READ, KEY_WRITE, REG_DWORD, REG_OPTION_NON_VOLATILE,
+    KEY_READ, KEY_WRITE, REG_DWORD, REG_EXPAND_SZ, REG_OPTION_NON_VOLATILE, REG_SZ,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, GetWindowTextW,
     IsDialogMessageW, MessageBoxW, PostQuitMessage, RegisterClassW, SendMessageW, SetWindowTextW,
     ShowWindow, TranslateMessage, BM_GETCHECK, BM_SETCHECK, BS_AUTOCHECKBOX, CW_USEDEFAULT,
-    ES_NUMBER, MB_ICONERROR, MB_OK, MSG, SW_SHOW, WM_COMMAND, WM_CREATE, WM_DESTROY, WNDCLASSW,
-    WS_BORDER, WS_CAPTION, WS_CHILD, WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
+    ES_AUTOHSCROLL, ES_NUMBER, MB_ICONERROR, MB_OK, MSG, SW_SHOW, WM_COMMAND, WM_CREATE, WM_DESTROY,
+    WNDCLASSW, WS_BORDER, WS_CAPTION, WS_CHILD, WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
 };
 
 const KEY_PATH: &str = r"Software\inklink\Config";
@@ -34,6 +35,9 @@ const ID_ROWS: usize = 102;
 const ID_DARK: usize = 103;
 const ID_LEARN: usize = 104;
 const ID_UNDO: usize = 105;
+const ID_AI_ENABLE: usize = 106;
+const ID_AI_ENDPOINT: usize = 107;
+const ID_AI_MODEL: usize = 108;
 const ID_SAVE: usize = 1001;
 const ID_RESET: usize = 1002;
 const ID_CLOSE: usize = 1003;
@@ -47,6 +51,10 @@ const DEF_COLS: u32 = 5;
 const DEF_ROWS: u32 = 5;
 const DEF_UNDO: u32 = 2000;
 
+/// 与引擎 `rime-server.cc` 的 `ai_config()` 默认值一致：本机 Ollama。
+const DEF_ENDPOINT: &str = "http://127.0.0.1:11434";
+const DEF_MODEL: &str = "qwen2.5:7b";
+
 thread_local! {
     static UI: RefCell<Ui> = RefCell::new(Ui::default());
 }
@@ -58,6 +66,9 @@ struct Ui {
     dark: HWND,
     learn: HWND,
     undo: HWND,
+    ai_enable: HWND,
+    ai_endpoint: HWND,
+    ai_model: HWND,
     status: HWND,
 }
 
@@ -72,16 +83,42 @@ fn read_form(ui: &Ui) -> Result<Config, String> {
         cols,
         rows,
         undo_ms: undo,
+        ai_enabled: checked(ui.ai_enable),
+        ai_endpoint: endpoint_or_default(&text_of(ui.ai_endpoint)),
+        ai_model: model_or_default(&text_of(ui.ai_model)),
     })
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Config {
     dark: bool,
     learn: bool,
     cols: u32,
     rows: u32,
     undo_ms: u32,
+    ai_enabled: bool,
+    ai_endpoint: String,
+    ai_model: String,
+}
+
+/// 地址留空就当默认值。**不能把空串写进注册表**：引擎那边空串也会退回默认，
+/// 但设置窗再打开时输入框会空着，用户会以为坏了。
+fn endpoint_or_default(s: &str) -> String {
+    let t = s.trim().trim_end_matches('/');
+    if t.is_empty() {
+        DEF_ENDPOINT.to_string()
+    } else {
+        t.to_string()
+    }
+}
+
+fn model_or_default(s: &str) -> String {
+    let t = s.trim();
+    if t.is_empty() {
+        DEF_MODEL.to_string()
+    } else {
+        t.to_string()
+    }
 }
 
 fn checked(h: HWND) -> bool {
@@ -89,7 +126,7 @@ fn checked(h: HWND) -> bool {
 }
 
 fn text_of(h: HWND) -> String {
-    let mut buf = [0u16; 32];
+    let mut buf = [0u16; 512];
     let n = unsafe { GetWindowTextW(h, buf.as_mut_ptr(), buf.len() as i32) };
     let n = if n < 0 { 0 } else { n as usize };
     String::from_utf16_lossy(&buf[..n.min(buf.len())])
@@ -174,18 +211,64 @@ unsafe fn write_dword(h: HKEY, name: &str, v: u32) -> bool {
     ) == 0
 }
 
+unsafe fn read_sz(h: HKEY, name: &str) -> Option<String> {
+    let n = wide(name);
+    let mut ty = 0u32;
+    let mut buf = [0u16; 512];
+    let mut cb = (buf.len() * 2) as u32;
+    let rc = RegQueryValueExW(
+        h,
+        n.as_ptr(),
+        std::ptr::null_mut(),
+        &mut ty,
+        buf.as_mut_ptr() as *mut u8,
+        &mut cb,
+    );
+    if rc != 0 || (ty != REG_SZ && ty != REG_EXPAND_SZ) {
+        return None;
+    }
+    let len = ((cb as usize / 2).saturating_sub(1)).min(buf.len());
+    let s: String = String::from_utf16_lossy(&buf[..len]);
+    let s = s.trim_end_matches('\0').trim();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s.to_string())
+    }
+}
+
+unsafe fn write_sz(h: HKEY, name: &str, v: &str) -> bool {
+    let n = wide(name);
+    let data: Vec<u16> = v.encode_utf16().chain(std::iter::once(0)).collect();
+    RegSetValueExW(
+        h,
+        n.as_ptr(),
+        0,
+        REG_SZ,
+        data.as_ptr() as *const u8,
+        (data.len() * 2) as u32,
+    ) == 0
+}
+
+fn default_config() -> Config {
+    Config {
+        dark: false,
+        learn: true,
+        cols: DEF_COLS,
+        rows: DEF_ROWS,
+        undo_ms: DEF_UNDO,
+        ai_enabled: false,
+        ai_endpoint: DEF_ENDPOINT.to_string(),
+        ai_model: DEF_MODEL.to_string(),
+    }
+}
+
 fn load_config() -> Config {
     unsafe {
         let Some(h) = open_key(KEY_READ) else {
-            return Config {
-                dark: false,
-                learn: true,
-                cols: DEF_COLS,
-                rows: DEF_ROWS,
-                undo_ms: DEF_UNDO,
-            };
+            return default_config();
         };
-        // 缺省语义必须和 DLL 一致：Dark 缺失=浅色（只有非 0 才算开），
+        // 缺省语义必须和 DLL 一致：Dark/AI_Enable 缺失=关（只有非 0 才算开），
         // Learn 缺失=开（只有明确写 0 才算关）。
         let dark = matches!(read_dword(h, "Dark"), Some(v) if v != 0);
         let learn = !matches!(read_dword(h, "Learn"), Some(0));
@@ -198,6 +281,9 @@ fn load_config() -> Config {
         let undo = read_dword(h, "UndoMs")
             .filter(|v| *v <= UNDO_RANGE.1)
             .unwrap_or(DEF_UNDO);
+        let ai_enabled = matches!(read_dword(h, "AI_Enable"), Some(v) if v != 0);
+        let ai_endpoint = read_sz(h, "AI_Endpoint").unwrap_or_else(|| DEF_ENDPOINT.to_string());
+        let ai_model = read_sz(h, "AI_Model").unwrap_or_else(|| DEF_MODEL.to_string());
         RegCloseKey(h);
         Config {
             dark,
@@ -205,6 +291,9 @@ fn load_config() -> Config {
             cols,
             rows,
             undo_ms: undo,
+            ai_enabled,
+            ai_endpoint,
+            ai_model,
         }
     }
 }
@@ -218,7 +307,10 @@ fn save_config(c: Config) -> bool {
             && write_dword(h, "Learn", if c.learn { 1 } else { 0 })
             && write_dword(h, "Cols", c.cols)
             && write_dword(h, "Rows", c.rows)
-            && write_dword(h, "UndoMs", c.undo_ms);
+            && write_dword(h, "UndoMs", c.undo_ms)
+            && write_dword(h, "AI_Enable", if c.ai_enabled { 1 } else { 0 })
+            && write_sz(h, "AI_Endpoint", &c.ai_endpoint)
+            && write_sz(h, "AI_Model", &c.ai_model);
         RegCloseKey(h);
         ok
     }
@@ -265,7 +357,7 @@ unsafe fn set_text(h: HWND, s: &str) {
 
 unsafe fn build_ui(hwnd: HWND) {
     let font = GetStockObject(DEFAULT_GUI_FONT) as HGDIOBJ;
-    let mut add = |h: HWND| {
+    let add = |h: HWND| {
         SendMessageW(
             h,
             0x0030, // WM_SETFONT
@@ -284,6 +376,22 @@ unsafe fn build_ui(hwnd: HWND) {
             "EDIT",
             t,
             WS_BORDER | WS_TABSTOP | ES_NUMBER as u32,
+            x,
+            y,
+            w,
+            22,
+            hwnd,
+            id,
+        );
+        SendMessageW(h, 0x0030, font as usize, 1);
+        h
+    };
+    // 文本输入框：地址和模型名是字符串，不能带 ES_NUMBER，长地址要能横向滚动
+    let edit_text = |t: &str, x: i32, y: i32, w: i32, id: usize| {
+        let h = child(
+            "EDIT",
+            t,
+            WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL as u32,
             x,
             y,
             w,
@@ -336,22 +444,46 @@ unsafe fn build_ui(hwnd: HWND) {
     label("撤回窗口（毫秒，0 = 关掉撤回）", 16, 112, 240);
     let undo = edit(&c.undo_ms.to_string(), 16, 134, 80, ID_UNDO);
 
+    // ── AI（P4b）────────────────────────────────────────────
+    label(
+        "AI —— 选中一段文字，再点浮条 ☰ 里的「翻译/改写/续写」",
+        16,
+        168,
+        380,
+    );
+    let ai_enable = check(
+        "启用 AI（会连到你填的接口地址）",
+        16,
+        190,
+        360,
+        ID_AI_ENABLE,
+    );
+    if c.ai_enabled {
+        SendMessageW(ai_enable, BM_SETCHECK as u32, 1, 0);
+    }
+
+    label("接口地址（Ollama 兼容端点）", 16, 220, 300);
+    let ai_endpoint = edit_text(&c.ai_endpoint, 16, 240, 380, ID_AI_ENDPOINT);
+
+    label("模型名", 16, 270, 100);
+    let ai_model = edit_text(&c.ai_model, 16, 290, 380, ID_AI_MODEL);
+
     let status = child(
         "STATIC",
         "改完点保存，下一次按键就生效，不用重启。",
         0,
         16,
-        166,
-        300,
+        326,
+        380,
         18,
         hwnd,
         0,
     );
     add(status);
 
-    button("保存", 16, 196, 76, ID_SAVE);
-    button("恢复默认", 100, 196, 90, ID_RESET);
-    button("关闭", 198, 196, 76, ID_CLOSE);
+    button("保存", 16, 354, 76, ID_SAVE);
+    button("恢复默认", 100, 354, 90, ID_RESET);
+    button("关闭", 198, 354, 76, ID_CLOSE);
 
     UI.with(|u| {
         let mut u = u.borrow_mut();
@@ -360,6 +492,9 @@ unsafe fn build_ui(hwnd: HWND) {
         u.dark = dark;
         u.learn = learn;
         u.undo = undo;
+        u.ai_enable = ai_enable;
+        u.ai_endpoint = ai_endpoint;
+        u.ai_model = ai_model;
         u.status = status;
     });
 }
@@ -404,6 +539,9 @@ impl Ui {
             dark: self.dark,
             learn: self.learn,
             undo: self.undo,
+            ai_enable: self.ai_enable,
+            ai_endpoint: self.ai_endpoint,
+            ai_model: self.ai_model,
             status: self.status,
         }
     }
@@ -425,6 +563,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     set_text(ui.undo, &DEF_UNDO.to_string());
                     SendMessageW(ui.dark, BM_SETCHECK as u32, 0, 0);
                     SendMessageW(ui.learn, BM_SETCHECK as u32, 1, 0);
+                    SendMessageW(ui.ai_enable, BM_SETCHECK as u32, 0, 0);
+                    set_text(ui.ai_endpoint, DEF_ENDPOINT);
+                    set_text(ui.ai_model, DEF_MODEL);
                     set_text(ui.status, "已填回默认值 —— 还要点一次“保存”才写进去。");
                 }
                 ID_CLOSE => {
@@ -471,8 +612,8 @@ fn main() {
             WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
-            320,
-            270,
+            424,
+            420,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
             std::ptr::null_mut(),
@@ -517,5 +658,23 @@ mod tests {
         assert_eq!(parse_clamped("2000", UNDO_RANGE), Some(2000));
         assert_eq!(parse_clamped("10000", UNDO_RANGE), Some(10000));
         assert_eq!(parse_clamped("10001", UNDO_RANGE), None);
+    }
+
+    #[test]
+    fn 地址留空就用默认值且去掉尾部斜杠() {
+        assert_eq!(endpoint_or_default(""), DEF_ENDPOINT);
+        assert_eq!(endpoint_or_default("   "), DEF_ENDPOINT);
+        assert_eq!(endpoint_or_default("http://127.0.0.1:11434/"), DEF_ENDPOINT);
+        assert_eq!(
+            endpoint_or_default(" http://192.168.1.9:8080 "),
+            "http://192.168.1.9:8080"
+        );
+    }
+
+    #[test]
+    fn 模型名留空就用默认值() {
+        assert_eq!(model_or_default(""), DEF_MODEL);
+        assert_eq!(model_or_default("  "), DEF_MODEL);
+        assert_eq!(model_or_default(" qwen3:8b "), "qwen3:8b");
     }
 }

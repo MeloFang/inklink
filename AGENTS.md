@@ -6,7 +6,7 @@
 ## 这是什么
 
 **inklink**：Windows 上开源的中文输入法。装进系统后就是一个正常的 TSF 输入法（Win+Space 切换），
-打拼音 → 候选窗 → 上屏。产品愿景是用个人词库 + Obsidian 语料 + AI 做个性化，目前 M0/M1 完成、产品化 P0–P1 上线（浮条已改进程内）。
+打拼音 → 候选窗 → 上屏。产品愿景是用个人词库 + Obsidian 语料 + AI 做个性化，目前 M0/M1 完成、产品化 P0–P1/P3/P4 上线（浮条已改进程内；AI 翻译/改写/续写是可选壳，默认关）。
 
 架构（ADR-0006）：`inklink_tsf.dll`（薄壳，装在应用进程里）──命名管道──▶ `rime-server.exe`（x86，链 librime）。
 **为什么分两个进程**：Weasel 分发的 `rime.dll` 只有 32 位，而 TSF DLL 必须 64 位。
@@ -39,15 +39,16 @@ inklink/
 │  ├─ src/lib.rs         按键状态机 + 组合串 + 候选导航
 │  ├─ src/candwin.rs     候选窗（Win32 弹出窗口）
 │  ├─ src/display.rs     组合串的下划线（ITfDisplayAttributeProvider + GUID_PROP_ATTRIBUTE）
-│  ├─ src/ipc.rs         命名管道客户端 + 引擎自动拉起
+│  ├─ src/ipc.rs         命名管道客户端 + 引擎自动拉起（含 AI 的协议 6/7）
 │  ├─ src/pinyin.rs      402 音节表（贪心最长匹配；算分段上屏吃掉多少字母 + 组合串按音节显示的 `'`）
 │  ├─ src/state.rs       全局状态（注册表 HKCU\Software\inklink\State：中英、中文标点；UI 位置）
 │  ├─ src/config.rs      可调配置（HKCU\Software\inklink\Config：暗色/列数/行数/撤回窗口/学习开关）
+│  ├─ src/ai.rs          AI 的界面侧（P4b）：动作/任务记账/线程局部服务指针，读选区与写回在 lib.rs
 │  ├─ src/bar.rs         浮条（宿主进程内自绘，窗口类 inklink-bar；Activate→show、Deactivate→hide）
 │  ├─ src/menu.rs        自绘 ☰ 菜单（不用 TrackPopupMenu，见 ADR-0008）
 │  └─ build.rs           把 VERSION 编进 DLL
 ├─ ui/                   【已退役，源码留作回退】旧独立浮条进程（1.1.10 起不构建/不部署/不自启，见 ADR-0008）
-├─ settings/             设置窗 inklink-settings.exe（P2a：一页原生小窗，只改 HKCU\Software\inklink\Config）
+├─ settings/             设置窗 inklink-settings.exe（P2a：一页原生小窗；P4b 加了 AI 三项，只改 HKCU\Software\inklink\Config）
 ├─ rime-server/          C++ 引擎服务（链 librime，x86）
 │  └─ rime-server.cc     协议 [u8 type] + 查询/选词；个人词库学习层 + --selftest
 ├─ rime-config/          引擎侧配置源
@@ -110,7 +111,7 @@ powershell -ExecutionPolicy Bypass -File tools\release.ps1
 $env:PATH = "$env:USERPROFILE\.cargo\bin;$env:PATH"
 
 cd C:\dsh\work\inklink\tsf
-cargo test --release                       # 122 个单测（按键认领 / 标点 / 引号 / 拼音切分 / 音节分隔显示 / 分词边界 / 分段上屏 / 误选撤回 / 整句上报 / 候选窗摆放与点击 / 注入退格抑制 / 显示属性 / 全局状态缺省值 / 配置默认值与夹取 / 浮条与菜单布局 / 浮条创建显示绘制 / 浮条外观预览 / 浮条两套主题对比度 / 标点符号的距离场内外 / 品牌标取哪一帧 / 浮条圆角抗锯齿 / 浮条可见性仲裁 / 标点横向错开 / 候选窗两套主题）
+cargo test --release                       # 137 个单测（按键认领 / 标点 / 引号 / 拼音切分 / 音节分隔显示 / 分词边界 / 分段上屏 / 误选撤回 / 整句上报 / 候选窗摆放与点击 / 注入退格抑制 / 显示属性 / 全局状态缺省值 / 配置默认值与夹取 / 浮条与菜单布局 / 浮条创建显示绘制 / 浮条外观预览 / 浮条两套主题对比度 / 标点符号的距离场内外 / 品牌标取哪一帧 / 浮条圆角抗锯齿 / 浮条可见性仲裁 / 标点横向错开 / 候选窗两套主题 / AI 菜单启用态与命令映射 / 协议 6-7 报文与解析）
 cargo build --release --lib --target-dir target-static
 cargo build --release --lib --target i686-pc-windows-msvc --target-dir target-static
 ```
