@@ -656,6 +656,14 @@ powershell -ExecutionPolicy Bypass -File tools\probe-ai.ps1 -Action 0 -Text hell
 2. `install.ps1` 从来没拷 `inklink-settings.exe`（浮条菜单的「设置…」点了没反应）。
    两处都已修，并补了自检项（rime 数据 / 设置窗）。
 
+### 1.1.40：浮条 AI 三格 + 结果确认框
+
+- 浮条 7 格：品牌 / 中英 / 标点 / 翻译 / 改写 / 续写 / ☰；亮暗切换进菜单（「暗色主题」）。
+- 新增 `tsf/src/preview.rs`：AI 结果先弹确认框（NOACTIVATE，不抢焦点），点「确定」才
+  写到文档；Esc / 点外面取消。`ai.rs` 用 `PENDING` 存待确认结果。
+- 引擎提示词：改写 = 错别字/用词/逻辑；续写 = 前文不动、只输出新增。
+- 单测 145、引擎 selftest 45。
+
 ### 还没做的（留给 P6 / M3）
 
 - 结果写进文档后**不能撤回**（它不属于组合串，`UndoMs` 那套管不到）。

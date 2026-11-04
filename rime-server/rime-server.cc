@@ -1252,10 +1252,14 @@ static std::string ai_prompt(int action, const std::string& text) {
     std::string head;
     switch (action) {
         case AI_REWRITE:
-            head = "把下面这段中文改写得更通顺自然，保持原意和语气，只输出改写后的正文：\n";
+            // 1.1.40 起"改写"的语义收窄成校对型：错别字、用词、逻辑漏洞
+            head = "把下面这段文字改写：修正错别字、优化用词、理顺逻辑（有明显漏洞就补上），"
+                   "保持原意和语气；只输出改写后的正文：\n";
             break;
         case AI_CONTINUE:
-            head = "接着下面这段中文往下写一句，风格保持一致，只输出续写的那一句：\n";
+            // 续写的硬约束：前文一个字都不动，只输出新增部分（DLL 负责接在后面）
+            head = "保持下面这段文字不变，顺着它的语气和逻辑往后写，不要重复已有的内容；"
+                   "只输出新写出来的部分：\n";
             break;
         default: head = "把下面这段内容翻译成中文，只输出译文：\n";
     }
@@ -1643,6 +1647,12 @@ static int run_selftest() {
     once.apps["code"] = 1;
     ck(boost_score(bw, "code") > boost_score(once, "code"),
         "boost_score: used in other apps still beats used once");
+
+    // AI 提示词（1.1.40 改过语义）：改写要覆盖错别字/用词/逻辑，续写只输出新增部分。
+    ck(ai_prompt(AI_REWRITE, "x").find("错别字") != std::string::npos,
+       "ai_prompt: rewrite is proofreading");
+    ck(ai_prompt(AI_CONTINUE, "x").find("不要重复") != std::string::npos,
+       "ai_prompt: continue appends only");
 
     if (fails == 0) {
         printf("\nall %d checks passed\n", total);

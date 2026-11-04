@@ -31,6 +31,7 @@ mod display;
 mod ipc;
 mod menu;
 mod pinyin;
+mod preview;
 mod state;
 use windows::core::IUnknownImpl;
 use windows::core::{GUID, HRESULT, Interface, Ref, implement};

@@ -44,6 +44,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 
 pub const CMD_TOGGLE_MODE: u32 = 1;
 pub const CMD_TOGGLE_PUNCT: u32 = 2;
+/// 亮/暗主题（1.1.40 从浮条挪进菜单）。
+pub const CMD_TOGGLE_THEME: u32 = 3;
 pub const CMD_SETTINGS: u32 = 4;
 pub const CMD_ABOUT: u32 = 5;
 /// P4b 的三项 AI 命令。编号和 `ai::ACTION_*` 分开：命令是"菜单项身份"，
@@ -122,7 +124,7 @@ fn scale(v: i32) -> i32 {
     (v * dpi + 48) / 96
 }
 
-fn build_items(chinese: bool, punct: bool, ai: bool) -> Vec<Item> {
+fn build_items(chinese: bool, punct: bool, ai: bool, dark: bool) -> Vec<Item> {
     let sep = || Item {
         id: 0,
         label: String::new(),
@@ -156,6 +158,13 @@ fn build_items(chinese: bool, punct: bool, ai: bool) -> Vec<Item> {
             id: CMD_TOGGLE_PUNCT,
             label: "中文标点".to_string(),
             checked: punct,
+            enabled: true,
+            separator: false,
+        },
+        Item {
+            id: CMD_TOGGLE_THEME,
+            label: "暗色主题".to_string(),
+            checked: dark,
             enabled: true,
             separator: false,
         },
@@ -458,9 +467,9 @@ fn ensure_class() {
 }
 
 /// 弹出菜单并阻塞到用户选完。返回命令 ID（0 = 点外面/按 Esc）。
-pub fn popup(owner: HWND, x: i32, y: i32, chinese: bool, punct: bool, ai: bool) -> u32 {
+pub fn popup(owner: HWND, x: i32, y: i32, chinese: bool, punct: bool, ai: bool, dark: bool) -> u32 {
     ensure_class();
-    let list = build_items(chinese, punct, ai);
+    let list = build_items(chinese, punct, ai, dark);
     if let Ok(mut slot) = ITEMS.lock() {
         *slot = list.clone();
     }
@@ -609,7 +618,7 @@ mod tests {
     use super::*;
 
     fn items() -> Vec<Item> {
-        build_items(true, true, true)
+        build_items(true, true, true, false)
     }
 
     #[test]
@@ -673,14 +682,14 @@ mod tests {
 
     #[test]
     fn mode_label_follows_state() {
-        let cn = build_items(true, true, true);
-        let en = build_items(false, true, true);
+        let cn = build_items(true, true, true, false);
+        let en = build_items(false, true, true, false);
         assert_eq!(cn[0].label, "切换为英文");
         assert_eq!(en[0].label, "切换为中文");
         assert!(cn[0].checked, "中文模式下第一项要打勾");
         assert!(!en[0].checked, "英文模式下第一项不打勾");
         assert!(cn[1].checked);
-        let off = build_items(true, false, true);
+        let off = build_items(true, false, true, false);
         assert!(!off[1].checked);
     }
 
@@ -703,7 +712,7 @@ mod tests {
 
     #[test]
     fn 三个_ai_菜单项按启用状态变灰() {
-        let on = build_items(true, true, true);
+        let on = build_items(true, true, true, false);
         for id in [CMD_AI_TRANSLATE, CMD_AI_REWRITE, CMD_AI_CONTINUE] {
             let it = on.iter().find(|it| it.id == id).expect("AI 项要在菜单里");
             assert!(it.enabled, "启用 AI 时该项可点");
@@ -721,7 +730,7 @@ mod tests {
             vec![CMD_AI_TRANSLATE, CMD_AI_REWRITE, CMD_AI_CONTINUE]
         );
 
-        let off = build_items(true, true, false);
+        let off = build_items(true, true, false, false);
         for id in [CMD_AI_TRANSLATE, CMD_AI_REWRITE, CMD_AI_CONTINUE] {
             let it = off.iter().find(|it| it.id == id).expect("AI 项要在菜单里");
             assert!(!it.enabled, "没启用 AI 时该项要灰掉");
@@ -735,7 +744,7 @@ mod tests {
 
     #[test]
     fn ai_说明行也是灰的且点不中() {
-        let off = build_items(true, true, false);
+        let off = build_items(true, true, false, false);
         let hint = off
             .iter()
             .position(|it| it.label.contains("启用 AI"))

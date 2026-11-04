@@ -131,8 +131,8 @@ const SEP_GAP: i32 = 6;
 const SEP_W: i32 = 1;
 const W_MODE: i32 = 34;
 const W_PUNCT: i32 = 34;
-/// 主题格：亮色画太阳、暗色画月牙，点一下就切换。
-const W_THEME: i32 = 34;
+/// AI 三格（翻译/改写/续写）：亮暗切换挪进 ☰ 菜单，这里换成 AI 的快捷入口。
+const W_AI: i32 = 38;
 const W_MENU: i32 = 30;
 
 // COLORREF 是 0x00BBGGRR（低字节是红）
@@ -189,11 +189,13 @@ fn scale(v: i32) -> i32 {
     (v * dpi + 48) / 96
 }
 
-/// 五个可点的地方：品牌标、中文/英文、中文标点/半角、**亮/暗切换**、菜单。纯函数，可单测。
+/// 七个可点的地方：品牌标、中文/英文、中文标点、**翻译 / 改写 / 续写**、菜单。
+///
+/// 亮/暗切换从浮条挪进了 ☰ 菜单（1.1.40）：三个 AI 动作更常用，直接摆出来少一次点击。
 ///
 /// 品牌标和第一格状态之间多留一道竖线（`SEP_W` 宽，两边各 `SEP_GAP`），
 /// 和搜狗浮条一样给"品牌 | 状态"一个视觉分隔。竖线本身不是可点区域。
-fn item_rects() -> [RECT; 5] {
+fn item_rects() -> [RECT; 7] {
     let pad = scale(PAD);
     let gap = scale(GAP);
     let h = scale(ITEM_H);
@@ -202,7 +204,9 @@ fn item_rects() -> [RECT; 5] {
         scale(W_BRAND),
         scale(W_MODE),
         scale(W_PUNCT),
-        scale(W_THEME),
+        scale(W_AI),
+        scale(W_AI),
+        scale(W_AI),
         scale(W_MENU),
     ];
     let mut rects = [RECT {
@@ -210,7 +214,7 @@ fn item_rects() -> [RECT; 5] {
         top: 0,
         right: 0,
         bottom: 0,
-    }; 5];
+    }; 7];
     let mut x = pad;
     for (i, w) in widths.iter().enumerate() {
         rects[i] = RECT {
@@ -228,7 +232,7 @@ fn item_rects() -> [RECT; 5] {
 }
 
 fn window_size() -> (i32, i32) {
-    let last = item_rects()[4];
+    let last = item_rects()[6];
     let pad = scale(PAD);
     (last.right + pad, last.bottom + pad)
 }
@@ -1278,63 +1282,6 @@ unsafe fn draw_menu_glyph(hdc: HDC, r: &RECT, color: u32) {
 ///
 /// 用 `fill_round_aa` 画圆，和整条的圆角同一套抗锯齿；
 /// 直接用 GDI 的 `Ellipse` 在 8px 直径下会变成一块方砧。
-unsafe fn draw_theme_glyph(c: &mut Canvas, r: &RECT, dark: bool, fg: u32, bg: u32) {
-    let (cw, ch) = (c.w, c.h);
-    let cx = (r.left + r.right) / 2;
-    let cy = (r.top + r.bottom) / 2;
-    let d = scale(4);
-    let disc = RECT {
-        left: cx - d,
-        top: cy - d,
-        right: cx + d,
-        bottom: cy + d,
-    };
-    fill_round_aa(c.pixels(), cw, ch, &disc, d as f32, fg);
-    if dark {
-        // 月牙：用底色在右上方盖一个偏移的圆，剩下一个弯钩。
-        let cut = RECT {
-            left: disc.left + scale(2),
-            top: disc.top - scale(2),
-            right: disc.right + scale(2),
-            bottom: disc.bottom - scale(2),
-        };
-        fill_round_aa(c.pixels(), cw, ch, &cut, d as f32, bg);
-    } else {
-        // 太阳：四道光线，每道 1.5px 宽。
-        let ray_in = d + scale(2);
-        let ray_out = d + scale(4);
-        let th = scale(2).max(1);
-        let bars = [
-            RECT {
-                left: cx + ray_in,
-                top: cy - th / 2,
-                right: cx + ray_out,
-                bottom: cy - th / 2 + th,
-            },
-            RECT {
-                left: cx - ray_out,
-                top: cy - th / 2,
-                right: cx - ray_in,
-                bottom: cy - th / 2 + th,
-            },
-            RECT {
-                left: cx - th / 2,
-                top: cy + ray_in,
-                right: cx - th / 2 + th,
-                bottom: cy + ray_out,
-            },
-            RECT {
-                left: cx - th / 2,
-                top: cy - ray_out,
-                right: cx - th / 2 + th,
-                bottom: cy - ray_in,
-            },
-        ];
-        for b in bars {
-            fill_rect(c.dc, &b, fg);
-        }
-    }
-}
 
 fn get_font() -> HGDIOBJ {
     make_font(&FONT, 17)
@@ -1611,11 +1558,14 @@ unsafe fn paint_bar(c: &mut Canvas, hover: i32, dark: bool) {
     let punct_fg = if punct { pal.accent } else { pal.dim };
     draw_glyphs_aa(hdc, &cell, &punct_glyphs(&cell, punct, dpi_k()), punct_fg);
 
-    // 第四格：亮/暗切换。图标画的是**当前**主题（亮= 太阳，暗= 月牙）。
-    draw_theme_glyph(c, &rects[3], dark, pal.text, pal.bg);
+    // 第四~六格：翻译 / 改写 / 续写。两字一格，AI 没启用也照常画（点了会提示去设置）。
+    let labels = ["翻译", "改写", "续写"];
+    for (i, label) in labels.iter().enumerate() {
+        draw_text_centered(hdc, &rects[3 + i], label, pal.text, font);
+    }
 
-    // 第五格：菜单。
-    draw_menu_glyph(hdc, &rects[4], pal.text);
+    // 第七格：菜单。
+    draw_menu_glyph(hdc, &rects[6], pal.text);
 
     // 状态字盖住整条（AI 处理中 / 失败）。放在 apply_frame 之前：
     // 圆角外的那几个像素必须保持透明，否则窗口会露出方形底。
@@ -1760,6 +1710,7 @@ fn handle_menu(hwnd: HWND, cmd: u32) {
     match cmd {
         crate::menu::CMD_TOGGLE_MODE => toggle_mode(hwnd),
         crate::menu::CMD_TOGGLE_PUNCT => toggle_punct(hwnd),
+        crate::menu::CMD_TOGGLE_THEME => toggle_theme(hwnd),
         crate::menu::CMD_SETTINGS => open_settings(),
         _ => {}
     }
@@ -1893,13 +1844,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 crate::state::write_pos(wr.left, wr.top);
             } else {
                 match pressed {
-                    // 品牌标：等同点 ☰，把菜单弹出来（投递到队列，不在这里直接弹）
-                    0 | 4 => {
+                    // 品牌标 / 最右格：等同点 ☰（投递到队列，不在这里直接弹）
+                    0 | 6 => {
                         PostMessageW(hwnd, WM_OPEN_MENU, 0, 0);
                     }
                     1 => toggle_mode(hwnd),
                     2 => toggle_punct(hwnd),
-                    3 => toggle_theme(hwnd),
+                    3 => crate::ai::from_menu(crate::ai::ACTION_TRANSLATE),
+                    4 => crate::ai::from_menu(crate::ai::ACTION_REWRITE),
+                    5 => crate::ai::from_menu(crate::ai::ACTION_CONTINUE),
                     _ => {}
                 }
             }
@@ -1913,7 +1866,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 let (chinese, punct) = crate::state::snapshot();
                 // AI 有没有启用现读注册表：菜单每次弹出都可能是刚在设置里勾上的
                 let ai = crate::ai::enabled();
-                let cmd = crate::menu::popup(hwnd, wr.left, wr.top, chinese, punct, ai);
+                let dark = crate::config::snapshot().dark;
+                let cmd = crate::menu::popup(hwnd, wr.left, wr.top, chinese, punct, ai, dark);
                 MENU_OPEN.store(false, Ordering::SeqCst);
                 if cmd != 0 {
                     crate::log_line(&format!("bar: menu choice {cmd}"));
@@ -3928,9 +3882,9 @@ mod tests {
     }
 
     #[test]
-    fn 五格从左到右不重叠() {
+    fn 七格从左到右不重叠() {
         let rects = item_rects();
-        for i in 1..5 {
+        for i in 1..7 {
             assert!(
                 rects[i].left >= rects[i - 1].right,
                 "第 {i} 格左边要 >= 上一格右边"
@@ -3941,7 +3895,7 @@ mod tests {
     #[test]
     fn 窗口尺寸等于最后一格右边加内边距() {
         let (w, h) = window_size();
-        let last = item_rects()[4];
+        let last = item_rects()[6];
         let pad = scale(PAD);
         assert_eq!(w, last.right + pad);
         assert_eq!(h, last.bottom + pad);
@@ -3956,7 +3910,7 @@ mod tests {
             assert_eq!(hit_test(cx, cy), i as i32, "第 {i} 格左上角内侧");
         }
         assert_eq!(hit_test(-5, -5), -1, "负坐标不该命中");
-        let last = rects[4];
+        let last = rects[6];
         assert_eq!(
             hit_test(last.right + 5, last.top + 1),
             -1,

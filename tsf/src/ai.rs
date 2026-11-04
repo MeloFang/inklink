@@ -69,6 +69,15 @@ pub struct Job {
 static NEXT_SEQ: AtomicU32 = AtomicU32::new(0); // 0 = 还没播种
 static JOBS: Mutex<Vec<Job>> = Mutex::new(Vec::new());
 
+/// 已经回来、等用户点「确定」的结果。预览框关闭前不写文档。
+struct Pending {
+    action: u8,
+    source: String,
+    text: String,
+}
+
+static PENDING: Mutex<Option<Pending>> = Mutex::new(None);
+
 type StartFn = fn(usize, u8);
 type ApplyFn = fn(usize, u8, &str, &str);
 
@@ -224,15 +233,23 @@ pub fn on_done(seq: u32) {
     let (state, text) = ipc::ai_result(seq);
     match state {
         1 if !text.trim().is_empty() => {
-            // 提示"可以撤回"：后面那两秒内按一次退格就能还原（见 lib.rs 的 AiUndo）
-            crate::bar::set_status("完成 · 退格可撤回", 2_500);
             let out = clip_chars(&text, MAX_RESULT_CHARS);
             crate::log_line(&format!(
-                "ai: done seq={seq} action={} chars={}",
+                "ai: done seq={seq} action={} chars={} waiting-confirm",
                 action_name(job.action),
                 out.chars().count()
             ));
-            apply(job.action, &job.source, out);
+            // 先弹预览框，用户点「确定」才写文档（1.1.40 的要求）。
+            // 结果放在 PENDING 里，框子只负责显示和收点击。
+            if let Ok(mut g) = PENDING.lock() {
+                *g = Some(Pending {
+                    action: job.action,
+                    source: job.source.clone(),
+                    text: out.to_string(),
+                });
+            }
+            crate::bar::set_status("AI 完成，等待确认", 3_000);
+            crate::preview::show(out);
         }
         1 => {
             crate::bar::set_status("AI 没返回内容", 2_500);
@@ -246,6 +263,35 @@ pub fn on_done(seq: u32) {
             crate::bar::set_status("AI 没响应", 3_000);
             crate::log_line(&format!("ai: seq={seq} 未知状态 {other}"));
         }
+    }
+}
+
+/// 用户在预览框点了「确定」：把待确认的结果写回文档。
+pub fn confirm_pending() {
+    let pending = PENDING.lock().ok().and_then(|mut g| g.take());
+    let Some(p) = pending else {
+        return;
+    };
+    crate::log_line(&format!(
+        "ai: confirmed action={} chars={}",
+        action_name(p.action),
+        p.text.chars().count()
+    ));
+    crate::bar::set_status("已应用 · 退格可撤回", 2_500);
+    apply(p.action, &p.source, &p.text);
+}
+
+/// 用户按 Esc / 点外面：丢掉这次结果，文档一个字都不动。
+pub fn cancel_pending() {
+    if PENDING
+        .lock()
+        .map(|mut g| g.take())
+        .ok()
+        .flatten()
+        .is_some()
+    {
+        crate::log_line("ai: cancelled by user");
+        crate::bar::set_status("已取消", 1_500);
     }
 }
 
@@ -271,6 +317,8 @@ pub fn clear_service() {
 /// 菜单点了某个 AI 动作：让输入服务去读选区（读和发请求都在编辑会话里做）。
 pub fn from_menu(action: u8) {
     if !enabled() {
+        // 浮条上直接给一行反馈：静默忽略会像"点了没反应"
+        crate::bar::set_status("先在设置里启用 AI", 2_500);
         crate::log_line("ai: 设置里没启用 AI，忽略");
         return;
     }
