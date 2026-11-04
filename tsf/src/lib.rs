@@ -394,6 +394,7 @@ impl TextService {
             Some(acc) => {
                 acc.text.push_str(&word);
                 acc.picks += 1;
+                acc.code = merge_sentence_code(&acc.code, code_before);
             }
             None => {
                 *g = Some(SentenceAcc {
@@ -545,13 +546,32 @@ struct SentenceAcc {
     picks: usize,
 }
 
-/// 整句短于这个字数就不算"整句"（`今天天气` = 4）。
-const SENTENCE_MIN_CHARS: usize = 4;
+/// 整句短于这个字数就不算"整句"。
+///
+/// 原来是 4（`今天天气`），2026-11-04 降到 2：短名字（王佳、李雷）没法靠整句学，
+/// 而"分段选两个字"本身就是用户明确表达过的偏好（选王 → 选佳）。
+/// 单字仍然不学（`USER_MIN_CHARS = 2`），所以这条只影响"两个字以上的组合"。
+const SENTENCE_MIN_CHARS: usize = 2;
 
 /// 要不要把这一句当成整句上报：至少选过两次（选一次的那次本身已经记过了），
 /// 且至少 `SENTENCE_MIN_CHARS` 个字。
 fn should_report_sentence(picks: usize, chars: usize) -> bool {
     picks >= 2 && chars >= SENTENCE_MIN_CHARS
+}
+
+/// 整句的码怎么拼。
+///
+/// 分段上屏有两种节奏：
+/// - 一次打完 `pikeqiu`，选「皮」后剩下的码是 `keqiu` —— 它是 `pikeqiu` 的后缀，
+///   所以直接用第一个码，**不能**再拼一次（否则记成 `pikeqiukeqiu`）。
+/// - 先打 `wang` 选「王」，再打 `jia` 选「佳」—— `jia` 不是 `wang` 的后缀，
+///   这一句真实的码是 `wangjia`，要拼起来。
+fn merge_sentence_code(code: &str, next: &str) -> String {
+    if next.is_empty() || code.ends_with(next) {
+        code.to_string()
+    } else {
+        format!("{code}{next}")
+    }
 }
 
 /// 我们自己注入的退格还剩几个没被自己的 sink 吃掉。
@@ -3613,9 +3633,13 @@ mod tests {
         assert!(!should_report_sentence(1, 7), "只选一次不报整句");
         // 分段上屏：今天 + 天气
         assert!(should_report_sentence(2, 4), "选两次、四个字，就是整句");
-        // 选两次但太短（今天 = 2 字）不算整句
-        assert!(!should_report_sentence(2, 2), "两个字不算整句");
-        assert!(!should_report_sentence(3, 3), "三个字仍然太短");
+        // 2026-11-04 起两个字也算：名字类输入只能靠这个（王佳、李雷）
+        assert!(
+            should_report_sentence(2, 2),
+            "两个字、两次选择 = 用户明确要的组合"
+        );
+        assert!(should_report_sentence(3, 3));
+        assert!(!should_report_sentence(2, 1), "单字仍然不学");
         assert!(should_report_sentence(3, 5));
     }
 
@@ -4017,5 +4041,29 @@ mod ai_undo_tests {
         assert_eq!(revert_extent(2, 3), None, "锚点不够长，必须拒绝");
         assert_eq!(revert_extent(10, 0), None, "没插入东西，不能删");
         assert_eq!(revert_extent(0, 1), None);
+    }
+}
+
+#[cfg(test)]
+mod sentence_code_tests {
+    use super::*;
+
+    #[test]
+    fn 整句的码只在不是后缀时才拼接() {
+        // 一次打完、剩下的码是后缀：保持原码
+        assert_eq!(merge_sentence_code("pikeqiu", "keqiu"), "pikeqiu");
+        assert_eq!(merge_sentence_code("xiangmu", "mu"), "xiangmu");
+        // 先打 short、再打新的一段：拼起来
+        assert_eq!(merge_sentence_code("wang", "jia"), "wangjia");
+        assert_eq!(merge_sentence_code("zhang", "san"), "zhangsan");
+        // 空串不动
+        assert_eq!(merge_sentence_code("wang", ""), "wang");
+    }
+
+    #[test]
+    fn 两个字也能算整句() {
+        assert!(should_report_sentence(2, 2), "王佳：两个字、两次选择");
+        assert!(!should_report_sentence(1, 2), "只选一次不算");
+        assert!(!should_report_sentence(2, 1), "单字不学");
     }
 }

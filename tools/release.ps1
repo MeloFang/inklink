@@ -81,7 +81,15 @@ $charsDict = Join-Path $ENG 'rime\data\8105.dict.yaml'
 if (-not (Test-Path $charsDict)) {
     throw "引擎目录里没有 8105.dict.yaml —— 单音节（zi/wo/de）会查不到候选，先用 tools\fetch-librime.ps1 铺好 data"
 }
-Copy-Item "$ENG\rime\data" (Join-Path $files 'rime') -Recurse -Force
+# 目标路径必须**逐字是 rime\data**：直接 Copy-Item "$ENG\rime\data" "$files\rime"
+# 在 files\rime 不存在时会把 data 的内容拍平到 rime\ 下（1.1.37 的包就是这么坏的：
+# 装完 C:\inklink-engine\rime\data 是空的，打字一个候选都没有）。
+$rimeDst = Join-Path $files 'rime\data'
+New-Item -ItemType Directory -Force $rimeDst | Out-Null
+Copy-Item "$ENG\rime\data\*" $rimeDst -Recurse -Force
+$dataCount = (Get-ChildItem $rimeDst -Recurse -File | Measure-Object).Count
+if ($dataCount -lt 10) { throw "rime 数据没打成：$rimeDst 只有 $dataCount 个文件" }
+Write-Host "  rime 数据 $dataCount 个文件"
 $userDst = Join-Path $files 'rime\user'
 New-Item -ItemType Directory -Force $userDst | Out-Null
 # 不带 build：那是 librime 按本机词库编译出来的产物（22 MB）。实测全新编译只要 4.4 秒，

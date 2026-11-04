@@ -885,7 +885,20 @@ static size_t prune_single_chars(std::vector<std::string>& cands, size_t syllabl
     }
     if (multi < 3) return 0;
 
-    size_t before = cands.size();
+    // 先把"该挤走"的单字捞出来，再统一挪到末尾。
+    //
+    // 为什么还留几个（kFallback）：整串没有想要的词时（打 wangjia 想打「王佳」），
+    // 用户得能先选「王」、剩下的 `jia` 继续选「佳」——这就是分段上屏的入口。
+    // 全剔掉的话，多音节输入里一个单字都点不到。单字只来自第一个音节
+    // （librime 的补全），所以兜底也只解决第一个字；第二个字靠分段后的
+    // 单音节查询自然出现。
+    std::vector<std::string> singles;
+    for (const auto& w : cands) {
+        if (utf8_char_count(w) < 2 && !ascii_only(w) && keep.find(w) == keep.end()) {
+            singles.push_back(w);
+        }
+    }
+    if (singles.empty()) return 0;
     cands.erase(std::remove_if(cands.begin(), cands.end(),
                                [&](const std::string& w) {
                                    if (utf8_char_count(w) >= 2) return false;
@@ -893,7 +906,11 @@ static size_t prune_single_chars(std::vector<std::string>& cands, size_t syllabl
                                    return keep.find(w) == keep.end();
                                }),
                 cands.end());
-    return before - cands.size();
+    const size_t kFallback = 5;
+    for (size_t i = 0; i < singles.size() && i < kFallback; ++i) {
+        cands.push_back(singles[i]);
+    }
+    return singles.size();
 }
 
 
@@ -1591,8 +1608,15 @@ static int run_selftest() {
         std::vector<std::string> v = {"项目", "橡木", "香木", "向慕", "向暮",
                                       "想", "向", "相", "像", "象"};
         std::set<std::string> keep;
-        ck(prune_single_chars(v, 2, keep) == 5, "prune_single_chars: 两音节剔掉单字");
-        ck(v.size() == 5, "prune_single_chars: 只剩多字候选");
+        ck(prune_single_chars(v, 2, keep) == 5, "prune_single_chars: 两音节的单字被挤走");
+        ck(v.size() == 10, "prune_single_chars: 单字挪到末尾，不是删掉");
+        ck(v[0] == "项目" && v[5] == "想" && v[9] == "象",
+           "prune_single_chars: 多字在前、单字兜底在后（最多 5 个）");
+
+        std::vector<std::string> many = {"项目", "橡木", "香木", "向慕", "向暮",
+                                         "想", "向", "相", "像", "象", "降", "项"};
+        ck(prune_single_chars(many, 3, keep) == 7, "prune_single_chars: 单字多于 5 个时只留 5 个");
+        ck(many.size() == 5 + 5, "prune_single_chars: 5 个兜底");
 
         std::vector<std::string> one = {"你", "尼", "泥", "逆", "拟", "腻"};
         ck(prune_single_chars(one, 1, keep) == 0, "prune_single_chars: 单音节不剔");
@@ -1604,7 +1628,9 @@ static int run_selftest() {
         std::vector<std::string> kept = {"项目", "橡木", "香木", "向慕", "向暮",
                                          "想", "向"};
         std::set<std::string> liked = {"想"};
-        ck(prune_single_chars(kept, 2, liked) == 1, "prune_single_chars: 用户选过的单字保留");
+        ck(prune_single_chars(kept, 2, liked) == 1, "prune_single_chars: 用户选过的单字不挪");
+        ck(kept.size() == 7 && kept[5] == "想" && kept[6] == "向",
+           "prune_single_chars: 选过的留在原位，其余挪到末尾");
 
         std::vector<std::string> eng = {"项目", "橡木", "香木", "向慕", "向暮", "github"};
         ck(prune_single_chars(eng, 2, keep) == 0, "prune_single_chars: 英文原样不动");

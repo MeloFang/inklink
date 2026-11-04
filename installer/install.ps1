@@ -70,6 +70,19 @@ if (Test-Path "$SRC\inklink.ico") { Install-File "$SRC\inklink.ico" "$PF\inklink
 if (Test-Path "$SRC\inklink-badge.ico") { Install-File "$SRC\inklink-badge.ico" "$PF\inklink-badge.ico" | Out-Null }
 Install-File "$SRC\rime-server.exe" "$ENG\rime-server.exe" | Out-Null
 Install-File "$SRC\rime.dll"        "$ENG\rime.dll"        | Out-Null
+# 设置窗（P2a/P4b）：浮条 ☰ 的「设置…」按 DLL 同目录找它。漏装的话菜单点了没反应。
+if (Test-Path "$SRC\inklink-settings.exe") { Install-File "$SRC\inklink-settings.exe" "$PF\inklink-settings.exe" | Out-Null }
+
+# rime 数据必须落到 $ENG\rime\data（1.1.37 的包把内容拍平到了 rime\ 下，装完引擎没词库）。
+# 这里显式建目录再拷内容，两种包结构都能装。
+if (Test-Path "$SRC\rime\data") {
+    New-Item -ItemType Directory -Force "$ENG\rime\data" | Out-Null
+    Copy-Item "$SRC\rime\data\*" "$ENG\rime\data" -Recurse -Force
+}
+if (Test-Path "$SRC\rime\user") {
+    New-Item -ItemType Directory -Force "$ENG\rime\user" | Out-Null
+    Copy-Item "$SRC\rime\user\*" "$ENG\rime\user" -Recurse -Force
+}
 if (Test-Path "$SRC\rime\data") { Copy-Item "$SRC\rime\data" "$ENG\rime\" -Recurse -Force }
 if (Test-Path "$SRC\rime\user") { Copy-Item "$SRC\rime\user" "$ENG\rime\" -Recurse -Force }
 Write-Host "    64 位 DLL : $dll64"
@@ -165,6 +178,8 @@ $checks = @(
     @{ Name = '32 位 DLL';  Ok = (Test-Path $dll32) },
     @{ Name = '引擎 exe';   Ok = (Test-Path "$ENG\rime-server.exe") },
     @{ Name = 'rime.dll';   Ok = (Test-Path "$ENG\rime.dll") },
+    @{ Name = 'rime 数据'; Ok = (Test-Path "$ENG\rime\data\default.yaml") },
+    @{ Name = '设置窗';    Ok = (Test-Path "$PF\inklink-settings.exe") },
     @{ Name = 'COM 64 位';  Ok = ((Get-ItemProperty $com64 -ErrorAction SilentlyContinue).'(default)' -eq $dll64) },
     @{ Name = 'COM 32 位';  Ok = ((Get-ItemProperty $com32 -ErrorAction SilentlyContinue).'(default)' -eq $dll32) },
     @{ Name = 'TIP 注册';   Ok = (Test-Path "HKLM:\SOFTWARE\Microsoft\CTF\TIP\$CLSID\LanguageProfile\0x00000804\$PROFILE") },

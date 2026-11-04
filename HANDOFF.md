@@ -641,6 +641,21 @@ powershell -ExecutionPolicy Bypass -File tools\probe-ai.ps1 -Action 0 -Text hell
 - 不靠应用 Ctrl+Z：TSF 的 `SetText` 进不进宿主撤销栈各家不同。
 - 单测 139 项（新增撤回区间的边界）。
 
+### 1.1.39：单字兜底 + 两字整句学习
+
+- 引擎：`prune_single_chars` 把单字挪到候选末尾（最多 5 个），不再直接删。验收：
+  `wangjia` 末尾是 `王/望/往/忘/网`，选「王」后剩 `jia` 继续选「佳」。
+- DLL：`SENTENCE_MIN_CHARS` 4 → 2；新增 `merge_sentence_code`（`keqiu` 是 `pikeqiu` 的后缀
+  就不拼，`jia` 不是 `wang` 的后缀就拼成 `wangjia`）。
+- 单测 141、引擎 `--selftest` 43 项。
+
+### 打包踩到的两个真 bug（1.1.37 的包受影响）
+
+1. `release.ps1` 把 `$ENGime\data` 拷到 `$filesime` 时，目标目录不存在会把 **data 的内容
+   拍平**到 `rime\` 下；安装脚本按 `rime\data` 找，静默跳过 → 装完**没有词库，一个候选都没有**。
+2. `install.ps1` 从来没拷 `inklink-settings.exe`（浮条菜单的「设置…」点了没反应）。
+   两处都已修，并补了自检项（rime 数据 / 设置窗）。
+
 ### 还没做的（留给 P6 / M3）
 
 - 结果写进文档后**不能撤回**（它不属于组合串，`UndoMs` 那套管不到）。
