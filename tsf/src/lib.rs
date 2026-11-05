@@ -24,6 +24,7 @@ use windows::Win32::UI::TextServices::{
 };
 use windows::core::BOOL;
 mod ai;
+mod ai_panel;
 mod bar;
 mod candwin;
 mod config;
@@ -31,7 +32,6 @@ mod display;
 mod ipc;
 mod menu;
 mod pinyin;
-mod preview;
 mod state;
 use windows::core::IUnknownImpl;
 use windows::core::{GUID, HRESULT, Interface, Ref, implement};
@@ -1428,10 +1428,19 @@ impl ITfEditSession_Impl for TextService_Impl {
                 Ok(())
             }
             EditAction::ReadSelection(action) => {
-                // 读选区必须在编辑会话里做（要 ec）。读完顺手把请求发出去：
-                // `ai::start` 只写管道、不等模型，几毫秒就回来。
+                // 读选区必须在编辑会话里做（要 ec）。
+                // `ACTION_READ` = 面板打开时只读一次，把文字交给面板显示，不发请求。
                 let text = selection_text(&ctx, ec);
                 let chars = text.chars().count();
+                if action == ai::ACTION_READ {
+                    if chars > ai::MAX_INPUT_CHARS {
+                        ai::on_selection("");
+                        log_line(&format!("ai: 选区太长（{chars} 字），面板不处理"));
+                    } else {
+                        ai::on_selection(&text);
+                    }
+                    return Ok(());
+                }
                 if chars == 0 || text.trim().is_empty() {
                     log_line("ai: 没有选中文字");
                     return Ok(());

@@ -189,13 +189,14 @@ fn scale(v: i32) -> i32 {
     (v * dpi + 48) / 96
 }
 
-/// 七个可点的地方：品牌标、中文/英文、中文标点、**翻译 / 改写 / 续写**、菜单。
+/// 五个可点的地方：品牌标、中文/英文、中文标点、**AI**、菜单。
 ///
-/// 亮/暗切换从浮条挪进了 ☰ 菜单（1.1.40）：三个 AI 动作更常用，直接摆出来少一次点击。
+/// 1.1.42：三个 AI 格并成一个「AI」按钮，点开是浮动面板（翻译/改写/续写在面板里）；
+/// 亮/暗切换在 ☰ 菜单里。
 ///
 /// 品牌标和第一格状态之间多留一道竖线（`SEP_W` 宽，两边各 `SEP_GAP`），
 /// 和搜狗浮条一样给"品牌 | 状态"一个视觉分隔。竖线本身不是可点区域。
-fn item_rects() -> [RECT; 7] {
+fn item_rects() -> [RECT; 5] {
     let pad = scale(PAD);
     let gap = scale(GAP);
     let h = scale(ITEM_H);
@@ -205,8 +206,6 @@ fn item_rects() -> [RECT; 7] {
         scale(W_MODE),
         scale(W_PUNCT),
         scale(W_AI),
-        scale(W_AI),
-        scale(W_AI),
         scale(W_MENU),
     ];
     let mut rects = [RECT {
@@ -214,7 +213,7 @@ fn item_rects() -> [RECT; 7] {
         top: 0,
         right: 0,
         bottom: 0,
-    }; 7];
+    }; 5];
     let mut x = pad;
     for (i, w) in widths.iter().enumerate() {
         rects[i] = RECT {
@@ -232,7 +231,7 @@ fn item_rects() -> [RECT; 7] {
 }
 
 fn window_size() -> (i32, i32) {
-    let last = item_rects()[6];
+    let last = item_rects()[4];
     let pad = scale(PAD);
     (last.right + pad, last.bottom + pad)
 }
@@ -1558,14 +1557,11 @@ unsafe fn paint_bar(c: &mut Canvas, hover: i32, dark: bool) {
     let punct_fg = if punct { pal.accent } else { pal.dim };
     draw_glyphs_aa(hdc, &cell, &punct_glyphs(&cell, punct, dpi_k()), punct_fg);
 
-    // 第四~六格：翻译 / 改写 / 续写。两字一格，AI 没启用也照常画（点了会提示去设置）。
-    let labels = ["翻译", "改写", "续写"];
-    for (i, label) in labels.iter().enumerate() {
-        draw_text_centered(hdc, &rects[3 + i], label, pal.text, font);
-    }
+    // 第四格：AI（点开是浮动面板，三个动作在面板里）。
+    draw_text_centered(hdc, &rects[3], "AI", pal.accent, font);
 
-    // 第七格：菜单。
-    draw_menu_glyph(hdc, &rects[6], pal.text);
+    // 第五格：菜单。
+    draw_menu_glyph(hdc, &rects[4], pal.text);
 
     // 状态字盖住整条（AI 处理中 / 失败）。放在 apply_frame 之前：
     // 圆角外的那几个像素必须保持透明，否则窗口会露出方形底。
@@ -1702,11 +1698,6 @@ struct DragState {
 static DRAG: Mutex<Option<DragState>> = Mutex::new(None);
 
 fn handle_menu(hwnd: HWND, cmd: u32) {
-    if let Some(action) = crate::ai::action_for_cmd(cmd) {
-        // 读选区、发请求都在输入服务的编辑会话里做（见 lib.rs 的 start_ai）
-        crate::ai::from_menu(action);
-        return;
-    }
     match cmd {
         crate::menu::CMD_TOGGLE_MODE => toggle_mode(hwnd),
         crate::menu::CMD_TOGGLE_PUNCT => toggle_punct(hwnd),
@@ -1721,7 +1712,7 @@ fn handle_menu(hwnd: HWND, cmd: u32) {
 /// 用 `CreateProcessW` 而不是 `ShellExecuteW`：后者会走 shell 关联、可能弹 UAC，
 /// 而且我们要的是"同一个目录下的兄弟程序"，路径自己算得出来。
 /// 失败不弹窗（在宿主进程里弹窗会打断用户打字），只写日志。
-fn open_settings() {
+pub(crate) fn open_settings() {
     let dll = crate::registry::dll_path();
     let dir = match std::path::Path::new(&dll).parent() {
         Some(d) => d.to_path_buf(),
@@ -1845,14 +1836,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             } else {
                 match pressed {
                     // 品牌标 / 最右格：等同点 ☰（投递到队列，不在这里直接弹）
-                    0 | 6 => {
+                    0 | 4 => {
                         PostMessageW(hwnd, WM_OPEN_MENU, 0, 0);
                     }
                     1 => toggle_mode(hwnd),
                     2 => toggle_punct(hwnd),
-                    3 => crate::ai::from_menu(crate::ai::ACTION_TRANSLATE),
-                    4 => crate::ai::from_menu(crate::ai::ACTION_REWRITE),
-                    5 => crate::ai::from_menu(crate::ai::ACTION_CONTINUE),
+                    3 => crate::ai::open_panel(),
                     _ => {}
                 }
             }
@@ -1865,9 +1854,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 GetWindowRect(hwnd, &mut wr);
                 let (chinese, punct) = crate::state::snapshot();
                 // AI 有没有启用现读注册表：菜单每次弹出都可能是刚在设置里勾上的
-                let ai = crate::ai::enabled();
                 let dark = crate::config::snapshot().dark;
-                let cmd = crate::menu::popup(hwnd, wr.left, wr.top, chinese, punct, ai, dark);
+                let cmd = crate::menu::popup(hwnd, wr.left, wr.top, chinese, punct, dark);
                 MENU_OPEN.store(false, Ordering::SeqCst);
                 if cmd != 0 {
                     crate::log_line(&format!("bar: menu choice {cmd}"));
@@ -3882,9 +3870,9 @@ mod tests {
     }
 
     #[test]
-    fn 七格从左到右不重叠() {
+    fn 五格从左到右不重叠() {
         let rects = item_rects();
-        for i in 1..7 {
+        for i in 1..5 {
             assert!(
                 rects[i].left >= rects[i - 1].right,
                 "第 {i} 格左边要 >= 上一格右边"
@@ -3895,7 +3883,7 @@ mod tests {
     #[test]
     fn 窗口尺寸等于最后一格右边加内边距() {
         let (w, h) = window_size();
-        let last = item_rects()[6];
+        let last = item_rects()[4];
         let pad = scale(PAD);
         assert_eq!(w, last.right + pad);
         assert_eq!(h, last.bottom + pad);
@@ -3910,7 +3898,7 @@ mod tests {
             assert_eq!(hit_test(cx, cy), i as i32, "第 {i} 格左上角内侧");
         }
         assert_eq!(hit_test(-5, -5), -1, "负坐标不该命中");
-        let last = rects[6];
+        let last = rects[4];
         assert_eq!(
             hit_test(last.right + 5, last.top + 1),
             -1,

@@ -43,6 +43,8 @@ pub const WM_AI_DONE: u32 = WM_APP + 30;
 pub const ACTION_TRANSLATE: u8 = 0;
 pub const ACTION_REWRITE: u8 = 1;
 pub const ACTION_CONTINUE: u8 = 2;
+/// 只读选区、不发请求（面板打开时用）。
+pub const ACTION_READ: u8 = 0xFE;
 
 /// 送给模型的最长字数。选中一整章再点翻译，提示词会大到没意义、还慢；
 /// 2000 字足够一段/一屏，也远小于协议里的 `u16` 长度上限。
@@ -61,22 +63,11 @@ pub const VALUE_AI_MODEL: &str = "AI_Model";
 pub struct Job {
     pub seq: u32,
     pub action: u8,
-    /// 发起时的选中文字，写回前拿它核对选区有没有被用户改掉。
-    pub source: String,
     started: Instant,
 }
 
 static NEXT_SEQ: AtomicU32 = AtomicU32::new(0); // 0 = 还没播种
 static JOBS: Mutex<Vec<Job>> = Mutex::new(Vec::new());
-
-/// 已经回来、等用户点「确定」的结果。预览框关闭前不写文档。
-struct Pending {
-    action: u8,
-    source: String,
-    text: String,
-}
-
-static PENDING: Mutex<Option<Pending>> = Mutex::new(None);
 
 type StartFn = fn(usize, u8);
 type ApplyFn = fn(usize, u8, &str, &str);
@@ -87,16 +78,6 @@ thread_local! {
     static SERVICE: Cell<(Option<StartFn>, usize)> = const { Cell::new((None, 0)) };
     /// 本线程的写回函数：同上。
     static APPLY: Cell<(Option<ApplyFn>, usize)> = const { Cell::new((None, 0)) };
-}
-
-/// 菜单命令 ID → 动作。`None` = 这条命令不是 AI 的。
-pub fn action_for_cmd(cmd: u32) -> Option<u8> {
-    match cmd {
-        crate::menu::CMD_AI_TRANSLATE => Some(ACTION_TRANSLATE),
-        crate::menu::CMD_AI_REWRITE => Some(ACTION_REWRITE),
-        crate::menu::CMD_AI_CONTINUE => Some(ACTION_CONTINUE),
-        _ => None,
-    }
 }
 
 /// 这个动作是"替换选中文字"还是"接在后面"。
@@ -178,11 +159,10 @@ fn prune(now: Instant) {
     }
 }
 
-fn remember_at(seq: u32, action: u8, source: &str, started: Instant) {
+fn remember_at(seq: u32, action: u8, started: Instant) {
     let job = Job {
         seq,
         action,
-        source: source.to_string(),
         started,
     };
     prune(started);
@@ -208,7 +188,7 @@ pub fn start(action: u8, text: &str) -> Option<u32> {
         return None;
     }
     let seq = next_seq();
-    remember_at(seq, action, text, Instant::now());
+    remember_at(seq, action, Instant::now());
     crate::log_line(&format!(
         "ai: start seq={seq} action={} chars={}",
         action_name(action),
@@ -221,10 +201,7 @@ pub fn start(action: u8, text: &str) -> Option<u32> {
     Some(seq)
 }
 
-/// 引擎通知"这个序号好了"：取结果、交给输入服务写回。
-///
-/// 跑在浮条的窗口过程里（宿主 UI 线程、10ms 级）。取结果是一次管道往返，
-/// 有超时；拿不到就只写日志。
+/// 引擎通知"这个序号好了"：取结果放进面板。
 pub fn on_done(seq: u32) {
     let Some(job) = take_at(seq) else {
         crate::log_line(&format!("ai: 收到未知序号的完成通知 seq={seq}"));
@@ -235,66 +212,105 @@ pub fn on_done(seq: u32) {
         1 if !text.trim().is_empty() => {
             let out = clip_chars(&text, MAX_RESULT_CHARS);
             crate::log_line(&format!(
-                "ai: done seq={seq} action={} chars={} waiting-confirm",
+                "ai: done seq={seq} action={} chars={}",
                 action_name(job.action),
                 out.chars().count()
             ));
-            // 先弹预览框，用户点「确定」才写文档（1.1.40 的要求）。
-            // 结果放在 PENDING 里，框子只负责显示和收点击。
-            if let Ok(mut g) = PENDING.lock() {
-                *g = Some(Pending {
-                    action: job.action,
-                    source: job.source.clone(),
-                    text: out.to_string(),
-                });
-            }
+            crate::ai_panel::set_result(out);
             crate::bar::set_status("AI 完成，等待确认", 3_000);
-            crate::preview::show(out);
         }
         1 => {
+            crate::ai_panel::set_error("模型没有返回内容");
             crate::bar::set_status("AI 没返回内容", 2_500);
             crate::log_line(&format!("ai: seq={seq} 返回空文本，丢掉"));
         }
         2 => {
-            crate::bar::set_status("AI 失败（详见日志）", 3_000);
+            crate::ai_panel::set_error(&text);
+            crate::bar::set_status("AI 失败（看面板）", 3_000);
             crate::log_line(&format!("ai: seq={seq} 失败：{text}"));
         }
         other => {
+            crate::ai_panel::set_error("引擎没有响应（服务是不是没起？）");
             crate::bar::set_status("AI 没响应", 3_000);
             crate::log_line(&format!("ai: seq={seq} 未知状态 {other}"));
         }
     }
 }
 
-/// 用户在预览框点了「确定」：把待确认的结果写回文档。
-pub fn confirm_pending() {
-    let pending = PENDING.lock().ok().and_then(|mut g| g.take());
-    let Some(p) = pending else {
+/// 读选区（面板打开时）：由 `lib.rs` 的编辑会话回调回来。
+pub fn on_selection(text: &str) {
+    if text.trim().is_empty() {
+        crate::ai_panel::set_no_selection();
+    } else {
+        crate::ai_panel::set_source(text);
+    }
+}
+
+/// 浮条上的「AI」按钮：打开面板，先读当前选区。
+pub fn open_panel() {
+    if !enabled() {
+        // 明确告诉用户"没启用"，而不是点了没反应（用户反馈原话）
+        crate::ai_panel::show_disabled();
+        return;
+    }
+    crate::ai_panel::show_loading();
+    SERVICE.with(|cell| match cell.get() {
+        (Some(f), ctx) if ctx != 0 => f(ctx, ACTION_READ),
+        _ => {
+            crate::ai_panel::set_error("输入上下文不可用：先点一下文档再点 AI");
+            crate::log_line("ai: 没有活动的输入服务（open_panel）");
+        }
+    });
+}
+
+/// 面板里点了翻译/改写/续写。
+pub fn send(action: u8) {
+    let Some(source) = crate::ai_panel::current_source() else {
+        return;
+    };
+    if source.trim().is_empty() {
+        crate::ai_panel::set_no_selection();
+        return;
+    }
+    crate::ai_panel::set_busy(action);
+    if start(action, &source).is_none() {
+        crate::ai_panel::set_error("请求没发出去（引擎没起？）");
+    }
+}
+
+/// 面板「确定」：把结果写回文档。
+pub fn confirm() {
+    let Some((action, source, text)) = crate::ai_panel::result_for_apply() else {
         return;
     };
     crate::log_line(&format!(
         "ai: confirmed action={} chars={}",
-        action_name(p.action),
-        p.text.chars().count()
+        action_name(action),
+        text.chars().count()
     ));
+    apply(action, &source, &text);
+    crate::ai_panel::hide();
     crate::bar::set_status("已应用 · 退格可撤回", 2_500);
-    apply(p.action, &p.source, &p.text);
 }
 
-/// 用户按 Esc / 点外面：丢掉这次结果，文档一个字都不动。
-pub fn cancel_pending() {
-    if PENDING
-        .lock()
-        .map(|mut g| g.take())
-        .ok()
-        .flatten()
-        .is_some()
-    {
-        crate::log_line("ai: cancelled by user");
-        crate::bar::set_status("已取消", 1_500);
+/// 面板「取消」/ Esc / 点外面。
+pub fn cancel_panel() {
+    crate::ai_panel::hide();
+}
+
+/// 面板「重新生成」：用同一个动作、同一段原文再发一次。
+pub fn regenerate() {
+    if let Some(action) = crate::ai_panel::last_action() {
+        send(action);
     }
 }
 
+/// 面板里的「打开设置」。
+pub fn open_settings() {
+    crate::bar::open_settings();
+}
+
+/// 把结果交给输入服务写回（编辑会话里做）。
 fn apply(action: u8, expect: &str, text: &str) {
     APPLY.with(|cell| match cell.get() {
         (Some(f), ctx) if ctx != 0 => f(ctx, action, expect, text),
@@ -314,33 +330,9 @@ pub fn clear_service() {
     APPLY.with(|c| c.set((None, 0)));
 }
 
-/// 菜单点了某个 AI 动作：让输入服务去读选区（读和发请求都在编辑会话里做）。
-pub fn from_menu(action: u8) {
-    if !enabled() {
-        // 浮条上直接给一行反馈：静默忽略会像"点了没反应"
-        crate::bar::set_status("先在设置里启用 AI", 2_500);
-        crate::log_line("ai: 设置里没启用 AI，忽略");
-        return;
-    }
-    SERVICE.with(|cell| match cell.get() {
-        (Some(f), ctx) if ctx != 0 => f(ctx, action),
-        _ => crate::log_line("ai: 本线程没有活动的输入服务，忽略"),
-    });
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn 菜单命令和动作一一对应() {
-        use crate::menu::{CMD_AI_CONTINUE, CMD_AI_REWRITE, CMD_AI_TRANSLATE};
-        assert_eq!(action_for_cmd(CMD_AI_TRANSLATE), Some(ACTION_TRANSLATE));
-        assert_eq!(action_for_cmd(CMD_AI_REWRITE), Some(ACTION_REWRITE));
-        assert_eq!(action_for_cmd(CMD_AI_CONTINUE), Some(ACTION_CONTINUE));
-        assert_eq!(action_for_cmd(0), None, "0 不是 AI 命令");
-        assert_eq!(action_for_cmd(crate::menu::CMD_SETTINGS), None);
-    }
 
     #[test]
     fn 只有续写不替换选区() {
@@ -382,10 +374,9 @@ mod tests {
     #[test]
     fn 记账取走一次就没了() {
         let now = Instant::now();
-        remember_at(4242, ACTION_TRANSLATE, "hello", now);
+        remember_at(4242, ACTION_TRANSLATE, now);
         let job = take_at(4242).expect("应该记得");
         assert_eq!(job.action, ACTION_TRANSLATE);
-        assert_eq!(job.source, "hello");
         assert!(take_at(4242).is_none(), "取走就该清掉");
     }
 
@@ -393,16 +384,16 @@ mod tests {
     fn 老任务会被清掉() {
         let now = Instant::now();
         let old = now - JOB_TTL - Duration::from_secs(1);
-        remember_at(1, ACTION_REWRITE, "旧", old);
-        remember_at(2, ACTION_REWRITE, "新", now);
+        remember_at(1, ACTION_REWRITE, old);
+        remember_at(2, ACTION_REWRITE, now);
         prune(now);
         assert!(take_at(1).is_none(), "过期的任务不该留着");
         assert!(take_at(2).is_some(), "新任务要留着");
     }
 
     #[test]
-    fn 没有输入服务时点菜单不崩() {
+    fn 没有输入服务时开面板不崩() {
         clear_service();
-        from_menu(ACTION_TRANSLATE); // 没有服务 → 只写日志
+        open_panel(); // 没有服务 → 面板显示错误态，不 panic
     }
 }

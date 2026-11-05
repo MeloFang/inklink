@@ -48,12 +48,6 @@ pub const CMD_TOGGLE_PUNCT: u32 = 2;
 pub const CMD_TOGGLE_THEME: u32 = 3;
 pub const CMD_SETTINGS: u32 = 4;
 pub const CMD_ABOUT: u32 = 5;
-/// P4b 的三项 AI 命令。编号和 `ai::ACTION_*` 分开：命令是"菜单项身份"，
-/// 动作是"协议里的一个字节"，中间由 `ai::action_for_cmd` 翻译。
-pub const CMD_AI_TRANSLATE: u32 = 10;
-pub const CMD_AI_REWRITE: u32 = 11;
-pub const CMD_AI_CONTINUE: u32 = 12;
-
 const CLASS_NAME: &str = "inklink-menu";
 
 /// 菜单弹出循环把它选中的命令放在这里。
@@ -124,22 +118,13 @@ fn scale(v: i32) -> i32 {
     (v * dpi + 48) / 96
 }
 
-fn build_items(chinese: bool, punct: bool, ai: bool, dark: bool) -> Vec<Item> {
+fn build_items(chinese: bool, punct: bool, dark: bool) -> Vec<Item> {
     let sep = || Item {
         id: 0,
         label: String::new(),
         checked: false,
         enabled: false,
         separator: true,
-    };
-    // AI 那三项只在"设置里启用 AI"之后才点得动（铁律第三条：默认不联网）。
-    // 没启用时灰着，并补一行说明——否则用户只会觉得"点了没反应"。
-    let ai_item = |id: u32, label: &str| Item {
-        id,
-        label: label.to_string(),
-        checked: false,
-        enabled: ai,
-        separator: false,
     };
     let mut items = vec![
         Item {
@@ -169,23 +154,9 @@ fn build_items(chinese: bool, punct: bool, ai: bool, dark: bool) -> Vec<Item> {
             separator: false,
         },
         sep(),
-        ai_item(CMD_AI_TRANSLATE, "翻译选中文字"),
-        ai_item(CMD_AI_REWRITE, "改写选中文字"),
-        ai_item(CMD_AI_CONTINUE, "续写选中文字"),
     ];
-    if !ai {
-        items.push(Item {
-            id: 0,
-            label: "（先到设置里启用 AI）".to_string(),
-            checked: false,
-            enabled: false,
-            separator: false,
-        });
-    }
-    items.push(sep());
     items.push(Item {
         id: CMD_SETTINGS,
-        // 1.1.30 起真的有设置窗了（inklink-settings.exe，装在同一个目录）。
         label: "设置…".to_string(),
         checked: false,
         enabled: true,
@@ -467,9 +438,9 @@ fn ensure_class() {
 }
 
 /// 弹出菜单并阻塞到用户选完。返回命令 ID（0 = 点外面/按 Esc）。
-pub fn popup(owner: HWND, x: i32, y: i32, chinese: bool, punct: bool, ai: bool, dark: bool) -> u32 {
+pub fn popup(owner: HWND, x: i32, y: i32, chinese: bool, punct: bool, dark: bool) -> u32 {
     ensure_class();
-    let list = build_items(chinese, punct, ai, dark);
+    let list = build_items(chinese, punct, dark);
     if let Ok(mut slot) = ITEMS.lock() {
         *slot = list.clone();
     }
@@ -618,7 +589,7 @@ mod tests {
     use super::*;
 
     fn items() -> Vec<Item> {
-        build_items(true, true, true, false)
+        build_items(true, true, false)
     }
 
     #[test]
@@ -682,14 +653,14 @@ mod tests {
 
     #[test]
     fn mode_label_follows_state() {
-        let cn = build_items(true, true, true, false);
-        let en = build_items(false, true, true, false);
+        let cn = build_items(true, true, false);
+        let en = build_items(false, true, false);
         assert_eq!(cn[0].label, "切换为英文");
         assert_eq!(en[0].label, "切换为中文");
         assert!(cn[0].checked, "中文模式下第一项要打勾");
         assert!(!en[0].checked, "英文模式下第一项不打勾");
         assert!(cn[1].checked);
-        let off = build_items(true, false, true, false);
+        let off = build_items(true, false, false);
         assert!(!off[1].checked);
     }
 
@@ -708,54 +679,5 @@ mod tests {
             list.iter().all(|it| it.id != 6),
             "进程内菜单没有「退出浮条」项"
         );
-    }
-
-    #[test]
-    fn 三个_ai_菜单项按启用状态变灰() {
-        let on = build_items(true, true, true, false);
-        for id in [CMD_AI_TRANSLATE, CMD_AI_REWRITE, CMD_AI_CONTINUE] {
-            let it = on.iter().find(|it| it.id == id).expect("AI 项要在菜单里");
-            assert!(it.enabled, "启用 AI 时该项可点");
-            assert!(!it.checked, "AI 项不打勾");
-            assert!(!it.separator);
-        }
-        // 顺序：翻译 → 改写 → 续写（动作编号也是 0/1/2）
-        let order: Vec<u32> = on
-            .iter()
-            .filter(|it| crate::ai::action_for_cmd(it.id).is_some())
-            .map(|it| it.id)
-            .collect();
-        assert_eq!(
-            order,
-            vec![CMD_AI_TRANSLATE, CMD_AI_REWRITE, CMD_AI_CONTINUE]
-        );
-
-        let off = build_items(true, true, false, false);
-        for id in [CMD_AI_TRANSLATE, CMD_AI_REWRITE, CMD_AI_CONTINUE] {
-            let it = off.iter().find(|it| it.id == id).expect("AI 项要在菜单里");
-            assert!(!it.enabled, "没启用 AI 时该项要灰掉");
-        }
-        assert!(
-            off.len() == on.len() + 1,
-            "没启用时要多一行「先到设置里启用 AI」的说明"
-        );
-        assert!(off.iter().any(|it| it.label.contains("启用 AI")));
-    }
-
-    #[test]
-    fn ai_说明行也是灰的且点不中() {
-        let off = build_items(true, true, false, false);
-        let hint = off
-            .iter()
-            .position(|it| it.label.contains("启用 AI"))
-            .unwrap();
-        assert!(!off[hint].enabled);
-        assert!(!off[hint].separator, "说明行是普通灰行，不是分隔线");
-        // 它能被 row_at 命中（只是点击不派发命令），菜单高度里也要占一格
-        let mut top = scale(PAD_Y);
-        for it in off.iter().take(hint) {
-            top += row_height(it);
-        }
-        assert_eq!(row_at(&off, top + 1), Some(hint));
     }
 }
