@@ -664,6 +664,12 @@ powershell -ExecutionPolicy Bypass -File tools\probe-ai.ps1 -Action 0 -Text hell
 - 引擎提示词：改写 = 错别字/用词/逻辑；续写 = 前文不动、只输出新增。
 - 单测 145、引擎 selftest 45。
 
+### 1.1.41：英文原样候选（修 bug）
+
+librime 对纯字母会返回满 50 个中文，而"追加原始英文"那段被 `out.size() < MAX_CANDS`
+挡住，导致 `github`/`hello` 连原样候选都没有。改成满了先 `pop_back()` 腾位。
+实测 `github`/`gith`/`hello` 第一候选就是原文。**英文联想仍没有**（见下）。
+
 ### 还没做的（留给 P6 / M3）
 
 - 结果写进文档后**不能撤回**（它不属于组合串，`UndoMs` 那套管不到）。

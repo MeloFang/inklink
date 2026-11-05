@@ -999,9 +999,13 @@ static std::vector<std::string> query(const std::string& code, const std::string
         for (char c : flat) {
             if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'))) { is_pure_alpha = false; break; }
         }
-        if (is_pure_alpha && out.size() < (size_t)MAX_CANDS) {
+        if (is_pure_alpha) {
             auto it = std::find(out.begin(), out.end(), flat);
             if (it == out.end()) {
+                // 候选满 50 个时先挤掉最后一个：librime 对 github/hello 这种纯英文
+                // 会吐满一页中文（给/过/国…），原来的 `out.size() < MAX_CANDS` 守卫
+                // 让原始英文**永远挤不进去**，用户连"原样上屏"都点不到。
+                if (out.size() >= (size_t)MAX_CANDS) out.pop_back();
                 // 不像拼音时英文原样要留在第一屏：没有纠错结果（github/vscode）排最前；
                 // 有纠错结果说明可能是打错的拼音（niihao → 你好），让纠错占第一，
                 // 原样紧跟其后（`update` 这种"恰好差一个字母就是合法拼音"的英文词
