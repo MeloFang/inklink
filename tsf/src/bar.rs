@@ -1143,17 +1143,17 @@ fn inset(r: &RECT, d: i32) -> RECT {
 // 带 alpha 交给系统合成 —— 角上的过渡像素是半透明的，叠在什么桌面上都是平滑的。
 
 /// 一张自上而下的 32 位 DIB，选进内存 DC。`Drop` 时归还 GDI 对象（不 panic）。
-struct Canvas {
-    dc: HDC,
+pub(crate) struct Canvas {
+    pub(crate) dc: HDC,
     dib: HBITMAP,
     old: HGDIOBJ,
     bits: *mut u32,
-    w: i32,
-    h: i32,
+    pub(crate) w: i32,
+    pub(crate) h: i32,
 }
 
 impl Canvas {
-    unsafe fn new(w: i32, h: i32) -> Option<Canvas> {
+    pub(crate) unsafe fn new(w: i32, h: i32) -> Option<Canvas> {
         if w <= 0 || h <= 0 || w > 4096 || h > 4096 {
             return None;
         }
@@ -1191,7 +1191,7 @@ impl Canvas {
     }
 
     /// 直接改像素（`0xAARRGGBB`）。先 `GdiFlush`：GDI 的绘制可能还攒在批里没落到位图上。
-    unsafe fn pixels(&mut self) -> &mut [u32] {
+    pub(crate) unsafe fn pixels(&mut self) -> &mut [u32] {
         GdiFlush();
         std::slice::from_raw_parts_mut(self.bits, (self.w * self.h) as usize)
     }
@@ -1209,7 +1209,7 @@ impl Drop for Canvas {
 
 /// 圆角矩形的有向距离（像素）：< 0 在里面。`(x0,y0)-(x1,y1)` 是外框，`r` 是圆角半径。
 /// 纯函数，可单测。
-fn round_rect_sdf(px: f32, py: f32, x0: f32, y0: f32, x1: f32, y1: f32, r: f32) -> f32 {
+pub(crate) fn round_rect_sdf(px: f32, py: f32, x0: f32, y0: f32, x1: f32, y1: f32, r: f32) -> f32 {
     let (cx, cy) = ((x0 + x1) / 2.0, (y0 + y1) / 2.0);
     let (hx, hy) = ((x1 - x0) / 2.0, (y1 - y0) / 2.0);
     let r = r.min(hx).min(hy).max(0.0);
@@ -1220,7 +1220,7 @@ fn round_rect_sdf(px: f32, py: f32, x0: f32, y0: f32, x1: f32, y1: f32, r: f32) 
 }
 
 /// 距离 → 覆盖率：一个像素宽的线性过渡。
-fn coverage(d: f32) -> f32 {
+pub(crate) fn coverage(d: f32) -> f32 {
     (0.5 - d).clamp(0.0, 1.0)
 }
 

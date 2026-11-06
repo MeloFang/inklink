@@ -189,12 +189,26 @@ unsafe fn create_ui_key() -> Option<HKEY> {
 
 /// 浮条上次的屏幕坐标；没存过、或飞出合理范围（换屏/分辨率变小）就当没存过。
 pub fn read_pos() -> Option<(i32, i32)> {
+    read_pair("PosX", "PosY")
+}
+
+/// AI 面板上次被拖到的位置（面板本体左上角，屏幕坐标）。
+pub fn read_panel_pos() -> Option<(i32, i32)> {
+    read_pair("AiPanelX", "AiPanelY")
+}
+
+/// 记下 AI 面板位置（拖动结束时）。
+pub fn write_panel_pos(x: i32, y: i32) {
+    write_pair("AiPanelX", "AiPanelY", x, y);
+}
+
+fn read_pair(xname: &str, yname: &str) -> Option<(i32, i32)> {
     unsafe {
         let Some(key) = open_ui_key(KEY_READ) else {
             return None;
         };
-        let x = query_dword(key, "PosX").map(|v| v as i32);
-        let y = query_dword(key, "PosY").map(|v| v as i32);
+        let x = query_dword(key, xname).map(|v| v as i32);
+        let y = query_dword(key, yname).map(|v| v as i32);
         RegCloseKey(key);
         match (x, y) {
             (Some(x), Some(y)) if x > -10000 && x < 10000 && y > -10000 && y < 10000 => {
@@ -207,11 +221,15 @@ pub fn read_pos() -> Option<(i32, i32)> {
 
 /// 记下浮条位置（拖动结束时）。
 pub fn write_pos(x: i32, y: i32) {
+    write_pair("PosX", "PosY", x, y);
+}
+
+fn write_pair(xname: &str, yname: &str, x: i32, y: i32) {
     unsafe {
         let Some(key) = create_ui_key() else {
             return;
         };
-        for (name, v) in [("PosX", x as u32), ("PosY", y as u32)] {
+        for (name, v) in [(xname, x as u32), (yname, y as u32)] {
             let name_w = wide(name);
             let data: u32 = v;
             RegSetValueExW(

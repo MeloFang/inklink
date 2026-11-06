@@ -208,6 +208,11 @@ pub fn on_done(seq: u32) {
         return;
     };
     let (state, text) = ipc::ai_result(seq);
+    // 用户在面板上点了取消（不等了）：结果丢掉，别把面板又翻回结果页
+    if !crate::ai_panel::is_busy() {
+        crate::log_line(&format!("ai: seq={seq} 回来时面板已不在等，丢掉"));
+        return;
+    }
     match state {
         1 if !text.trim().is_empty() => {
             let out = clip_chars(&text, MAX_RESULT_CHARS);
