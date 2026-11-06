@@ -237,30 +237,92 @@ pub fn on_done(seq: u32) {
     }
 }
 
-/// 读选区（面板打开时）：由 `lib.rs` 的编辑会话回调回来。
-pub fn on_selection(text: &str) {
-    if text.trim().is_empty() {
+/// 上一次读到的选区（只用来决定"变了才写日志"，内容不留）。
+static LAST_SELECTION: Mutex<Option<(usize, bool)>> = Mutex::new(None);
+
+/// 读选区（面板轮询）：由 `lib.rs` 的编辑会话回调回来。`too_long` = 超过 `MAX_INPUT_CHARS`。
+pub fn on_selection(text: &str, too_long: bool) {
+    let chars = text.chars().count();
+    let empty = text.trim().is_empty();
+    let changed = {
+        let mut g = LAST_SELECTION.lock().unwrap_or_else(|p| p.into_inner());
+        let now = Some((chars, too_long));
+        let changed = *g != now;
+        *g = now;
+        changed
+    };
+    if changed {
+        // 只记长度：选区里可能是用户的隐私文字
+        crate::log_line(&format!("ai: selection chars={chars} too_long={too_long}"));
+    }
+    if too_long {
+        crate::ai_panel::set_too_long(chars, MAX_INPUT_CHARS);
+    } else if empty {
         crate::ai_panel::set_no_selection();
     } else {
         crate::ai_panel::set_source(text);
     }
 }
 
-/// 浮条上的「AI」按钮：打开面板，先读当前选区。
+/// 写回的结果（编辑会话里调）。`why` 是 `apply_ai_result` 的返回值。
+pub fn on_applied(why: &str) {
+    crate::ai_panel::set_applied(applied_message(why));
+    if why == "ok" {
+        crate::bar::set_status("已写入 · 退格可撤回", 2_500);
+    }
+}
+
+/// 写回结果对应面板上的那句话。`Ok` = 写进去了。纯函数，可单测。
+fn applied_message(why: &str) -> Result<&'static str, &'static str> {
+    match why {
+        "ok" => Ok("已写入文档。可以继续选别的文字。"),
+        "selection changed" => Err("没写进去：选中的文字变了。重新选中原文后再点「确定」。"),
+        "composing" => Err("没写进去：正在打拼音。打完再点「确定」。"),
+        "busy" => Err("没写进去：输入法正忙。稍等再点「确定」。"),
+        _ => Err("没写进去：这个程序不让输入法改文字。可以用「复制结果」手动粘贴。"),
+    }
+}
+
+/// 本线程有没有活动的输入服务（面板据此决定显示还是先收起）。
+pub fn has_service() -> bool {
+    SERVICE.with(|cell| matches!(cell.get(), (Some(_), ctx) if ctx != 0))
+}
+
+/// 面板轮询：开着的时候每隔一会儿读一次选区，用户在文档里选什么就显示什么。
+///
+/// 以前只在点「AI」的那一下读一次：先开面板、再去选字的人永远看到"没有选中文字"，
+/// 而且去文档里点一下面板就关了（1.1.42 的用户反馈"选中进不去 AI 助手"）。
+pub fn poll_selection() {
+    if !crate::ai_panel::wants_selection() {
+        return;
+    }
+    SERVICE.with(|cell| {
+        if let (Some(f), ctx) = cell.get()
+            && ctx != 0
+        {
+            f(ctx, ACTION_READ);
+        }
+    });
+}
+
+/// 浮条上的「AI」按钮：打开面板（已经开着就收起，等同面板上的 ×）。
 pub fn open_panel() {
+    if crate::ai_panel::is_open() {
+        crate::ai_panel::hide();
+        return;
+    }
     if !enabled() {
         // 明确告诉用户"没启用"，而不是点了没反应（用户反馈原话）
         crate::ai_panel::show_disabled();
         return;
     }
     crate::ai_panel::show_loading();
-    SERVICE.with(|cell| match cell.get() {
-        (Some(f), ctx) if ctx != 0 => f(ctx, ACTION_READ),
-        _ => {
-            crate::ai_panel::set_error("输入上下文不可用：先点一下文档再点 AI");
-            crate::log_line("ai: 没有活动的输入服务（open_panel）");
-        }
-    });
+    if has_service() {
+        poll_selection();
+    } else {
+        crate::ai_panel::set_error("输入上下文不可用：先点一下文档再点 AI");
+        crate::log_line("ai: 没有活动的输入服务（open_panel）");
+    }
 }
 
 /// 面板里点了翻译/改写/续写。
@@ -278,7 +340,8 @@ pub fn send(action: u8) {
     }
 }
 
-/// 面板「确定」：把结果写回文档。
+/// 面板「确定」：把结果写回文档。面板不关（用户要求：只有 × 能关），
+/// 写没写进去由 `on_applied` 告诉面板。
 pub fn confirm() {
     let Some((action, source, text)) = crate::ai_panel::result_for_apply() else {
         return;
@@ -288,13 +351,17 @@ pub fn confirm() {
         action_name(action),
         text.chars().count()
     ));
+    crate::ai_panel::set_applying();
     apply(action, &source, &text);
-    crate::ai_panel::hide();
-    crate::bar::set_status("已应用 · 退格可撤回", 2_500);
 }
 
-/// 面板「取消」/ Esc / 点外面。
-pub fn cancel_panel() {
+/// 面板「取消」：丢掉这次结果，回到"选中文字 → 选动作"那一步。面板不关。
+pub fn cancel_result() {
+    crate::ai_panel::discard_result();
+}
+
+/// 面板右上角 ×：真正关掉面板。
+pub fn close_panel() {
     crate::ai_panel::hide();
 }
 
@@ -395,5 +462,27 @@ mod tests {
     fn 没有输入服务时开面板不崩() {
         clear_service();
         open_panel(); // 没有服务 → 面板显示错误态，不 panic
+        crate::ai_panel::hide();
+    }
+
+    #[test]
+    fn 写回结果都给面板一句人话() {
+        assert!(applied_message("ok").is_ok());
+        // 每一种失败都要说清楚为什么、下一步怎么办，不能只写日志
+        for why in [
+            "selection changed",
+            "composing",
+            "busy",
+            "SetText failed",
+            "no range",
+        ] {
+            let msg = applied_message(why).expect_err(why);
+            assert!(msg.starts_with("没写进去"), "{why} -> {msg}");
+        }
+        assert!(
+            applied_message("selection changed")
+                .unwrap_err()
+                .contains("重新选中")
+        );
     }
 }

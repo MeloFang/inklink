@@ -1,6 +1,6 @@
 [package]
 name = "inklink-tsf"
-version = "1.1.42"
+version = "1.1.43"
 edition = "2024"
 description = "inklink 的 TSF 文本服务（薄壳）"
 
@@ -32,6 +32,10 @@ windows-sys = { version = "0.61", features = [
   "Win32_UI_WindowsAndMessaging",
   "Win32_UI_HiDpi",
   "Win32_Graphics_Gdi",
+  # AI 面板的「复制结果」：写剪贴板（只在用户点按钮时）
+  "Win32_System_DataExchange",
+  "Win32_System_Memory",
+  "Win32_System_Ole",
 ] }
 
 [profile.release]

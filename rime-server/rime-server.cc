@@ -865,51 +865,45 @@ static std::string user_dict_path() {
 // ───────────────────────── 查询 ─────────────────────────
 static const int MAX_CANDS = 50;
 
-/// 多音节输入里的单字候选是噪音。
+/// 多音节输入里单字候选放哪、给多少。
 ///
-/// librime 对 `xiangmu` 这种两音节的输入，会把第一个音节的单字也列进来
-/// （想/向/相/像/象/响/香/降/项/乡/享/翔/箱/祥/详——实测恰好 15 个），排在词后面像刷屏。
-/// 单音节输入（`ni`）不能剔，那就是它本身该给的东西。
+/// librime 对 `xiangmu` 会把第一个音节的单字（想/向/相/…）夹在词中间，像刷屏，
+/// 所以挪到多字词后面。1.1.39 挪完只留 5 个，太少了：词不是固定搭配、要一个字一个字
+/// 找的时候，想要的字常常不在那 5 个里（用户反馈"单个的字只能出现少数几个，找不到"）。
 ///
-/// 两个保护：
-///   - 多字候选不夯 3 个时不剔（不能把列表剔空）——`pikeqiu` 只有 3 个词，
-///     大量单字正是用户抱怨的那种刷屏，3 个也该剔；
-///   - 用户真选过的单字（`keep`）不剔——那是他明确表达过的偏好。
-/// 返回剔掉了几个。
-static size_t prune_single_chars(std::vector<std::string>& cands, size_t syllables,
-                                 const std::set<std::string>& keep) {
+/// 1.1.43 起：
+///   - 单字**全部保留**，挪到多字词后面（多字词不到 3 个时不挪，原位不动）；
+///   - 再用第一个音节单独查一次（`first_singles`），把 librime 没列出来的单字补在后面，
+///     第一个字总能翻到；选了它之后剩下的拼音继续分段查，后面的字自然齐全；
+///   - 单字最多 `kSingleMax` 个；用户选过的单字（`keep`）留在原位；英文原样不动。
+/// 返回放到末尾的单字个数。
+static const size_t kSingleMax = 60;
+static size_t arrange_single_chars(std::vector<std::string>& cands, size_t syllables,
+                                   const std::set<std::string>& keep,
+                                   const std::vector<std::string>& first_singles) {
     if (syllables < 2) return 0;
+    auto movable = [&](const std::string& w) {
+        return utf8_char_count(w) < 2 && !ascii_only(w) && keep.find(w) == keep.end();
+    };
     size_t multi = 0;
     for (const auto& w : cands) {
         if (utf8_char_count(w) >= 2) ++multi;
     }
-    if (multi < 3) return 0;
-
-    // 先把"该挤走"的单字捞出来，再统一挪到末尾。
-    //
-    // 为什么还留几个（kFallback）：整串没有想要的词时（打 wangjia 想打「王佳」），
-    // 用户得能先选「王」、剩下的 `jia` 继续选「佳」——这就是分段上屏的入口。
-    // 全剔掉的话，多音节输入里一个单字都点不到。单字只来自第一个音节
-    // （librime 的补全），所以兜底也只解决第一个字；第二个字靠分段后的
-    // 单音节查询自然出现。
     std::vector<std::string> singles;
-    for (const auto& w : cands) {
-        if (utf8_char_count(w) < 2 && !ascii_only(w) && keep.find(w) == keep.end()) {
-            singles.push_back(w);
+    if (multi >= 3) {
+        for (const auto& w : cands) {
+            if (movable(w)) singles.push_back(w);
         }
+        cands.erase(std::remove_if(cands.begin(), cands.end(), movable), cands.end());
     }
-    if (singles.empty()) return 0;
-    cands.erase(std::remove_if(cands.begin(), cands.end(),
-                               [&](const std::string& w) {
-                                   if (utf8_char_count(w) >= 2) return false;
-                                   if (ascii_only(w)) return false;
-                                   return keep.find(w) == keep.end();
-                               }),
-                cands.end());
-    const size_t kFallback = 5;
-    for (size_t i = 0; i < singles.size() && i < kFallback; ++i) {
-        cands.push_back(singles[i]);
+    for (const auto& w : first_singles) {
+        if (utf8_char_count(w) != 1 || ascii_only(w)) continue;
+        if (std::find(cands.begin(), cands.end(), w) != cands.end()) continue;
+        if (std::find(singles.begin(), singles.end(), w) != singles.end()) continue;
+        singles.push_back(w);
     }
+    if (singles.size() > kSingleMax) singles.resize(kSingleMax);
+    cands.insert(cands.end(), singles.begin(), singles.end());
     return singles.size();
 }
 
@@ -1028,7 +1022,8 @@ static std::vector<std::string> query(const std::string& code, const std::string
             }
         }
     }
-    // 多音节输入里的单字噪音（`xiangmu` 后面那 15 个想/向/相/…）在用户词库加权之前先剔掉。
+    // 多音节输入里的单字挪到词后面、并用第一个音节补全（见 arrange_single_chars），
+    // 在用户词库加权之前做。
     // 为什么放在 boost 前：boost 只会把用户选过的词往前挪，
     // 不会新增候选，所以先剔后挪的结果与反过来一样，但少一次遍历。
     {
@@ -1043,9 +1038,31 @@ static std::vector<std::string> query(const std::string& code, const std::string
                 for (const auto& kv : it->second) keep.insert(kv.first);
             }
         }
-        const size_t syllables = split_lengths(strip_separators(code)).size();
-        const size_t removed = prune_single_chars(out, syllables, keep);
-        if (removed) logf("prune single: %zu (code=%s)", removed, code.c_str());
+        // 按用户打的分词边界分段（xi'an = xi + an），每段再贪心切音节；顺手记下第一个音节
+        const std::string bounded = normalize_boundaries(code);
+        size_t syllables = 0;
+        std::string first;
+        size_t start = 0;
+        while (start <= bounded.size()) {
+            const size_t q = bounded.find('\'', start);
+            const std::string seg =
+                bounded.substr(start, q == std::string::npos ? std::string::npos : q - start);
+            const std::vector<size_t> lens = split_lengths(seg);
+            if (first.empty() && !lens.empty()) first = seg.substr(0, lens[0]);
+            syllables += lens.size();
+            if (q == std::string::npos) break;
+            start = q + 1;
+        }
+        // 第一个音节单独查一次：单音节查询给的是这个音的全部常用字（按字频），
+        // 多音节查询里 librime 只顺带列出其中一部分。多一次 librime 查询，约 1~2ms。
+        std::vector<std::string> first_singles;
+        if (syllables >= 2 && !first.empty()) {
+            first_singles = collect_candidates(g_session, first, kSingleMax);
+        }
+        const size_t moved = arrange_single_chars(out, syllables, keep, first_singles);
+        if (moved) {
+            logf("singles at tail: %zu (code=%s first=%s)", moved, code.c_str(), first.c_str());
+        }
     }
 
     // 用户词库：这个拼音下用户选过的词提前（次数多的更前）。
@@ -1325,8 +1342,76 @@ static std::string json_field(const std::string& body, const char* name) {
     return out;
 }
 
-/// POST 一段 JSON 到 http://host:port/path。成功返回 true，body 写进 out。
-static bool http_post_json(const std::string& url, const std::string& body, std::string* out) {
+/// 拼 Ollama `/api/generate` 的请求体。
+///
+/// `no_think`：要不要带 `"think":false`。qwen3.x、gpt-oss 这类"会先想一想"的模型，
+/// 不关掉就先输出几百个 token 的推理再给结果——实测 qwen3.5:9b 翻一句 `hello world`
+/// 关掉要 145ms、开着要 3.5s，长文更是动辄超时。对不支持思考的模型（gemma3 等）
+/// 新版 Ollama 会忽略这个字段；老版本可能报 400，调用方会去掉它再试一次。
+static std::string ai_request_body(const std::string& model, const std::string& prompt,
+                                   bool no_think) {
+    std::string b = "{\"model\":\"" + json_escape(model) + "\",\"prompt\":\"" +
+                    json_escape(prompt) + "\",\"stream\":false";
+    if (no_think) b += ",\"think\":false";
+    b += "}";
+    return b;
+}
+
+/// 去掉模型输出里的 `<think>…</think>` 段，再去掉开头的空白。
+///
+/// 关了思考的模型一般不会输出它，但有的模板（老版本 Ollama、自制模型）还是会把推理
+/// 写进 `response`——那段混进用户正文就糟了。没闭合的 `<think>` 当作整段都是推理。
+static std::string strip_think(const std::string& s) {
+    std::string out;
+    size_t pos = 0;
+    while (pos < s.size()) {
+        size_t open = s.find("<think>", pos);
+        if (open == std::string::npos) {
+            out += s.substr(pos);
+            break;
+        }
+        out += s.substr(pos, open - pos);
+        size_t close = s.find("</think>", open);
+        if (close == std::string::npos) break;
+        pos = close + 8;
+    }
+    size_t start = 0;
+    while (start < out.size() &&
+           (out[start] == ' ' || out[start] == '\n' || out[start] == '\r' || out[start] == '\t')) {
+        ++start;
+    }
+    return out.substr(start);
+}
+
+/// 把 HTTP 层的失败翻成用户看得懂的一句话（显示在 AI 面板里）。
+///
+/// 以前面板上只有「WinHttp 请求失败: 12029」——用户看不出是 Ollama 没开。
+/// `win_err` 是 WinHTTP 的 `GetLastError()`（0 = 请求本身成功），`http_status` 是状态码。
+static std::string ai_error_text(DWORD win_err, DWORD http_status, const std::string& body,
+                                 const std::string& endpoint, const std::string& model) {
+    if (win_err == 12029 || win_err == 12007) {   // CANNOT_CONNECT / NAME_NOT_RESOLVED
+        return "连不上 AI 服务（" + endpoint + "）：Ollama 没启动？先运行 Ollama 再点「重新生成」";
+    }
+    if (win_err == 12002) {   // ERROR_WINHTTP_TIMEOUT
+        return "AI 服务响应超时：模型可能还在加载，稍等再点「重新生成」";
+    }
+    if (win_err != 0) {
+        return "请求 AI 服务失败（WinHTTP 错误 " + std::to_string(win_err) + "）";
+    }
+    if (http_status == 404 && body.find("not found") != std::string::npos) {
+        return "模型 " + model + " 没装：在命令行运行 ollama pull " + model +
+               "，或在设置里换一个已装的模型";
+    }
+    return "AI 服务返回 HTTP " + std::to_string(http_status) + "：" + body.substr(0, 200);
+}
+
+/// POST 一段 JSON 到 http://host:port/path。成功（2xx）返回 true，body 写进 out。
+///
+/// 失败时 `out` 是响应体（可能为空），`http_status` / `win_err` 给调用方拼错误提示。
+static bool http_post_json(const std::string& url, const std::string& body, std::string* out,
+                           DWORD* http_status, DWORD* win_err) {
+    *http_status = 0;
+    *win_err = 0;
     std::string rest = url;
     const std::string scheme = "http://";
     if (rest.rfind(scheme, 0) == 0) rest = rest.substr(scheme.size());
@@ -1336,17 +1421,27 @@ static bool http_post_json(const std::string& url, const std::string& body, std:
     size_t colon = hostport.find(':');
     std::string host = colon == std::string::npos ? hostport : hostport.substr(0, colon);
     int port = colon == std::string::npos ? 80 : std::atoi(hostport.c_str() + colon + 1);
-    if (host.empty()) return false;
+    if (host.empty()) {
+        *win_err = 12007;
+        return false;
+    }
     std::wstring whost(host.begin(), host.end());
     std::wstring wpath(path.begin(), path.end());
 
     HINTERNET session = WinHttpOpen(L"inklink/1.0", WINHTTP_ACCESS_TYPE_NO_PROXY,
                                     WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-    if (!session) return false;
-    // 不走系统代理：目标是本机 Ollama，挂上代理反而连不上
-    WinHttpSetTimeouts(session, 3000, 3000, 30000, 30000);
+    if (!session) {
+        *win_err = GetLastError();
+        return false;
+    }
+    // 不走系统代理：目标是本机 Ollama，挂上代理反而连不上。
+    // 接收超时 120s（原来 30s）：9B 模型冷启动光加载就 7~15s，再改写一段 2000 字的
+    // 文字，30s 经常不够，表现就是"点了没反应，过一会儿报失败"。这在引擎的后台线程里，
+    // 不占任何同步路径。
+    WinHttpSetTimeouts(session, 3000, 3000, 30000, 120000);
     bool ok = false;
     HINTERNET conn = WinHttpConnect(session, whost.c_str(), static_cast<INTERNET_PORT>(port), 0);
+    if (!conn) *win_err = GetLastError();
     if (conn) {
         HINTERNET req = WinHttpOpenRequest(conn, L"POST", wpath.c_str(), nullptr,
                                            WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, 0);
@@ -1371,16 +1466,15 @@ static bool http_post_json(const std::string& url, const std::string& body, std:
                     if (!WinHttpReadData(req, &chunk[0], avail, &got) || got == 0) break;
                     data.append(chunk.data(), got);
                 } while (true);
-                if (status >= 200 && status < 300) {
-                    *out = data;
-                    ok = true;
-                } else {
-                    *out = "HTTP " + std::to_string(status) + " " + data.substr(0, 200);
-                }
+                *http_status = status;
+                *out = data;
+                ok = status >= 200 && status < 300;
             } else {
-                *out = "WinHttp 请求失败: " + std::to_string(GetLastError());
+                *win_err = GetLastError();
             }
             WinHttpCloseHandle(req);
+        } else {
+            *win_err = GetLastError();
         }
         WinHttpCloseHandle(conn);
     }
@@ -1397,18 +1491,36 @@ static void ai_set(uint32_t seq, int state, const std::string& text) {
 
 static void ai_worker(uint32_t seq, uint32_t hwnd, int action, std::string text) {
     const AiConfig cfg = ai_config();
-    std::string body = "{\"model\":\"" + json_escape(cfg.model) + "\",\"prompt\":\"" +
-                       json_escape(ai_prompt(action, text)) + "\",\"stream\":false}";
+    const std::string url = cfg.endpoint + "/api/generate";
+    const std::string prompt = ai_prompt(action, text);
     std::string resp;
-    const bool ok = http_post_json(cfg.endpoint + "/api/generate", body, &resp);
-    std::string result = ok ? json_field(resp, "response") : resp;
-    if (ok && result.empty()) result = json_field(resp, "content");   // OpenAI 兼容端点
-    if (ok && result.empty()) {
-        ai_set(seq, 2, "模型没返回内容");
-    } else {
-        ai_set(seq, ok ? 1 : 2, result);
+    DWORD status = 0, win_err = 0;
+    bool ok = http_post_json(url, ai_request_body(cfg.model, prompt, true), &resp, &status,
+                             &win_err);
+    // 老版本 Ollama 或不支持思考的模型可能对 "think" 报 400：去掉再试一次
+    if (!ok && win_err == 0 && status == 400 && resp.find("think") != std::string::npos) {
+        logf("ai seq=%u: endpoint rejected think=false, retry without it", seq);
+        ok = http_post_json(url, ai_request_body(cfg.model, prompt, false), &resp, &status,
+                            &win_err);
     }
-    logf("ai seq=%u action=%d ok=%d len=%zu", seq, action, ok ? 1 : 0, result.size());
+    std::string result;
+    if (ok) {
+        result = strip_think(json_field(resp, "response"));
+        if (result.empty()) result = strip_think(json_field(resp, "content"));   // OpenAI 兼容端点
+        if (result.empty()) {
+            ai_set(seq, 2, "模型没返回内容（换一个模型试试）");
+        } else {
+            ai_set(seq, 1, result);
+        }
+    } else {
+        // 服务端自己的 {"error":"..."} 比状态码更说明问题，优先拿它
+        std::string err_body = json_field(resp, "error");
+        if (err_body.empty()) err_body = resp;
+        result = ai_error_text(win_err, status, err_body, cfg.endpoint, cfg.model);
+        ai_set(seq, 2, result);
+    }
+    logf("ai seq=%u action=%d ok=%d status=%lu winerr=%lu len=%zu", seq, action, ok ? 1 : 0,
+         static_cast<unsigned long>(status), static_cast<unsigned long>(win_err), result.size());
     if (hwnd) {
         PostMessageW(reinterpret_cast<HWND>(static_cast<uintptr_t>(hwnd)), WM_APP + 30,
                      static_cast<WPARAM>(seq), 0);
@@ -1611,37 +1723,52 @@ static int run_selftest() {
     bw.apps["weixin"] = 2;
     ck(boost_score(bw, "weixin") == 9, "boost_score: own app doubled");
     ck(boost_score(bw, "code") == 5, "boost_score: other app counts global only");
-    // 单字噪音：多音节输入里的单字要剔，但不能剔空、也不能剔用户选过的
+    // 单字（1.1.43）：多音节输入里挪到词后面，但全部保留，并用第一个音节补全
     {
-        std::vector<std::string> v = {"项目", "橡木", "香木", "向慕", "向暮",
-                                      "想", "向", "相", "像", "象"};
         std::set<std::string> keep;
-        ck(prune_single_chars(v, 2, keep) == 5, "prune_single_chars: 两音节的单字被挤走");
-        ck(v.size() == 10, "prune_single_chars: 单字挪到末尾，不是删掉");
-        ck(v[0] == "项目" && v[5] == "想" && v[9] == "象",
-           "prune_single_chars: 多字在前、单字兜底在后（最多 5 个）");
+        const std::vector<std::string> none;
+        std::vector<std::string> v = {"项目", "橡木", "香木", "向慕", "向暮",
+                                      "想", "向", "相", "像", "象", "降", "项"};
+        ck(arrange_single_chars(v, 2, keep, none) == 7, "singles: all 7 kept, moved to tail");
+        ck(v.size() == 12 && v[0] == "项目" && v[4] == "向暮" && v[5] == "想" && v[11] == "项",
+           "singles: words first, singles after in rime order");
 
-        std::vector<std::string> many = {"项目", "橡木", "香木", "向慕", "向暮",
-                                         "想", "向", "相", "像", "象", "降", "项"};
-        ck(prune_single_chars(many, 3, keep) == 7, "prune_single_chars: 单字多于 5 个时只留 5 个");
-        ck(many.size() == 5 + 5, "prune_single_chars: 5 个兜底");
+        std::vector<std::string> w = {"项目", "橡木", "香木", "想", "向"};
+        const std::vector<std::string> first = {"想", "向", "相", "香", "乡", "项目"};
+        ck(arrange_single_chars(w, 2, keep, first) == 5, "singles: first syllable fills in");
+        ck(w.size() == 8 && w[3] == "想" && w[4] == "向" && w[5] == "相" && w[7] == "乡",
+           "singles: fill-ins after rime's own, no dups, no words");
 
-        std::vector<std::string> one = {"你", "尼", "泥", "逆", "拟", "腻"};
-        ck(prune_single_chars(one, 1, keep) == 0, "prune_single_chars: 单音节不剔");
-        ck(one.size() == 6, "prune_single_chars: 单音节保留全部");
+        std::vector<std::string> one = {"你", "尼", "泥"};
+        ck(arrange_single_chars(one, 1, keep, first) == 0 && one.size() == 3,
+           "singles: single syllable untouched");
 
-        std::vector<std::string> few = {"项目", "橡木", "想", "向"};
-        ck(prune_single_chars(few, 2, keep) == 0, "prune_single_chars: 多字不夯 5 个时不剔");
+        std::vector<std::string> few = {"王佳", "王", "望"};
+        const std::vector<std::string> wang = {"王", "望", "往", "忘"};
+        ck(arrange_single_chars(few, 2, keep, wang) == 2, "singles: few words -> no move, still fill");
+        ck(few.size() == 5 && few[1] == "王" && few[3] == "往" && few[4] == "忘",
+           "singles: few words keep order, fill-ins appended");
 
-        std::vector<std::string> kept = {"项目", "橡木", "香木", "向慕", "向暮",
-                                         "想", "向"};
+        std::vector<std::string> kept = {"项目", "橡木", "香木", "想", "向"};
         std::set<std::string> liked = {"想"};
-        ck(prune_single_chars(kept, 2, liked) == 1, "prune_single_chars: 用户选过的单字不挪");
-        ck(kept.size() == 7 && kept[5] == "想" && kept[6] == "向",
-           "prune_single_chars: 选过的留在原位，其余挪到末尾");
+        ck(arrange_single_chars(kept, 2, liked, none) == 1 && kept[3] == "想" && kept[4] == "向",
+           "singles: user-picked single stays in place");
 
-        std::vector<std::string> eng = {"项目", "橡木", "香木", "向慕", "向暮", "github"};
-        ck(prune_single_chars(eng, 2, keep) == 0, "prune_single_chars: 英文原样不动");
+        std::vector<std::string> eng = {"项目", "橡木", "香木", "github"};
+        ck(arrange_single_chars(eng, 2, keep, none) == 0 && eng[3] == "github",
+           "singles: ascii raw untouched");
+
+        std::vector<std::string> big = {"项目", "橡木", "香木"};
+        std::vector<std::string> lots;
+        for (int i = 0; i < 100; ++i) {   // U+4E00.. 一百个不同的单字
+            std::string s;
+            s += static_cast<char>(0xE4);
+            s += static_cast<char>(0xB8 + (i >> 6));
+            s += static_cast<char>(0x80 + (i & 63));
+            lots.push_back(s);
+        }
+        ck(arrange_single_chars(big, 2, keep, lots) == kSingleMax && big.size() == 3 + kSingleMax,
+           "singles: capped at kSingleMax");
     }
 
     ck(boost_score(bw, "") == 5, "boost_score: unknown app counts global only");
@@ -1657,6 +1784,26 @@ static int run_selftest() {
        "ai_prompt: rewrite is proofreading");
     ck(ai_prompt(AI_CONTINUE, "x").find("不要重复") != std::string::npos,
        "ai_prompt: continue appends only");
+
+    // 1.1.43：思考型模型（qwen3.5:9b）不关思考就慢到超时 —— 请求体必须带 think:false
+    ck(ai_request_body("qwen3.5:9b", "hi", true) ==
+           "{\"model\":\"qwen3.5:9b\",\"prompt\":\"hi\",\"stream\":false,\"think\":false}",
+       "ai_request_body: think off");
+    ck(ai_request_body("m", "a\"b", false) ==
+           "{\"model\":\"m\",\"prompt\":\"a\\\"b\",\"stream\":false}",
+       "ai_request_body: retry without think, escaped");
+    ck(strip_think("<think>\nreasoning\n</think>\n\nhello") == "hello",
+       "strip_think: drops think block");
+    ck(strip_think("hello") == "hello", "strip_think: plain text unchanged");
+    ck(strip_think("<think>never closed") == "", "strip_think: unclosed means all reasoning");
+    ck(ai_error_text(12029, 0, "", "http://127.0.0.1:11434", "m").find("Ollama") !=
+           std::string::npos,
+       "ai_error_text: cannot connect mentions Ollama");
+    ck(ai_error_text(12002, 0, "", "e", "m").find("超时") != std::string::npos,
+       "ai_error_text: timeout");
+    ck(ai_error_text(0, 404, "model 'x' not found", "e", "qwen3.5:9b").find("ollama pull qwen3.5:9b") !=
+           std::string::npos,
+       "ai_error_text: missing model tells how to pull");
 
     if (fails == 0) {
         printf("\nall %d checks passed\n", total);

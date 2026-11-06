@@ -84,6 +84,19 @@ const TIMER_WATCH: usize = 1;
 /// 看门狗周期：600ms。再快没必要，再慢切走程序后能明显看到浮条赖着不走。
 const WATCH_MS: u32 = 600;
 
+/// AI 面板开着时浮条外圈那圈转动彩光的动画定时器。
+const TIMER_GLOW: usize = 2;
+/// 25 帧/秒：转得顺，又不至于让宿主进程一直忙着画。只在面板开着、浮条可见时跑。
+const GLOW_MS: u32 = 40;
+/// 转一圈多久。
+const GLOW_PERIOD_MS: f32 = 2400.0;
+/// 浮条四周给彩光留的边（96 DPI 设计值）。**一直留着**：不亮的时候这圈像素全透明，
+/// 分层窗口对 alpha 为 0 的像素不做命中测试，鼠标会直接穿过去，跟没有一样。
+/// 常留是为了亮/灭时窗口大小不变——否则位置、拖动、命中测试都要跟着来回换算。
+const GLOW_PAD: i32 = 7;
+/// 彩光开没开（面板开着 = 开）。进程级：面板一个进程只有一个。
+static GLOW_ON: AtomicBool = AtomicBool::new(false);
+
 // 本线程的浮条窗口。**必须是 thread_local**：TSF 按线程激活，一个进程里可能有好几条
 // 线程各建一个窗口；放进程级全局只记得最后一个，其余窗口就永远没人关（叠出好几条）。
 //
@@ -230,10 +243,56 @@ fn item_rects() -> [RECT; 5] {
     rects
 }
 
+/// 浮条本体的大小（不含外圈彩光的边）。
 fn window_size() -> (i32, i32) {
     let last = item_rects()[4];
     let pad = scale(PAD);
     (last.right + pad, last.bottom + pad)
+}
+
+/// 外圈留给彩光的边（像素）。
+fn glow_pad() -> i32 {
+    scale(GLOW_PAD)
+}
+
+/// 真正的窗口大小 = 浮条本体 + 四周彩光边。
+fn outer_size() -> (i32, i32) {
+    let (w, h) = window_size();
+    let g = glow_pad();
+    (w + 2 * g, h + 2 * g)
+}
+
+/// 窗口客户区坐标 → 浮条本体坐标（`item_rects` / `hit_test` 用的那套）。
+fn to_bar_coords(x: i32, y: i32) -> (i32, i32) {
+    let g = glow_pad();
+    (x - g, y - g)
+}
+
+/// 打开/关掉外圈彩光（AI 面板开/关时调，在面板所在的线程上）。
+pub fn set_glow(on: bool) {
+    GLOW_ON.store(on, Ordering::SeqCst);
+    let hwnd = our_hwnd();
+    if (hwnd as isize) == 0 {
+        return;
+    }
+    unsafe {
+        if on {
+            SetTimer(hwnd, TIMER_GLOW, GLOW_MS, None);
+        } else {
+            KillTimer(hwnd, TIMER_GLOW);
+        }
+        if IsWindowVisible(hwnd) != 0 {
+            redraw(hwnd);
+        }
+    }
+}
+
+/// 现在转到第几圈的哪儿（0..1）。按真实时间算，丢帧也不会忽快忽慢。
+fn glow_phase() -> f32 {
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    let t0 = START.get_or_init(Instant::now);
+    let ms = t0.elapsed().as_millis() as f32;
+    (ms % GLOW_PERIOD_MS) / GLOW_PERIOD_MS
 }
 
 fn hit_test(x: i32, y: i32) -> i32 {
@@ -272,8 +331,8 @@ fn set_our_hwnd(hwnd: HWND) {
     HWND_CELL.with(|c| c.set(hwnd as isize));
 }
 
-/// 前台窗口是不是我们自己这个进程的窗口。
-fn foreground_is_self() -> bool {
+/// 前台窗口是不是我们自己这个进程的窗口（AI 面板也用它决定收起还是露出来）。
+pub(crate) fn foreground_is_self() -> bool {
     unsafe {
         let fg = GetForegroundWindow();
         if (fg as isize) == 0 {
@@ -914,10 +973,16 @@ fn ensure_window() {
                 return;
             }
             set_our_hwnd(hwnd);
-            let (w, h) = window_size();
+            // 记下来的位置是浮条**本体**的左上角（老版本没有彩光边，存的就是它）；
+            // 窗口要往外扩一圈彩光边，所以左上角往左上挪 `glow_pad`。
+            let (w, h) = outer_size();
+            let g = glow_pad();
             let (x, y) = crate::state::read_pos().unwrap_or_else(default_position);
-            MoveWindow(hwnd, x, y, w, h, 0);
+            MoveWindow(hwnd, x - g, y - g, w, h, 0);
             crate::log_line(&format!("bar: created {w}x{h} at {x},{y}"));
+            if GLOW_ON.load(Ordering::SeqCst) {
+                SetTimer(hwnd, TIMER_GLOW, GLOW_MS, None);
+            }
         }
     }
 }
@@ -1629,14 +1694,178 @@ fn clear_expired_status() -> bool {
     }
 }
 
+// ── AI 面板开着时的外圈彩光 ─────────────────────────────────────────────────
+//
+// 一圈贴着浮条外沿、一直在转的渐变光：颜色沿圆周按色标插值，色标大半是紫系
+// （紫罗兰 / 紫 / 品红 / 靛蓝），中间夹一点粉、琥珀、青、蓝 —— "五彩、以紫为主"。
+// 亮度 = 贴边一道细亮线 + 往外按指数衰减的光晕；再加一个跟着转的高光点，转动才看得出来。
+// 全是纯函数，逐像素算（浮条外框 ~270×60，一帧几万次乘加，不到 1ms）。
+
+/// 彩光的色标：`(位置 0..1, 0xRRGGBB)`。首尾同色，绕一圈接得上。
+const GLOW_STOPS: [(f32, u32); 11] = [
+    (0.00, 0x8B5CF6), // 紫罗兰
+    (0.14, 0xA855F7), // 紫
+    (0.26, 0xD946EF), // 品红
+    (0.36, 0xEC4899), // 粉
+    (0.44, 0xF59E0B), // 琥珀
+    (0.52, 0x8B5CF6), // 紫罗兰
+    (0.64, 0x6366F1), // 靛蓝
+    (0.74, 0x22D3EE), // 青
+    (0.82, 0x3B82F6), // 蓝
+    (0.91, 0xA855F7), // 紫
+    (1.00, 0x8B5CF6), // 紫罗兰
+];
+
+/// 沿圆周位置 `t`（0..1）上的颜色，返回 `(r, g, b)`（0..255）。
+fn glow_color(t: f32) -> (f32, f32, f32) {
+    let t = t.rem_euclid(1.0);
+    let split = |c: u32| {
+        (
+            ((c >> 16) & 0xFF) as f32,
+            ((c >> 8) & 0xFF) as f32,
+            (c & 0xFF) as f32,
+        )
+    };
+    for pair in GLOW_STOPS.windows(2) {
+        let (t0, c0) = pair[0];
+        let (t1, c1) = pair[1];
+        if t >= t0 && t <= t1 {
+            let f = if t1 > t0 { (t - t0) / (t1 - t0) } else { 0.0 };
+            let (a, b) = (split(c0), split(c1));
+            return (
+                a.0 + (b.0 - a.0) * f,
+                a.1 + (b.1 - a.1) * f,
+                a.2 + (b.2 - a.2) * f,
+            );
+        }
+    }
+    split(GLOW_STOPS[0].1)
+}
+
+/// 外圈彩光的一个像素：`(alpha 0..1, r, g, b)`，**未预乘**。
+///
+/// - `bar`：浮条本体在画布里的矩形，`radius` 是它的圆角；
+/// - `pad`：画布四周留了多宽的边（光晕在这之前淡完，不会被画布边缘切出硬边）；
+/// - `phase`：转到哪儿了（0..1），`k`：DPI 缩放。
+#[allow(clippy::too_many_arguments)]
+fn glow_pixel(
+    px: f32,
+    py: f32,
+    bar: (f32, f32, f32, f32),
+    radius: f32,
+    pad: f32,
+    phase: f32,
+    k: f32,
+) -> (f32, f32, f32, f32) {
+    let (x0, y0, x1, y1) = bar;
+    let d = round_rect_sdf(px, py, x0, y0, x1, y1, radius);
+    // 浮条里面不发光（本体会盖上去）；留 1.5px 让它和本体的抗锯齿边接上
+    if d < -1.5 * k {
+        return (0.0, 0.0, 0.0, 0.0);
+    }
+    // 贴边的细亮线（中心在外沿外 0.8px，宽约 3px）
+    let core = (1.0 - (d - 0.8 * k).abs() / (1.6 * k)).clamp(0.0, 1.0);
+    // 往外衰减的光晕
+    let halo = (-d.max(0.0) / (2.4 * k)).exp() * 0.55;
+    // 到画布边缘前淡完
+    let fade = ((pad - 0.5 * k - d) / (1.5 * k)).clamp(0.0, 1.0);
+
+    let (cx, cy) = ((x0 + x1) / 2.0, (y0 + y1) / 2.0);
+    let (hw, hh) = (((x1 - x0) / 2.0).max(1.0), ((y1 - y0) / 2.0).max(1.0));
+    // 先按长宽归一化再取角度：长条形的浮条，角度沿周边走得才均匀
+    let angle = ((py - cy) / hh).atan2((px - cx) / hw);
+    let t = (angle / std::f32::consts::TAU + 0.5 + phase).rem_euclid(1.0);
+    let (mut r, mut g, mut b) = glow_color(t);
+
+    // 跟着转的高光：t 接近 0 的那一小段提亮、往白里靠
+    let dist = t.min(1.0 - t);
+    let spark = (-(dist / 0.07) * (dist / 0.07)).exp();
+    r += (255.0 - r) * 0.55 * spark;
+    g += (255.0 - g) * 0.55 * spark;
+    b += (255.0 - b) * 0.55 * spark;
+
+    let alpha = (core.max(halo) * (0.78 + 0.22 * spark) * fade).clamp(0.0, 1.0);
+    (alpha, r, g, b)
+}
+
+/// 把整圈彩光画进一张（全透明的）预乘 alpha 画布。
+fn paint_glow(px: &mut [u32], w: i32, h: i32, bar: (f32, f32, f32, f32), radius: f32, phase: f32) {
+    let k = dpi_k();
+    let pad = glow_pad() as f32;
+    for y in 0..h {
+        for x in 0..w {
+            let (a, r, g, b) =
+                glow_pixel(x as f32 + 0.5, y as f32 + 0.5, bar, radius, pad, phase, k);
+            if a <= 0.0 {
+                continue;
+            }
+            let ai = (a * 255.0 + 0.5) as u32;
+            let pm = |c: f32| ((c * a) + 0.5).min(255.0) as u32;
+            if let Some(slot) = px.get_mut((y * w + x) as usize) {
+                *slot = (ai << 24) | (pm(r) << 16) | (pm(g) << 8) | pm(b);
+            }
+        }
+    }
+}
+
+/// 预乘 alpha 的"源盖在目标上"：`out = src + dst × (1 − src.a)`。
+fn over_premul(src: u32, dst: u32) -> u32 {
+    let sa = src >> 24;
+    if sa == 255 {
+        return src;
+    }
+    let inv = 255 - sa;
+    let ch = |shift: u32| {
+        let s = (src >> shift) & 0xFF;
+        let d = (dst >> shift) & 0xFF;
+        (s + (d * inv + 127) / 255).min(255)
+    };
+    (ch(24) << 24) | (ch(16) << 16) | (ch(8) << 8) | ch(0)
+}
+
+/// 拼出整个窗口的像素：四周 `glow_pad` 的边 + 正中的浮条本体。
+///
+/// `dst` 是外框大小（`outer_size()`）的画布，`bar` 是本体（`bw × bh`，预乘 alpha）。
+/// `glow` 给了相位就先画彩光、本体盖在上面；`None` 时外圈全透明（鼠标会穿过去）。
+fn compose_outer(dst: &mut [u32], bar: &[u32], bw: i32, bh: i32, glow: Option<f32>) {
+    let g = glow_pad();
+    let (w, h) = (bw + 2 * g, bh + 2 * g);
+    dst.fill(0);
+    if let Some(phase) = glow {
+        let rect = (g as f32, g as f32, (g + bw) as f32, (g + bh) as f32);
+        paint_glow(dst, w, h, rect, scale(RADIUS) as f32, phase);
+    }
+    for y in 0..bh {
+        for x in 0..bw {
+            let (Some(&s), Some(d)) = (
+                bar.get((y * bw + x) as usize),
+                dst.get_mut(((y + g) * w + (x + g)) as usize),
+            ) else {
+                continue;
+            };
+            *d = over_premul(s, *d);
+        }
+    }
+}
+
 unsafe fn present(hwnd: HWND) -> bool {
-    let (w, h) = window_size();
-    let Some(mut c) = Canvas::new(w, h) else {
+    let (bw, bh) = window_size();
+    let Some(mut c) = Canvas::new(bw, bh) else {
         return false;
     };
     let dark = crate::config::snapshot().dark;
     PAINTED_DARK.store(dark, Ordering::Relaxed);
     paint_bar(&mut c, HOVER.load(Ordering::Relaxed), dark);
+
+    // 外框：四周留出彩光的边。本体画在 (g, g)，外圈要么全透明，要么是彩光。
+    let (w, h) = outer_size();
+    let Some(mut outer) = Canvas::new(w, h) else {
+        return false;
+    };
+    let glow = GLOW_ON.load(Ordering::SeqCst).then(glow_phase);
+    let bar_px = c.pixels().to_vec();
+    compose_outer(outer.pixels(), &bar_px, bw, bh, glow);
+    let c = outer;
     let size = SIZE { cx: w, cy: h };
     let src = POINT { x: 0, y: 0 };
     let blend = BLENDFUNCTION {
@@ -1766,6 +1995,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_MOUSEMOVE => {
             let x = (lparam & 0xFFFF) as i16 as i32;
             let y = ((lparam >> 16) & 0xFFFF) as i16 as i32;
+            let (x, y) = to_bar_coords(x, y);
             let hit = hit_test(x, y);
             if hit != HOVER.load(Ordering::Relaxed) {
                 HOVER.store(hit, Ordering::Relaxed);
@@ -1788,8 +2018,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 }
                 if DRAGGING.load(Ordering::Relaxed) {
                     // 尺寸必须**原样传回**：`MoveWindow` 的 nWidth/nHeight 是新尺寸，
-                    // 传 0 会把窗口缩成 0x0（浮条"拖一下就不见了"）。
-                    let (w, h) = window_size();
+                    // 传 0 会把窗口缩成 0x0（浮条"拖一下就不见了"）。这里是整个窗口（含彩光边）。
+                    let (w, h) = outer_size();
                     if let Some(d) = DRAG.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
                         MoveWindow(hwnd, d.window.x + dx, d.window.y + dy, w, h, 0);
                     }
@@ -1800,6 +2030,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_LBUTTONDOWN => {
             let x = (lparam & 0xFFFF) as i16 as i32;
             let y = ((lparam >> 16) & 0xFFFF) as i16 as i32;
+            let (x, y) = to_bar_coords(x, y);
             let mut cursor: POINT = std::mem::zeroed();
             let mut wr: RECT = std::mem::zeroed();
             GetCursorPos(&mut cursor);
@@ -1832,7 +2063,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             if dragging {
                 let mut wr: RECT = std::mem::zeroed();
                 GetWindowRect(hwnd, &mut wr);
-                crate::state::write_pos(wr.left, wr.top);
+                // 存本体的左上角，和老版本存的是同一个东西
+                let g = glow_pad();
+                crate::state::write_pos(wr.left + g, wr.top + g);
             } else {
                 match pressed {
                     // 品牌标 / 最右格：等同点 ☰（投递到队列，不在这里直接弹）
@@ -1855,7 +2088,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 let (chinese, punct) = crate::state::snapshot();
                 // AI 有没有启用现读注册表：菜单每次弹出都可能是刚在设置里勾上的
                 let dark = crate::config::snapshot().dark;
-                let cmd = crate::menu::popup(hwnd, wr.left, wr.top, chinese, punct, dark);
+                // 菜单贴着浮条本体弹，不是贴着外圈彩光边
+                let g = glow_pad();
+                let cmd = crate::menu::popup(hwnd, wr.left + g, wr.top + g, chinese, punct, dark);
                 MENU_OPEN.store(false, Ordering::SeqCst);
                 if cmd != 0 {
                     crate::log_line(&format!("bar: menu choice {cmd}"));
@@ -1872,6 +2107,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             // 引擎的后台线程发完 HTTP 了：这里取结果并排一次写回（见 ai.rs / lib.rs）。
             // 只做内存读 + 排一个编辑会话，不阻塞宿主。
             crate::ai::on_done(wparam as u32);
+            0
+        }
+        WM_TIMER if wparam == TIMER_GLOW => {
+            // 彩光动画一帧。面板关了就停表；浮条收着（宿主在后台）就不画，省得白忙。
+            if !GLOW_ON.load(Ordering::SeqCst) {
+                KillTimer(hwnd, TIMER_GLOW);
+                redraw(hwnd);
+            } else if IsWindowVisible(hwnd) != 0 {
+                present(hwnd);
+            }
             0
         }
         WM_TIMER => {
@@ -4144,6 +4389,157 @@ mod tests {
             glyph_sdf(comma, 0.0, 7.5) > 0.0,
             "尾巴到 5.4+0.4 就收尖了，再往下必须是空的"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // AI 面板开着时的外圈彩光
+    // -----------------------------------------------------------------------
+
+    /// 一个 200×40、圆角 8 的浮条，四周留 7 的边（96 DPI 的设计值）。
+    const GBAR: (f32, f32, f32, f32) = (7.0, 7.0, 207.0, 47.0);
+
+    fn gp(x: f32, y: f32, phase: f32) -> (f32, f32, f32, f32) {
+        glow_pixel(x, y, GBAR, 8.0, 7.0, phase, 1.0)
+    }
+
+    /// HSV 色相（度）。
+    fn hue(r: f32, g: f32, b: f32) -> f32 {
+        let (mx, mn) = (r.max(g).max(b), r.min(g).min(b));
+        if mx - mn < 1.0 {
+            return 0.0;
+        }
+        let d = mx - mn;
+        let h = if mx == r {
+            ((g - b) / d).rem_euclid(6.0)
+        } else if mx == g {
+            (b - r) / d + 2.0
+        } else {
+            (r - g) / d + 4.0
+        };
+        h * 60.0
+    }
+
+    #[test]
+    fn 彩光贴边最亮往外变淡且到画布边缘前淡完() {
+        // 上边正中往外走：贴边那一像素最亮，越往外越淡
+        let at = |dy: f32| gp(107.0, 7.0 - dy, 0.3).0;
+        assert!(at(0.8) > 0.7, "贴边亮线 alpha {}", at(0.8));
+        assert!(at(3.0) < at(0.8), "往外变淡");
+        assert!(at(5.0) < at(3.0), "继续变淡");
+        // 画布最外一像素（离本体 6.5）必须已经透明，否则会被画布边缘切出一道硬边
+        assert!(at(6.5) < 0.01, "画布边缘 alpha {}", at(6.5));
+        // 本体里面不发光
+        assert_eq!(gp(107.0, 27.0, 0.3).0, 0.0, "浮条正中不该有光");
+    }
+
+    #[test]
+    fn 彩光以紫色为主但不止一种颜色() {
+        // 沿圆周均匀取 360 个色，数一数落在紫系（色相 250°–320°）的有多少
+        let mut purple = 0;
+        let mut other_hues = std::collections::BTreeSet::new();
+        for i in 0..360 {
+            let (r, g, b) = glow_color(i as f32 / 360.0);
+            let h = hue(r, g, b);
+            if (250.0..=320.0).contains(&h) {
+                purple += 1;
+            } else {
+                other_hues.insert((h / 60.0) as i32);
+            }
+        }
+        assert!(purple * 100 / 360 >= 50, "紫系只占 {purple}/360");
+        assert!(
+            other_hues.len() >= 3,
+            "五彩：紫之外至少还有三个色区，实际 {other_hues:?}"
+        );
+    }
+
+    #[test]
+    fn 彩光会转() {
+        // 同一个像素，相位不同颜色就不同（转动就是靠这个）
+        let a = gp(107.0, 6.0, 0.0);
+        let b = gp(107.0, 6.0, 0.25);
+        let diff = (a.1 - b.1).abs() + (a.2 - b.2).abs() + (a.3 - b.3).abs();
+        assert!(diff > 40.0, "转了四分之一圈颜色几乎没变：{a:?} vs {b:?}");
+        // 转满一圈回到原样
+        let c = gp(107.0, 6.0, 1.0);
+        assert!((a.1 - c.1).abs() < 0.5 && (a.3 - c.3).abs() < 0.5);
+    }
+
+    #[test]
+    fn 合成时不透明的本体盖住彩光_外圈不亮时全透明() {
+        let opaque = 0xFF_11_22_33u32;
+        assert_eq!(
+            over_premul(opaque, 0x80_40_00_40),
+            opaque,
+            "本体不透明就完全盖住"
+        );
+        assert_eq!(
+            over_premul(0, 0x80_40_00_40),
+            0x80_40_00_40,
+            "本体透明就露出彩光"
+        );
+
+        let (bw, bh) = (20, 10);
+        let g = glow_pad();
+        let (w, h) = (bw + 2 * g, bh + 2 * g);
+        let bar = vec![opaque; (bw * bh) as usize];
+        let mut out = vec![0xDEAD_BEEFu32; (w * h) as usize];
+        compose_outer(&mut out, &bar, bw, bh, None);
+        assert_eq!(out[0], 0, "不亮时外圈全透明（鼠标能穿过去）");
+        assert_eq!(out[(g * w + g) as usize], opaque, "本体放在 (pad, pad)");
+        assert_eq!(out[((g + bh - 1) * w + g + bw - 1) as usize], opaque);
+
+        compose_outer(&mut out, &bar, bw, bh, Some(0.0));
+        let top_mid = ((g - 1) * w + g + bw / 2) as usize;
+        assert!(out[top_mid] >> 24 > 100, "亮的时候本体外沿有光");
+        assert_eq!(
+            out[(g * w + g + 3) as usize],
+            opaque,
+            "本体本身不被彩光改色"
+        );
+    }
+
+    #[test]
+    fn 窗口坐标换成浮条本体坐标() {
+        let g = glow_pad();
+        assert_eq!(to_bar_coords(g, g), (0, 0));
+        let r = item_rects()[3];
+        // 鼠标在 AI 格正中：窗口坐标多出一圈彩光边，换算后要命中 AI 格
+        let (x, y) = to_bar_coords((r.left + r.right) / 2 + g, (r.top + r.bottom) / 2 + g);
+        assert_eq!(hit_test(x, y), 3);
+        let (ow, oh) = outer_size();
+        let (w, h) = window_size();
+        assert_eq!((ow - w, oh - h), (2 * g, 2 * g));
+    }
+
+    /// 彩光预览：三个相位并排存成 `tsf/target/bar-preview-glow.bmp`（叠在白和深灰两种桌面上）。
+    #[test]
+    fn 渲染彩光预览图() {
+        let (bw, bh) = window_size();
+        let (w, h) = outer_size();
+        unsafe {
+            let mut c = Canvas::new(bw, bh).expect("画布创建失败");
+            paint_bar(&mut c, -1, false);
+            let bar = c.pixels().to_vec();
+            let mut sheet = vec![0u32; (w * h * 3) as usize];
+            for (i, phase) in [0.0f32, 0.33, 0.66].iter().enumerate() {
+                let mut out = vec![0u32; (w * h) as usize];
+                compose_outer(&mut out, &bar, bw, bh, Some(*phase));
+                for y in 0..h {
+                    for x in 0..w {
+                        sheet[((y + h * i as i32) * w + x) as usize] = out[(y * w + x) as usize];
+                    }
+                }
+            }
+            write_preview("bar-preview-glow.bmp", &sheet, w, h * 3, (0xFF, 0xFF, 0xFF));
+            write_preview(
+                "bar-preview-glow-dark.bmp",
+                &sheet,
+                w,
+                h * 3,
+                (0x2A, 0x2A, 0x2E),
+            );
+        }
     }
 
     #[test]

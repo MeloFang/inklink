@@ -124,8 +124,6 @@ enum EditAction {
     /// 半角符号（用户实测："输入数字之后打的。会是.而不是。"）；判断必须在编辑
     /// 会话里做，因为按键线程上拿不到文档内容。
     InsertPunct(String, String),
-    /// 自己删掉光标前的一个字（误选撤回时用，见 `OnKeyDown` 的退格分支）
-    DeleteBack,
     /// 读出当前选中的文字，然后请引擎做 AI（翻译/改写/续写，参数是动作编号）。
     ///
     /// 为什么读选区要占一个编辑会话：`ITfContext::GetSelection` 必须在编辑会话里
@@ -175,6 +173,9 @@ struct TextServiceInner {
     cursor: Mutex<usize>,
     /// 待编辑会话执行的动作
     pending: Mutex<Option<EditAction>>,
+    /// 上面那个动作是在哪个上下文上请求的编辑会话。`DoEditSession` 必须用同一个，
+    /// 否则会话在 A 文档里拿到 `ec`、却拿去读 B 文档的选区（AI 读到空串的原因之一）。
+    pending_ctx: Mutex<Option<ITfContext>>,
     /// 是否由我们主动结束组合（提交/取消），用于区分外部终止
     self_terminating: AtomicBool,
     /// 最近一次 GetTextExt 拿到的组合串屏幕位置（左下起 `(x, 顶边, 底边)`）
@@ -187,8 +188,6 @@ struct TextServiceInner {
     sentence: Mutex<Option<SentenceAcc>>,
     /// 刚上屏的那一句（用于整句的撤回）
     sentence_mark: Mutex<Option<CommitMark>>,
-    /// 攒着还没执行的退格次数（自己删字用，见 EditAction::DeleteBack）
-    pending_backspace: Mutex<usize>,
     /// 刚写回的 AI 结果（用于"两秒内按退格撤回"）
     ai_undo: Mutex<Option<AiUndo>>,
 }
@@ -222,13 +221,13 @@ impl TextService {
                 composition: Mutex::new(None),
                 cursor: Mutex::new(0),
                 pending: Mutex::new(None),
+                pending_ctx: Mutex::new(None),
                 self_terminating: AtomicBool::new(false),
                 last_pos: Mutex::new(None),
                 shift_used: AtomicBool::new(false),
                 commit_mark: Mutex::new(None),
                 sentence: Mutex::new(None),
                 sentence_mark: Mutex::new(None),
-                pending_backspace: Mutex::new(0),
                 ai_undo: Mutex::new(None),
             },
         }
@@ -269,12 +268,6 @@ impl TextService {
             .sentence_mark
             .lock()
             .unwrap_or_else(|p| p.into_inner()) = None;
-        // 攒着没执行的退格次数也作废，否则等下删字会多删
-        *self
-            .inner
-            .pending_backspace
-            .lock()
-            .unwrap_or_else(|p| p.into_inner()) = 0;
     }
 
     /// 有没有"刚上屏、还可能被撤回"的词或整句。
@@ -341,6 +334,26 @@ impl TextService {
         });
     }
 
+    /// 撤回窗口里的一次退格：只记账（删光了就撤回学习），不认领、不删字。
+    ///
+    /// 字由宿主自己删。同一次按键可能经过 `OnTestKeyDown` 和 `OnKeyDown` 各一次，
+    /// 按 `(lparam, GetMessageTime())` 去重，只算一下。
+    fn note_idle_backspace(&self, lparam: isize) {
+        // SAFETY: 只读当前线程最近一条消息的时间戳
+        let time = unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetMessageTime() };
+        let fresh = is_new_backspace(
+            &mut LAST_BACKSPACE.lock().unwrap_or_else(|p| p.into_inner()),
+            lparam,
+            time,
+        );
+        if !fresh {
+            return;
+        }
+        for (code, word) in self.count_backspace() {
+            log_line(&format!("unlearn code={code} word={word}"));
+            ipc::unlearn(&code, &word);
+        }
+    }
     /// 记一次退格。返回需要撤回学习的 `(码, 词)` 列表 —— 删掉最后一个词时
     /// 一条，接着把整句也删光时两条（逐词的 + 整句的）。
     fn count_backspace(&self) -> Vec<(String, String)> {
@@ -575,52 +588,22 @@ fn merge_sentence_code(code: &str, next: &str) -> String {
     }
 }
 
-/// 我们自己注入的退格还剩几个没被自己的 sink 吃掉。
+/// 上一次记过账的退格：`(lparam, 消息时间)`。
 ///
-/// 少数宿主（WPS 正文控件等）既不给 ACP 区间、`ShiftStart` 也不动，只能注入
-/// 原生 `VK_BACK` 让宿主自己删字。注入的键会再走一遍 TSF 回到我们这里，
-/// 所以注入前记数、收到时放行（返回 FALSE），否则会把注入的键再认领一次。
-static INJECTED_BACK: Mutex<Option<(std::time::Instant, usize)>> = Mutex::new(None);
+/// 撤回窗口里的退格**不认领**、让宿主自己删（见 `note_idle_backspace`），只数一下。
+/// 有的宿主会对同一次按键调两遍 `OnTestKeyDown`（自己先 TestKeyDown 再 KeyDown），
+/// 也可能 `OnTestKeyDown` 和 `OnKeyDown` 各来一次；按"同一条消息"去重：同一次按键的
+/// lparam 和 `GetMessageTime()` 都相同，连按、按住自动重复的每一下时间都不同。
+static LAST_BACKSPACE: Mutex<Option<(isize, i32)>> = Mutex::new(None);
 
-/// 记住"接下来有 n 个退格是我们自己发的"。
-fn mark_injected_backspace(n: usize) {
-    let mut g = INJECTED_BACK.lock().unwrap_or_else(|p| p.into_inner());
-    *g = if n == 0 {
-        None
-    } else {
-        Some((std::time::Instant::now(), n))
-    };
-}
-
-/// 还有没有自己注入、尚未放行的退格（只读，`OnTestKeyDown` 用）。
-fn injected_backspace_pending() -> bool {
-    let g = INJECTED_BACK.lock().unwrap_or_else(|p| p.into_inner());
-    match *g {
-        // 1 秒还没消化掉就当作丢了，免得把用户真正的退格一直放行
-        Some((at, n)) => n > 0 && at.elapsed() < std::time::Duration::from_millis(1000),
-        None => false,
-    }
-}
-
-/// 消化掉一个注入的退格（`OnKeyDown` 用）：返回 true 表示这次按键是我们自己发的。
-fn take_injected_backspace() -> bool {
-    if !injected_backspace_pending() {
-        *INJECTED_BACK.lock().unwrap_or_else(|p| p.into_inner()) = None;
+/// 这次退格是不是新的一下（同一条消息只算一次）。纯逻辑，可单测。
+fn is_new_backspace(slot: &mut Option<(isize, i32)>, lparam: isize, time: i32) -> bool {
+    if *slot == Some((lparam, time)) {
         return false;
     }
-    let mut g = INJECTED_BACK.lock().unwrap_or_else(|p| p.into_inner());
-    match *g {
-        Some((at, n)) if n > 1 => {
-            *g = Some((at, n - 1));
-            true
-        }
-        _ => {
-            *g = None;
-            true
-        }
-    }
+    *slot = Some((lparam, time));
+    true
 }
-
 impl ITfTextInputProcessor_Impl for TextService_Impl {
     fn Activate(&self, ptim: Ref<ITfThreadMgr>, tid: u32) -> windows::core::Result<()> {
         let r = self.advise_keys(ptim, tid);
@@ -655,6 +638,11 @@ impl ITfTextInputProcessor_Impl for TextService_Impl {
             .lock()
             .unwrap_or_else(|p| p.into_inner()) = None;
         *self.inner.pending.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        *self
+            .inner
+            .pending_ctx
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = None;
         *self.inner.cursor.lock().unwrap_or_else(|p| p.into_inner()) = 0;
         candwin::hide();
         self.unadvise_keys();
@@ -885,7 +873,8 @@ impl TextService_Impl {
     /// 把一个动作交给编辑会话执行（异步，安全，不阻塞按键线程）。
     fn request_edit(&self, action: EditAction) {
         *self.inner.pending.lock().unwrap_or_else(|p| p.into_inner()) = Some(action);
-        self.poke_session();
+        let ctx = self.current_context();
+        self.poke_session(ctx);
     }
 
     /// 同上，但**槽位占着就不排**（返回 false）。
@@ -893,6 +882,8 @@ impl TextService_Impl {
     /// AI 的两步（读选区、写回）都要用它：编辑会话只有一个槽位，AI 结果晚几秒才到，
     /// 这期间用户很可能正在打字、槽位里躺着一个组合串更新。这时候硬塞会把用户的
     /// 那一次更新挤掉（表现为"打着打着拼音不刷新了"）。宁可丢掉 AI 结果。
+    ///
+    /// AI 的动作都跑在**焦点文档**上（见 `focus_context`），不是最后一次按键的那个。
     fn request_edit_if_idle(&self, action: EditAction) -> bool {
         {
             let mut slot = self.inner.pending.lock().unwrap_or_else(|p| p.into_inner());
@@ -901,22 +892,51 @@ impl TextService_Impl {
             }
             *slot = Some(action);
         }
-        self.poke_session();
+        let ctx = self.focus_context();
+        self.poke_session(ctx);
         true
     }
 
     /// 通知 TSF"有个编辑会话要跑"。槽位已经填好，这里只负责敲一下门。
-    fn poke_session(&self) {
-        let tid = *self.inner.tid.lock().unwrap();
+    /// 请求用的上下文记进 `pending_ctx`，`DoEditSession` 用同一个。
+    fn poke_session(&self, ctx: Option<ITfContext>) {
+        let tid = *self.inner.tid.lock().unwrap_or_else(|p| p.into_inner());
         if tid == 0 {
             return;
         }
-        let Some(ctx) = self.current_context() else {
+        let Some(ctx) = ctx else {
             return;
         };
+        *self
+            .inner
+            .pending_ctx
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(ctx.clone());
         let sink: ITfEditSession = self.to_interface();
         // SAFETY: 标准 TSF 编辑会话请求，sink 生命周期由 COM 引用计数管理
         let _ = unsafe { ctx.RequestEditSession(tid, &sink, TF_ES_ASYNC | TF_ES_READWRITE) };
+    }
+
+    /// 线程焦点所在文档的顶层上下文；问不到再退回最后一次按键存下的那个。
+    ///
+    /// AI 读选区必须用它：在 Kiro / VS Code 这种一个窗口里好几个编辑区的程序里，
+    /// 用户刚在聊天框打过字、又去编辑器里选了一段，`context` 还是聊天框的 ——
+    /// 读出来是空串，面板一直显示"没有选中文字"（1.1.42 的实际表现）。
+    fn focus_context(&self) -> Option<ITfContext> {
+        let mgr = self
+            .inner
+            .thread_mgr
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        if let Some(mgr) = mgr {
+            // SAFETY: 只读查询焦点文档管理器，不涉及编辑会话
+            let top = unsafe { mgr.GetFocus().ok().and_then(|doc| doc.GetTop().ok()) };
+            if top.is_some() {
+                return top;
+            }
+        }
+        self.current_context()
     }
 
     /// 拿当前输入上下文：优先用 `OnKeyDown` 存下来的，没有再问线程焦点。
@@ -960,21 +980,22 @@ impl TextService_Impl {
             .is_empty()
     }
 
-    /// 菜单点了翻译/改写/续写：排一次"读选区"。
+    /// 排一次"读选区"（面板开着时每 400ms 一次，见 `ai::poll_selection`）。
+    ///
+    /// 正在打拼音、或者编辑会话正忙，就跳过这一轮——下一轮再读，不挤掉打字的会话。
+    /// 轮询很频繁，所以跳过时不写日志。
     fn start_ai(&self, action: u8) {
         if self.is_composing() {
-            log_line("ai: 正在打拼音，先不读选区");
             return;
         }
-        if !self.request_edit_if_idle(EditAction::ReadSelection(action)) {
-            log_line("ai: 编辑会话正忙，跳过这次请求");
-        }
+        let _ = self.request_edit_if_idle(EditAction::ReadSelection(action));
     }
 
     /// 引擎把结果送回来了：排一次"写回"。
     fn apply_ai(&self, action: u8, expect: &str, text: &str) {
         if self.is_composing() {
-            log_line("ai: 正在打拼音，结果丢掉（不往组合串中间塞字）");
+            log_line("ai: 正在打拼音，结果先不写（不往组合串中间塞字）");
+            ai::on_applied("composing");
             return;
         }
         let action_desc = ai::action_name(action);
@@ -983,7 +1004,8 @@ impl TextService_Impl {
             expect: expect.to_string(),
             text: text.to_string(),
         }) {
-            log_line(&format!("ai: 编辑会话正忙，{action_desc}结果丢掉"));
+            log_line(&format!("ai: 编辑会话正忙，{action_desc}结果先不写"));
+            ai::on_applied("busy");
         }
     }
 
@@ -1109,8 +1131,14 @@ impl ITfEditSession_Impl for TextService_Impl {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clone();
-        // 和 poke_session 用同一个取法：AI 可能在一次键都没按过时发起（详见 current_context）
-        let Some(ctx) = self.current_context() else {
+        // 用请求会话时的那个上下文（`poke_session` 记下的）；万一没有再按老办法取。
+        let requested = self
+            .inner
+            .pending_ctx
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
+        let Some(ctx) = requested.or_else(|| self.current_context()) else {
             return Ok(());
         };
 
@@ -1302,143 +1330,13 @@ impl ITfEditSession_Impl for TextService_Impl {
                 }
                 Ok(())
             }
-            EditAction::DeleteBack => {
-                // 误选撤回时自己删字。
-                //
-                // 为什么不让应用删：我们在 `OnTestKeyDown` 里认领了退格之后，
-                // 有的应用（微信、记事本）就再也收不到这个键了 ——
-                // 用户看到的是"按了两下没反应，第三下才删掉一个字"。
-                // 所以这里自己把光标前一个字删掉，`OnKeyDown` 返回 TRUE 把键吃掉。
-                let mut sel = [TF_SELECTION::default()];
-                let mut fetched = 0u32;
-                let mut why = "ok";
-                // 连按了好几下退格就一次删完（计数器由 OnKeyDown 累加）
-                let want = {
-                    let mut n = self
-                        .inner
-                        .pending_backspace
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner());
-                    let v = *n;
-                    *n = 0;
-                    v
-                };
-                let want = want.max(1) as i32;
-                // SAFETY: 标准 TSF range 操作，全部在同一个编辑会话内
-                unsafe {
-                    match ctx.GetSelection(ec, TF_DEFAULT_SELECTION, &mut sel, &mut fetched) {
-                        Err(_) => why = "GetSelection failed",
-                        Ok(()) => match sel[0].range.as_ref() {
-                            None => why = "no range",
-                            Some(range) => {
-                                // 三级级联，每级都要**确认真的删掉了**才收手：
-                                //
-                                // ① `ITfRangeACP` 精确指定区间（最干净）。
-                                // ② `Collapse + ShiftStart`（1.0.5/1.0.6 用的就是它）——
-                                //    在某些宿主上返回 S_OK 却一步都没移动，所以必须
-                                //    检查 `shifted`，不然 `SetText(&[])` 作用在空区间上，
-                                //    日志写 ok、界面一个字都没少。
-                                // ③ 注入原生 `VK_BACK`，让宿主编按自己的逻辑删。
-                                //    WPS 的正文控件在 ① 里 `GetExtent` 给 (0,0)、
-                                //    在 ② 里原地不动，只剩这条路 —— 代价是这个键会
-                                //    再回到我们的 `OnKeyDown`，所以要记抑制次数。
-                                let mut done = false;
-                                if let Ok(acp) = range.cast::<ITfRangeACP>() {
-                                    let (mut anchor, mut cch) = (0i32, 0i32);
-                                    if acp.GetExtent(&mut anchor, &mut cch).is_err() {
-                                        why = "GetExtent failed";
-                                    } else if anchor == 0 && cch == 0 {
-                                        // 分不清"宿主不认 ACP"和"光标真在文档开头"，
-                                        // 但光标在开头的情况我们本来就没什么可删，
-                                        // 让后面两级去试，代价可以接受。
-                                        log_line("delete-back acp extent=0 (host ignores ACP)");
-                                        why = "acp-extent-zero";
-                                    } else {
-                                        // 有选中内容就删选中；只有一个光标就往前吃 want 个字。
-                                        let (from, len) = if cch > 0 {
-                                            (anchor, cch)
-                                        } else {
-                                            let from =
-                                                if anchor - want < 0 { 0 } else { anchor - want };
-                                            (from, anchor - from)
-                                        };
-                                        if len <= 0 {
-                                            why = "nothing to delete";
-                                        } else if acp.SetExtent(from, len).is_err() {
-                                            why = "SetExtent failed";
-                                        } else {
-                                            log_line(&format!(
-                                                "delete-back acp anchor={anchor} cch={cch} from={from} len={len} want={want}"
-                                            ));
-                                            if range.SetText(ec, 0, &[]).is_err() {
-                                                why = "SetText failed";
-                                            } else {
-                                                done = true;
-                                                why = "ok";
-                                            }
-                                        }
-                                    }
-                                } else {
-                                    why = "no acp";
-                                }
-                                if !done {
-                                    // ② ShiftStart，必须真的移动了才算数
-                                    let mut shifted = 0i32;
-                                    let moved = range.Collapse(ec, TF_ANCHOR_START).is_ok()
-                                        && range
-                                            .ShiftStart(ec, -want, &mut shifted, std::ptr::null())
-                                            .is_ok()
-                                        && shifted != 0;
-                                    if moved && range.SetText(ec, 0, &[]).is_ok() {
-                                        log_line(&format!(
-                                            "delete-back shiftstart shifted={shifted}"
-                                        ));
-                                        done = true;
-                                        why = "ok (shiftstart)";
-                                    } else {
-                                        log_line(&format!(
-                                            "delete-back shiftstart failed shifted={shifted}"
-                                        ));
-                                    }
-                                }
-                                if !done {
-                                    // ③ 交给宿主：注入原生退格
-                                    log_line(&format!(
-                                        "delete-back inject native want={want} (why={why})"
-                                    ));
-                                    mark_injected_backspace(want as usize);
-                                    crate::ipc::press_backspace(want as usize);
-                                    why = "injected native backspace";
-                                }
-                                if done {
-                                    let _ = range.Collapse(ec, TF_ANCHOR_END);
-                                    let caret = [TF_SELECTION {
-                                        range: std::mem::ManuallyDrop::new(Some(range.clone())),
-                                        style: Default::default(),
-                                    }];
-                                    if ctx.SetSelection(ec, &caret).is_err() {
-                                        why = "SetSelection failed";
-                                    }
-                                }
-                            }
-                        },
-                    }
-                }
-                log_line(&format!("delete-back -> {why}"));
-                Ok(())
-            }
             EditAction::ReadSelection(action) => {
                 // 读选区必须在编辑会话里做（要 ec）。
-                // `ACTION_READ` = 面板打开时只读一次，把文字交给面板显示，不发请求。
+                // `ACTION_READ` = 面板轮询选区：把文字交给面板显示，不发请求。
                 let text = selection_text(&ctx, ec);
                 let chars = text.chars().count();
                 if action == ai::ACTION_READ {
-                    if chars > ai::MAX_INPUT_CHARS {
-                        ai::on_selection("");
-                        log_line(&format!("ai: 选区太长（{chars} 字），面板不处理"));
-                    } else {
-                        ai::on_selection(&text);
-                    }
+                    ai::on_selection(&text, chars > ai::MAX_INPUT_CHARS);
                     return Ok(());
                 }
                 if chars == 0 || text.trim().is_empty() {
@@ -1479,6 +1377,8 @@ impl ITfEditSession_Impl for TextService_Impl {
                     "ai: apply action={} -> {why}",
                     ai::action_name(action)
                 ));
+                // 面板要知道写没写进去：以前"选区变了"只写日志，用户点了确定什么都没发生
+                ai::on_applied(why);
                 Ok(())
             }
             EditAction::AiRevert {
@@ -1588,12 +1488,6 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
     ) -> windows::core::Result<BOOL> {
         let vk = wparam.0 as u32;
         const VK_BACK: u32 = 0x08;
-        // 这个退格是我们自己注入的（见 EditAction::DeleteBack 的第三级）：
-        // 不认领，让应用收下它去删字。
-        if vk == VK_BACK && injected_backspace_pending() {
-            log_line("test vk=8 claim=false (injected)");
-            return Ok(BOOL(0));
-        }
         // 「这次按键是 Shift 组合键」这件事必须在这里就记下：
         // 下面可能一个键都不认领（`Shift+=` → `+` 交给应用、英文模式下所有键都放行），
         // 那种情况下 TSF 不会再调 OnKeyDown，只在 OnKeyDown 里记就会漏掉，
@@ -1607,9 +1501,14 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .is_empty();
-        // 刚上屏、可能被撤回的词，要先把退格抢过来数一下
-        let undo = !composing && (self.undo_pending() || self.ai_undo_pending());
-        // 全局状态（注册表）：中英模式 + 中文标点开关，所有应用一致。
+        // 刚写回的 AI 结果：退格要认领下来，由我们把原文换回去（见 OnKeyDown）。
+        let undo = !composing && self.ai_undo_pending();
+        // 刚上屏的词：退格**不认领**、交给宿主自己删，这里只数一下（误选撤回的记账）。
+        // 1.1.43 以前是认领下来自己用 SetText 删：Chromium 系宿主（VS Code / Kiro / Edge /
+        // 各家 Electron）会把上屏后紧跟的那次删除丢掉，用户得按两次退格才删掉一个字。
+        if vk == VK_BACK && !composing && !undo && self.undo_pending() {
+            self.note_idle_backspace(_lparam.0);
+        }        // 全局状态（注册表）：中英模式 + 中文标点开关，所有应用一致。
         let (chinese_mode, punct_mode) = state::snapshot();
         // 标点开关关掉时，空闲态干脆不认领标点键：应用自己出半角标点。
         // 这比"认领下来再转回半角"干净得多 —— 后者要猜键盘布局，还要自己 SetText。
@@ -1654,12 +1553,6 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
 
         let vk = wparam.0 as u32;
 
-        // 自己注入的退格：放行给应用（见 EditAction::DeleteBack 的第三级）
-        if vk == VK_BACK && take_injected_backspace() {
-            log_line("keydown vk=8 pass-through (injected)");
-            return Ok(BOOL(0));
-        }
-
         // 光标不在可编辑区域时一个键都不认领，否则会在没有光标的地方冒出候选窗
         let composable = self.can_compose(pic.as_ref());
 
@@ -1674,10 +1567,9 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
         // 上屏后 2 秒内按退格，把刚上屏的几个字删光就说明那一下选错了：
         // 把刚才记的学习减掉。
         //
-        // 这段窗口里退格由**我们**执行（`EditAction::DeleteBack` 自己删一个字），
-        // 因为 `OnTestKeyDown` 认领了之后有的应用就收不到这个键了 ——
-        // 之前的表现是"按两下没反应，第三下才删掉"。窗口之外的退格不认领、
-        // 也不经这里，应用照常自己删。
+        // 字由**宿主自己删**（`OnTestKeyDown` 不认领这个键）。正常情况下它根本不会走到
+        // 这里；少数宿主直接调 `OnKeyDown` 时同样只记账、放行（`note_idle_backspace` 去重）。
+        // 只有 AI 结果的撤回要认领：那是把一段文字换回原文，宿主的退格做不到。
         if vk == VK_BACK {
             let composing = !self
                 .inner
@@ -1697,28 +1589,11 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                     });
                     return Ok(BOOL(1));
                 }
-                let had_mark = self.undo_pending();
-                for (code, word) in self.count_backspace() {
-                    log_line(&format!("unlearn code={code} word={word}"));
-                    ipc::unlearn(&code, &word);
-                }
-                if had_mark {
-                    // 连按两下时异步编辑会话可能还没跑起来，pending 只有一个槽，
-                    // 所以把次数攒在计数器里，会话一次按次数删完。
-                    {
-                        let mut n = self
-                            .inner
-                            .pending_backspace
-                            .lock()
-                            .unwrap_or_else(|p| p.into_inner());
-                        *n += 1;
-                    }
-                    self.request_edit(EditAction::DeleteBack);
-                    return Ok(BOOL(1));
+                if self.undo_pending() {
+                    self.note_idle_backspace(_lparam.0);
                 }
                 return Ok(BOOL(0));
-            }
-        } else {
+            }        } else {
             self.clear_commit_mark();
             self.clear_ai_undo();
         }
@@ -3994,34 +3869,16 @@ mod punct_claim_tests {
     const VK_SPACE_KEY: u32 = 0x20;
 
     #[test]
-    fn 注入的退格按次数放行() {
-        // 有些宿主删不掉字，我们注入原生退格让宿主自己删；
-        // 注入的键会再回到自己这里，必须按次数逐一放行，不能永久放行。
-        mark_injected_backspace(0);
-        assert!(!injected_backspace_pending());
-        assert!(!take_injected_backspace());
-
-        mark_injected_backspace(2);
-        assert!(injected_backspace_pending());
-        assert!(take_injected_backspace(), "第一个注入键");
-        assert!(injected_backspace_pending(), "还剩一个");
-        assert!(take_injected_backspace(), "第二个注入键");
-        assert!(!injected_backspace_pending(), "放行完了");
-        assert!(!take_injected_backspace(), "之后不再放行");
+    fn 同一次退格只记一次账() {
+        // 撤回窗口里的退格不认领、由宿主删；同一次按键可能被调两遍，记账必须去重，
+        // 否则两个字的词按一下就被当成"删光了"撤回学习。
+        let mut slot = None;
+        assert!(is_new_backspace(&mut slot, 0x000E_0001, 1000), "第一下");
+        assert!(!is_new_backspace(&mut slot, 0x000E_0001, 1000), "同一条消息又来一次");
+        assert!(is_new_backspace(&mut slot, 0x000E_0001, 1150), "连按的第二下");
+        assert!(is_new_backspace(&mut slot, 0x400E_0001, 1183), "按住自动重复");
+        assert!(!is_new_backspace(&mut slot, 0x400E_0001, 1183));
     }
-
-    #[test]
-    fn 注入标记过期后不再放行用户自己的退格() {
-        // 万一注入的键没被送到（宿主吞了），不能让标记一直挂着把用户真正的
-        // 退格当成注入键放行 —— 那样误选就永远撤不回来了。
-        *INJECTED_BACK.lock().unwrap_or_else(|p| p.into_inner()) = Some((
-            std::time::Instant::now() - std::time::Duration::from_secs(5),
-            3,
-        ));
-        assert!(!injected_backspace_pending());
-        assert!(!take_injected_backspace());
-    }
-
     #[test]
     fn 图标缺失时退回_dll_自身() {
         // 安装目录里有 inklink.ico 就用它；没有（开发机、或安装器还没跑）就退回 DLL，
