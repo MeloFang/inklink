@@ -1033,13 +1033,21 @@ fn keep_on_screen(hwnd: HWND) {
         return;
     }
     let g = glow_pad();
-    let (bx, by) = (wr.left + g, wr.top + g);
-    let (x, y) = fit_on_screen(bx, by);
-    if (x, y) != (bx, by) {
+    let (cur_x, cur_y) = (wr.left + g, wr.top + g);
+    // 位置是全局记一份的，但浮条窗口是**每个进程一条**（TSF 按线程激活）。
+    // 只有建窗口时读一次的话：宿主的浮条窗口早建好，用户在别的程序里把它拖走之后，
+    // 这边还待在老地方 —— 同一个浮条在不同的程序里出现在屏幕不同位置
+    // （2026-11-06 用户反馈"一会在左边一会在右边"）。所以每次显示都跟一次。
+    let want = crate::state::read_pos().unwrap_or((cur_x, cur_y));
+    // 出界（换分辨率、拔掉副屏）也要挪回来
+    let (x, y) = fit_on_screen(want.0, want.1);
+    if (x, y) != (cur_x, cur_y) {
         let (w, h) = outer_size();
         unsafe { MoveWindow(hwnd, x - g, y - g, w, h, 0) };
-        crate::state::write_pos(x, y);
-        crate::log_line(&format!("bar: off-screen {bx},{by} -> {x},{y}"));
+        if (x, y) != want {
+            crate::state::write_pos(x, y);
+            crate::log_line(&format!("bar: off-screen {},{} -> {x},{y}", want.0, want.1));
+        }
     }
 }
 

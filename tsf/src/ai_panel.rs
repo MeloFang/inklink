@@ -851,6 +851,14 @@ fn ensure_window() {
     let (bw, bh) = (scale(BODY_W), scale(BODY_H));
     let (w, h) = outer_size();
     let (x, y) = body_position(bw, bh);
+    // 第一次摆好的位置立刻记下来。
+    //
+    // 面板每次打开都是新窗口（`hide()` 会 DestroyWindow），没记过位置的话每次都要
+    // 按"当前前台那块屏的底部正中"重算 —— 两块屏之间来回开，面板就一会儿在左边、
+    // 一会儿在右边（2026-11-06 用户反馈"悬浮窗位置动来动去"）。
+    if crate::state::read_panel_pos().is_none() {
+        crate::state::write_panel_pos(x, y);
+    }
 
     let name = wide(CLASS_NAME);
     let hwnd = unsafe {
