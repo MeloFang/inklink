@@ -336,6 +336,11 @@ fn result_view(phase: Phase) -> bool {
     )
 }
 
+/// 这个阶段能不能用「粘贴」：AI 没启用、正在生成、正在写回时都不收。
+fn accepts_paste(phase: Phase) -> bool {
+    !matches!(phase, Phase::Disabled | Phase::Busy | Phase::Applying)
+}
+
 /// 哪些阶段算"手里有一段原文、可以发请求"（重新生成也走这里）。
 fn actions_enabled(phase: Phase) -> bool {
     matches!(phase, Phase::Ready | Phase::Done | Phase::Error)
@@ -348,6 +353,8 @@ struct Layout {
     settings: RECT,
     source_box: RECT,
     chip: RECT,
+    /// 输入卡右下角的「粘贴」小药丸：没读到选区时用户自己把文字弄进来
+    paste: RECT,
     rows: [RECT; 3],
     note: RECT,
     open_settings: RECT,
@@ -390,6 +397,12 @@ fn layout(w: i32, h: i32) -> Layout {
         source_box.bottom - scale(12) - scale(24),
         source_box.left + scale(12) + scale(120),
         source_box.bottom - scale(12),
+    );
+    let paste = rect(
+        source_box.right - scale(12) - scale(52),
+        chip.top,
+        source_box.right - scale(12),
+        chip.bottom,
     );
     let row_h = scale(42);
     let ry = source_box.bottom + scale(10);
@@ -434,6 +447,7 @@ fn layout(w: i32, h: i32) -> Layout {
         settings,
         source_box,
         chip,
+        paste,
         rows,
         note,
         open_settings,
@@ -458,6 +472,7 @@ enum Hit {
     Cancel,
     Regenerate,
     Copy,
+    Paste,
 }
 
 fn inside(r: &RECT, x: i32, y: i32) -> bool {
@@ -475,6 +490,10 @@ fn hit(x: i32, y: i32, w: i32, h: i32, phase: Phase) -> Hit {
     }
     if inside(&l.settings, x, y) {
         return Hit::Settings;
+    }
+    // 「粘贴」任何时候都能点（除了不可用/正忙）：读取失败、或者用户压根不想在文档里选字
+    if accepts_paste(phase) && inside(&l.paste, x, y) {
+        return Hit::Paste;
     }
     if result_view(phase) {
         let done = phase == Phase::Done;
@@ -538,6 +557,9 @@ fn redraw() {
         present(h as HWND);
     }
 }
+
+/// 「正在读选区」已经过了多少拍（50ms 一拍）。读不回来就退到可粘贴状态。
+static LOADING_TICKS: AtomicU32 = AtomicU32::new(0);
 
 /// 选区轮询的结果落到哪个阶段（纯函数，好测）。
 ///
@@ -618,6 +640,28 @@ pub fn set_source(text: &str) {
         s.result.clear();
         // 选了新的一段，上一次"已写入"的提示就过时了
         s.note = None;
+        true
+    });
+}
+
+/// 用户自己粘贴进来的文字：不管当前在哪个阶段都收（出了结果之后也要能换一段重来）。
+pub fn set_source_pasted(text: &str) {
+    update(|s| {
+        s.phase = Phase::Ready;
+        s.source = text.to_string();
+        s.result.clear();
+        s.note = None;
+        true
+    });
+}
+
+/// 粘贴进来的文字太长：同样绕开"只在等选区时更新"的限制。
+pub fn set_too_long_pasted(chars: usize, max: usize) {
+    update(|s| {
+        s.phase = Phase::TooLong;
+        s.source.clear();
+        s.result.clear();
+        s.note = Some((false, format!("{chars} 字，一次最多 {max} 字。换短一点的一段。")));
         true
     });
 }
@@ -873,6 +917,17 @@ fn on_tick(hwnd: HWND) {
         set_hover(Hit::None);
     }
     let n = TICKS.fetch_add(1, Ordering::Relaxed);
+    // 读选区超时（2026-11-06：WPS 的 AI 面板里读不回来，面板一直卡在「读取中…」）。
+    // 25 拍 × 50ms ≈ 1.25 秒还没结果就退成"没选中"，把「粘贴」这条路露出来。
+    if state_snapshot().0 == Phase::Loading {
+        if LOADING_TICKS.fetch_add(1, Ordering::Relaxed) >= 25 {
+            LOADING_TICKS.store(0, Ordering::Relaxed);
+            crate::log_line("ai-panel: 读选区超时，退到可粘贴状态");
+            set_no_selection();
+        }
+    } else {
+        LOADING_TICKS.store(0, Ordering::Relaxed);
+    }
     if n.is_multiple_of(SELECTION_EVERY) {
         crate::ai::poll_selection();
     }
@@ -887,6 +942,68 @@ fn set_hover(h: Hit) {
     };
     if changed {
         redraw();
+    }
+}
+
+/// 读剪贴板里的文字（CF_UNICODETEXT）。不是文字 / 打不开 → None。
+fn clipboard_text() -> Option<String> {
+    use windows_sys::Win32::System::DataExchange::{
+        CloseClipboard, GetClipboardData, IsClipboardFormatAvailable, OpenClipboard,
+    };
+    use windows_sys::Win32::System::Memory::{GlobalLock, GlobalUnlock};
+    const CF_UNICODETEXT: u32 = 13;
+    unsafe {
+        if IsClipboardFormatAvailable(CF_UNICODETEXT) == 0 {
+            return None;
+        }
+        if OpenClipboard(std::ptr::null_mut()) == 0 {
+            return None;
+        }
+        let mut out = None;
+        let handle = GetClipboardData(CF_UNICODETEXT);
+        if !handle.is_null() {
+            let p = GlobalLock(handle) as *const u16;
+            if !p.is_null() {
+                let mut len = 0usize;
+                while *p.add(len) != 0 {
+                    len += 1;
+                }
+                out = Some(String::from_utf16_lossy(std::slice::from_raw_parts(p, len)));
+                GlobalUnlock(handle);
+            }
+        }
+        CloseClipboard();
+        out
+    }
+}
+
+/// 点「粘贴」：把剪贴板里的文字当成本次的原文。
+///
+/// 为什么要有这个口子：有的宿主（WPS 的 AI 面板就是）读不到选区，面板会一直停在
+/// "正在读取选中文字…"；让用户自己复制一段再粘进来，比卡在那里强。
+fn paste_source() {
+    let Some(raw) = clipboard_text() else {
+        update(|s| {
+            s.note = Some((
+                false,
+                "剪贴板里没有文字。先在文档里复制一段，再点「粘贴」。".to_string(),
+            ));
+            true
+        });
+        return;
+    };
+    let text = raw.trim().to_string();
+    let chars = text.chars().count();
+    crate::log_line(&format!("ai-panel: paste chars={chars}"));
+    if chars == 0 {
+        update(|s| {
+            s.note = Some((false, "剪贴板是空的。".to_string()));
+            true
+        });
+    } else if chars > crate::ai::MAX_INPUT_CHARS {
+        set_too_long_pasted(chars, crate::ai::MAX_INPUT_CHARS);
+    } else {
+        set_source_pasted(&text);
     }
 }
 
@@ -1032,8 +1149,8 @@ fn chip_text(phase: Phase, chars: usize) -> String {
 fn hint_line(phase: Phase) -> &'static str {
     match phase {
         Phase::Disabled => "在设置里勾选「启用 AI」、填好接口地址，再回到这里",
-        Phase::Loading => "正在读取选中的文字…",
-        Phase::NoSelection => "选中文字后点一种处理方式。按住空白处可以拖动面板",
+        Phase::Loading => "正在读取选中的文字…（读不到就复制一段，点上面的「粘贴」）",
+        Phase::NoSelection => "选中文字后点一种处理方式；也可以复制一段点「粘贴」",
         Phase::TooLong => "一次最多处理 2000 字",
         Phase::Ready => "点一种处理方式。按住空白处可以拖动面板",
         _ => "",
@@ -1258,6 +1375,23 @@ fn paint_panel(c: &mut Canvas, m: i32, dark: bool, hover: Hit, snap: Snap) {
         fonts.small,
         line | DT_CENTER,
     );
+    if accepts_paste(phase) {
+        // 右下角「粘贴」：没读到选区时的备用入口（用户 2026-11-06 反馈 WPS 里读不到）
+        let r = o(&l.paste);
+        let hot = hover == Hit::Paste;
+        {
+            let px = unsafe { c.pixels() };
+            fill_round(
+                px,
+                w,
+                h,
+                &r,
+                (r.bottom - r.top) as f32 / 2.0,
+                &solid(if hot { pal.hover } else { pal.field_border }),
+            );
+        }
+        text(hdc, &r, "粘贴", if hot { pal.text } else { pal.dim }, fonts.small, line | DT_CENTER);
+    }
 
     if !in_result {
         // 动作列表
@@ -1476,6 +1610,9 @@ fn on_click(h: Hit) {
                 });
                 true
             });
+        }
+        Hit::Paste => {
+            paste_source();
         }
         Hit::Drag | Hit::None => {}
     }
@@ -1827,7 +1964,7 @@ mod tests {
     fn 渲染面板预览图() {
         let m = scale(SHADOW);
         let (w, h) = outer_size();
-        let cases: [(&str, Snap, Hit); 3] = [
+        let cases: [(&str, Snap, Hit); 4] = [
             (
                 "ai-panel-ready.bmp",
                 (
@@ -1854,6 +1991,11 @@ mod tests {
                 "ai-panel-disabled.bmp",
                 (Phase::Disabled, String::new(), String::new(), 0, None),
                 Hit::None,
+            ),
+            (
+                "ai-panel-nosel.bmp",
+                (Phase::NoSelection, String::new(), String::new(), 0, None),
+                Hit::Paste,
             ),
         ];
         for (name, snap, hover) in cases {
