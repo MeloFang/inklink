@@ -740,6 +740,25 @@ oldest / ollama / olympic，`jav` → java / javascript / javadoc / javac；
 `install.ps1` 装到 `C:\inklink-engine\en-words.txt` 并加进自检。漏了不会崩，只是没有补全
 （引擎日志 `en words: ... not found`）。
 
+### 1.1.47 / 1.1.48：候选窗瘦身、提到最上层、AI 面板粘贴（2026-11-06）
+
+用户三个反馈一次修完。
+
+- **候选窗太占屏幕**：单元格以前整页一律按最长候选取宽，一页里有个四字词，短候选之间
+  就空出半格。改成逐列算宽（`col_widths`），内边距 14→10、行高 34→30、拼音行 24→22、
+  最小格宽 96→76。同一份内容 528×120 → 440×102。命中测试改成按逐列宽度量。
+- **候选窗被宿主的浮层盖住**（WPS 的 AI 面板）：显示时 `SetWindowPos(HWND_TOPMOST)`
+  而不是 `SWP_NOZORDER` —— 窗口虽是 TOPMOST 建的，宿主浮层也是 TOPMOST 且后建。
+  仍带 `SWP_NOACTIVATE`，不抢焦点。
+- **AI 面板卡在"正在读取选中文字…"**：有的宿主读不回选区，状态机就一直停在 Loading。
+  两处兜底：① 定时器 25 拍（≈1.25 秒）还没结果就退成"没选中"；② 输入卡右下角加了
+  **「粘贴」**按钮，把剪贴板文字直接当原文（`clipboard_text()` + `set_source_pasted`，
+  绕开"只在等选区时更新"的限制，出了结果也能换一段重来）。
+
+顺带一条环境教训：用户机器上装了搜狗，`HKCU\\Control Panel\\International\\User Profile\\zh-Hans-CN`
+里 inklink 不是 1（默认）。自动化测试前**先读这个键确认 inklink 是默认再打字**，
+否则测到的是别人的候选窗（这次就这么乌龙了一场）。
+
 ### 还没做的（留给 P6 / M3）
 
 - 结果写进文档后**不能撤回**（它不属于组合串，`UndoMs` 那套管不到）。
