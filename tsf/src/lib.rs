@@ -1508,7 +1508,7 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
         // 各家 Electron）会把上屏后紧跟的那次删除丢掉，用户得按两次退格才删掉一个字。
         if vk == VK_BACK && !composing && !undo && self.undo_pending() {
             self.note_idle_backspace(_lparam.0);
-        }        // 全局状态（注册表）：中英模式 + 中文标点开关，所有应用一致。
+        } // 全局状态（注册表）：中英模式 + 中文标点开关，所有应用一致。
         let (chinese_mode, punct_mode) = state::snapshot();
         // 标点开关关掉时，空闲态干脆不认领标点键：应用自己出半角标点。
         // 这比"认领下来再转回半角"干净得多 —— 后者要猜键盘布局，还要自己 SetText。
@@ -1593,7 +1593,8 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                     self.note_idle_backspace(_lparam.0);
                 }
                 return Ok(BOOL(0));
-            }        } else {
+            }
+        } else {
             self.clear_commit_mark();
             self.clear_ai_undo();
         }
@@ -3874,9 +3875,18 @@ mod punct_claim_tests {
         // 否则两个字的词按一下就被当成"删光了"撤回学习。
         let mut slot = None;
         assert!(is_new_backspace(&mut slot, 0x000E_0001, 1000), "第一下");
-        assert!(!is_new_backspace(&mut slot, 0x000E_0001, 1000), "同一条消息又来一次");
-        assert!(is_new_backspace(&mut slot, 0x000E_0001, 1150), "连按的第二下");
-        assert!(is_new_backspace(&mut slot, 0x400E_0001, 1183), "按住自动重复");
+        assert!(
+            !is_new_backspace(&mut slot, 0x000E_0001, 1000),
+            "同一条消息又来一次"
+        );
+        assert!(
+            is_new_backspace(&mut slot, 0x000E_0001, 1150),
+            "连按的第二下"
+        );
+        assert!(
+            is_new_backspace(&mut slot, 0x400E_0001, 1183),
+            "按住自动重复"
+        );
         assert!(!is_new_backspace(&mut slot, 0x400E_0001, 1183));
     }
     #[test]
