@@ -894,6 +894,7 @@ fn show_with_foreground(foreground: fn() -> bool) {
     if (hwnd as isize) == 0 {
         return;
     }
+    keep_on_screen(hwnd);
     // 前台激活：拿到仲裁权就收起别的浮条、显示自己；后台激活：先收着，等看门狗。
     let out = drive_this_thread(hwnd, Trigger::Activate, foreground);
     crate::log_line(&format!("bar show -> {out:?}"));
@@ -978,12 +979,67 @@ fn ensure_window() {
             let (w, h) = outer_size();
             let g = glow_pad();
             let (x, y) = crate::state::read_pos().unwrap_or_else(default_position);
+            let (x, y) = fit_on_screen(x, y);
             MoveWindow(hwnd, x - g, y - g, w, h, 0);
             crate::log_line(&format!("bar: created {w}x{h} at {x},{y}"));
             if GLOW_ON.load(Ordering::SeqCst) {
                 SetTimer(hwnd, TIMER_GLOW, GLOW_MS, None);
             }
         }
+    }
+}
+
+/// 把浮条本体（左上角 `(x, y)`、大小 `w × h`）整个挪进工作区 `work`。纯函数，可单测。
+///
+/// 只挪本体，四周透明的彩光边出界无所谓（鼠标本来就穿过去）。比工作区还大就贴左/贴顶。
+fn clamp_into(work: &RECT, x: i32, y: i32, w: i32, h: i32) -> (i32, i32) {
+    let x = x.min(work.right - w).max(work.left);
+    let y = y.min(work.bottom - h).max(work.top);
+    (x, y)
+}
+
+/// 离 `(x, y)` 最近的那块显示器的工作区（已扣任务栏）。取不到退回主显示器。
+fn work_area_near(x: i32, y: i32) -> RECT {
+    use windows_sys::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint,
+    };
+    unsafe {
+        let mon = MonitorFromPoint(POINT { x, y }, MONITOR_DEFAULTTONEAREST);
+        let mut mi: MONITORINFO = std::mem::zeroed();
+        mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+        if !mon.is_null() && GetMonitorInfoW(mon, &mut mi) != 0 {
+            return mi.rcWork;
+        }
+        let mut area: RECT = std::mem::zeroed();
+        SystemParametersInfoW(SPI_GETWORKAREA, 0, &mut area as *mut RECT as *mut _, 0);
+        area
+    }
+}
+
+/// 浮条本体左上角挪进它所在（最近）那块屏幕的工作区。
+///
+/// 2026-11-06 用户报：存的位置是 (1776, 983)，屏幕右边只到 1910，浮条一宽 → AI 格整个
+/// 在屏幕外点不到。`state::read_pos` 只挡了 ±10000 的离谱值，不知道窗口多大、屏幕多大，
+/// 所以在这里（知道两者的地方）挪。按本体中心找显示器：多屏时留在原来那块屏上。
+fn fit_on_screen(x: i32, y: i32) -> (i32, i32) {
+    let (w, h) = window_size();
+    clamp_into(&work_area_near(x + w / 2, y + h / 2), x, y, w, h)
+}
+
+/// 每次显示前检查一遍：分辨率变小、拔掉副屏之后，已经建好的浮条也要挪回来。
+fn keep_on_screen(hwnd: HWND) {
+    let mut wr: RECT = unsafe { std::mem::zeroed() };
+    if unsafe { GetWindowRect(hwnd, &mut wr) } == 0 {
+        return;
+    }
+    let g = glow_pad();
+    let (bx, by) = (wr.left + g, wr.top + g);
+    let (x, y) = fit_on_screen(bx, by);
+    if (x, y) != (bx, by) {
+        let (w, h) = outer_size();
+        unsafe { MoveWindow(hwnd, x - g, y - g, w, h, 0) };
+        crate::state::write_pos(x, y);
+        crate::log_line(&format!("bar: off-screen {bx},{by} -> {x},{y}"));
     }
 }
 
@@ -2063,9 +2119,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             if dragging {
                 let mut wr: RECT = std::mem::zeroed();
                 GetWindowRect(hwnd, &mut wr);
-                // 存本体的左上角，和老版本存的是同一个东西
+                // 存本体的左上角，和老版本存的是同一个东西。拖到一半出了屏幕就先挪回来，
+                // 否则存下的位置下次一打开就有几格点不到（AI 格在最右边，最先出界）。
                 let g = glow_pad();
-                crate::state::write_pos(wr.left + g, wr.top + g);
+                let (x, y) = fit_on_screen(wr.left + g, wr.top + g);
+                if (x, y) != (wr.left + g, wr.top + g) {
+                    let (w, h) = outer_size();
+                    MoveWindow(hwnd, x - g, y - g, w, h, 0);
+                }
+                crate::state::write_pos(x, y);
             } else {
                 match pressed {
                     // 品牌标 / 最右格：等同点 ☰（投递到队列，不在这里直接弹）
@@ -4540,6 +4602,49 @@ mod tests {
                 (0x2A, 0x2A, 0x2E),
             );
         }
+    }
+
+    #[test]
+    fn 出界的浮条挪回工作区() {
+        // 用户实测：工作区右边 1910，存的位置 (1776, 983)，浮条本体 275×45
+        let work = RECT {
+            left: 0,
+            top: 0,
+            right: 1910,
+            bottom: 1030,
+        };
+        assert_eq!(
+            clamp_into(&work, 1776, 983, 275, 45),
+            (1635, 983),
+            "右边出界往左挪"
+        );
+        assert_eq!(
+            clamp_into(&work, 1480, 930, 275, 45),
+            (1480, 930),
+            "在屏幕里不动"
+        );
+        assert_eq!(
+            clamp_into(&work, 100, 1020, 275, 45),
+            (100, 985),
+            "压住任务栏往上挪"
+        );
+        assert_eq!(clamp_into(&work, -40, -10, 275, 45), (0, 0), "左上出界");
+        // 副屏在左边（负坐标）：按那块屏的工作区挪，不会被拽到主屏
+        let left = RECT {
+            left: -1920,
+            top: 0,
+            right: 0,
+            bottom: 1040,
+        };
+        assert_eq!(clamp_into(&left, -100, 500, 275, 45), (-275, 500));
+        // 比工作区还宽：贴左
+        let tiny = RECT {
+            left: 10,
+            top: 10,
+            right: 200,
+            bottom: 300,
+        };
+        assert_eq!(clamp_into(&tiny, 50, 50, 275, 45), (10, 50));
     }
 
     #[test]
