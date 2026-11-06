@@ -29,6 +29,7 @@ mod bar;
 mod candwin;
 mod config;
 mod display;
+mod hint;
 mod ipc;
 mod menu;
 mod pinyin;
@@ -173,6 +174,8 @@ struct TextServiceInner {
     cursor: Mutex<usize>,
     /// 待编辑会话执行的动作
     pending: Mutex<Option<EditAction>>,
+    /// 上屏的最后一个词（联想用：和下一下上屏的词配成词对）。
+    last_word: Mutex<Option<String>>,
     /// 上面那个动作是在哪个上下文上请求的编辑会话。`DoEditSession` 必须用同一个，
     /// 否则会话在 A 文档里拿到 `ec`、却拿去读 B 文档的选区（AI 读到空串的原因之一）。
     pending_ctx: Mutex<Option<ITfContext>>,
@@ -207,6 +210,7 @@ impl TextService {
     fn new() -> Self {
         Self {
             inner: TextServiceInner {
+            last_word: Mutex::new(None),
                 thread_mgr: Mutex::new(None),
                 keystroke_mgr: Mutex::new(None),
                 tid: Mutex::new(0),
@@ -645,6 +649,7 @@ impl ITfTextInputProcessor_Impl for TextService_Impl {
             .unwrap_or_else(|p| p.into_inner()) = None;
         *self.inner.cursor.lock().unwrap_or_else(|p| p.into_inner()) = 0;
         candwin::hide();
+        hint::hide();
         self.unadvise_keys();
         Ok(())
     }
@@ -693,6 +698,21 @@ unsafe extern "system" fn cand_click_thunk(ctx: usize, index: usize) {
     unsafe {
         let svc = &*(ctx as *const TextService_Impl);
         let _ = svc.handle_cand_click(index);
+    }
+}
+
+/// 联想条点击的跳板：和候选窗同一套约定（`ctx` 是 TextService 指针）。
+///
+/// # Safety
+/// `ctx` 必须是 `advise_keys` 里存进去的 `TextService_Impl` 指针；联想条只在激活
+/// 期间可见，`unadvise_keys` 会拆掉回调。
+unsafe extern "system" fn hint_click_thunk(ctx: usize, index: usize) {
+    if ctx == 0 {
+        return;
+    }
+    unsafe {
+        let svc = &*(ctx as *const TextService_Impl);
+        let _ = svc.handle_hint_click(index);
     }
 }
 
@@ -760,6 +780,7 @@ impl TextService_Impl {
         // 候选窗点鼠标选词：回调跳板带上自己，窗口过程只要把下标送回来。
         // 只在激活期间有效（`unadvise_keys` 里拆掉）。
         candwin::set_click_handler(cand_click_thunk, self as *const TextService_Impl as usize);
+        hint::set_click_handler(hint_click_thunk, self as *const TextService_Impl as usize);
         // AI 的两个跳板（菜单发起 / 结果写回）。按线程存：TSF 按线程激活，
         // 一个进程里可能有好几条线程各有自己的服务实例。
         let me = self as *const TextService_Impl as usize;
@@ -798,6 +819,7 @@ impl TextService_Impl {
         *self.inner.keystroke_mgr.lock().unwrap() = None;
         *self.inner.thread_mgr.lock().unwrap() = None;
         candwin::clear_click_handler();
+        hint::clear_click_handler();
         ai::clear_service();
     }
 
@@ -805,6 +827,7 @@ impl TextService_Impl {
     fn finish_pick(&self, code_before: &str, action: EditAction) -> BOOL {
         if let EditAction::Commit(word) = &action {
             self.mark_commit(code_before, word);
+            self.note_hint(word);
         }
         if let Some((code, text)) = self.note_pick_for_sentence(code_before, &action) {
             log_line(&format!("learn-sentence code={code} text={text}"));
@@ -818,6 +841,61 @@ impl TextService_Impl {
             self.mark_sentence(&code, &text);
         }
         self.request_edit(action);
+        BOOL(1)
+    }
+
+    /// 上屏一个词之后：和上一个词配成词对，再问引擎"这个词后面常接什么"。
+    ///
+    /// 只有 2~8 个汉字的词才参与（标点、单个字母、英文词都会把"上一个词"清掉，
+    /// 这样 `，` 和空格不会把两句不相干的话接成一条联想）。
+    fn note_hint(&self, word: &str) {
+        let chars = word.chars().count();
+        let ascii = word.chars().all(|c| c.is_ascii());
+        let usable = !ascii && (2..=8).contains(&chars);
+        let prev = {
+            let mut last = self.inner.last_word.lock().unwrap_or_else(|p| p.into_inner());
+            let prev = last.take();
+            if usable {
+                *last = Some(word.to_string());
+            }
+            prev
+        };
+        let Some(prev) = prev else { return };
+        let tips = ipc::pair_and_suggest(&prev, word);
+        if tips.is_empty() {
+            return;
+        }
+        let caret = self
+            .inner
+            .last_pos
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .unwrap_or((0, 0, 0));
+        hint::show(&tips, caret, word);
+    }
+
+    /// 点了联想条里的第 `index` 个词：插进文档，然后接着问它的下一段。
+    fn handle_hint_click(&self, index: usize) -> BOOL {
+        let tips = hint::current();
+        let Some(word) = tips.get(index).cloned() else {
+            return BOOL(0);
+        };
+        let from = hint::source().unwrap_or_default();
+        log_line(&format!("hint: pick #{index} word={word} from={from}"));
+        hint::hide();
+        self.request_edit(EditAction::Insert(word.clone()));
+        // 链式联想：上一段是 from，这一段是 word —— 顺手把这对也学了。
+        let next = ipc::pair_and_suggest(&from, &word);
+        *self.inner.last_word.lock().unwrap_or_else(|p| p.into_inner()) = Some(word.clone());
+        if !next.is_empty() {
+            let caret = self
+                .inner
+                .last_pos
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .unwrap_or((0, 0, 0));
+            hint::show(&next, caret, &word);
+        }
         BOOL(1)
     }
 
@@ -1555,6 +1633,9 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
 
         // 光标不在可编辑区域时一个键都不认领，否则会在没有光标的地方冒出候选窗
         let composable = self.can_compose(pic.as_ref());
+
+        // 只要开始按键，联想条就收起来（它只在"刚上屏、还没接着写"那一小段有用）
+        hint::hide();
 
         // 存下输入上下文，编辑会话要用
         self.store_context(pic);

@@ -44,13 +44,14 @@ inklink/
 │  ├─ src/state.rs       全局状态（注册表 HKCU\Software\inklink\State：中英、中文标点；UI 位置）
 │  ├─ src/config.rs      可调配置（HKCU\Software\inklink\Config：暗色/列数/行数/撤回窗口/学习开关）
 │  ├─ src/ai.rs          AI 的界面侧（P4b）：动作/任务记账/线程局部服务指针，读选区与写回在 lib.rs
+│  ├─ src/hint.rs       联想条（上屏一个词后给"后面常接什么"，点击即插入并接着联想）
 │  ├─ src/bar.rs         浮条（宿主进程内自绘，窗口类 inklink-bar；Activate→show、Deactivate→hide）
 │  ├─ src/menu.rs        自绘 ☰ 菜单（不用 TrackPopupMenu，见 ADR-0008）
 │  └─ build.rs           把 VERSION 编进 DLL
 ├─ ui/                   【已退役，源码留作回退】旧独立浮条进程（1.1.10 起不构建/不部署/不自启，见 ADR-0008）
 ├─ settings/             设置窗 inklink-settings.exe（P2a：一页原生小窗；P4b 加了 AI 三项，只改 HKCU\Software\inklink\Config）
 ├─ rime-server/          C++ 引擎服务（链 librime，x86）
-│  ├─ rime-server.cc     协议 [u8 type] + 查询/选词；个人词库学习层 + 英文前缀补全 + --selftest
+│  ├─ rime-server.cc     协议 [u8 type] + 查询/选词/联想；个人词库学习 + 英文补全 + 词对记忆 + --selftest
 │  └─ en-words.txt       英文补全词表（4 万词，按词频排序；引擎按 exe 同目录找它）
 ├─ rime-config/          引擎侧配置源
 │  └─ fuzzy.yaml         模糊音七组开关（默认全关）
@@ -122,7 +123,7 @@ cargo build --release --lib --target i686-pc-windows-msvc --target-dir target-st
 引擎是 C++（`rime-server/rime-server.cc`），编译命令写在文件头注释里，需要 32 位 MSVC 环境
 （`vcvars32.bat`）；日常改 DLL 不需要动它。
 
-引擎侧还有一份可单测的纯逻辑：`rime-server.exe --selftest` 跑 63 项断言
+引擎侧还有一份可单测的纯逻辑：`rime-server.exe --selftest` 跑 71 项断言
 （`utf8_char_count` / `strip_separators` / `normalize_boundaries` / `split_lengths` / `learn_key` /
 `should_learn` / `boost_score` / `prune_single_chars`），纯 ASCII 输出，
 不初始化 librime、不碰管道，改学习逻辑后先跑它。

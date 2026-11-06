@@ -968,6 +968,144 @@ static std::vector<std::string> english_completions(const std::string& typed, si
     return out;
 }
 
+// ───────────────────── 联想（词接词）─────────────────────
+// 用户连着打「健全」「考核」「激励体系」，这里记 (健全 → 考核, 3)、(考核 → 激励体系, 2)。
+// 下次上屏「健全」就把「考核」递过去 —— 个人输入法里最有感知的一块（2026-11-06 用户提的）。
+//
+// 只记**词对**，不记句子、不记段落：句子在磁盘上就是隐私，词对没有上下文也能看出。
+// 文件在 %LOCALAPPDATA%\inklink\phrase-pairs.tsv，和用户词库同一个目录。
+static std::map<std::string, std::map<std::string, int>> g_pairs;   // 前词 -> 后词 -> 次数
+static std::string g_pairs_path;
+static std::mutex g_pairs_mutex;
+static bool g_pairs_dirty = false;
+
+static const size_t PAIR_MIN_CHARS = 2;
+static const size_t PAIR_MAX_CHARS = 8;
+static const size_t PAIR_MAX_PREV = 3000;   // 最多记多少个"前词"，超了丢最弱的
+static const int PAIR_COUNT_CAP = 99;
+
+/// 和用户词库同目录的 `phrase-pairs.tsv`。
+static std::string pairs_path() {
+    std::string user = user_dict_path();
+    size_t slash = user.find_last_of("\\/");
+    std::string dir = (slash == std::string::npos) ? std::string() : user.substr(0, slash + 1);
+    return dir + "phrase-pairs.tsv";
+}
+
+/// 这一对值不值得记：两边都是 2~8 个汉字、不是纯英文、不是同一个词。
+///
+/// 单字不记（`了` 后面接什么太发散，记了也是噪音）；超过 8 个字多半是整句，
+/// 那更像"语料"而不是"联想"，留给 M2。
+static bool pair_ok(const std::string& prev, const std::string& cur) {
+    if (prev.empty() || cur.empty()) return false;
+    if (prev == cur) return false;
+    if (ascii_only(prev) || ascii_only(cur)) return false;
+    size_t pc = utf8_char_count(prev);
+    size_t cc = utf8_char_count(cur);
+    return pc >= PAIR_MIN_CHARS && pc <= PAIR_MAX_CHARS && cc >= PAIR_MIN_CHARS &&
+           cc <= PAIR_MAX_CHARS;
+}
+
+/// 从"后词 -> 次数"的表里取前 `limit` 个（次数多的在前，同次数按字的顺序，稳定）。纯函数。
+static std::vector<std::string> top_next(const std::map<std::string, int>& m, size_t limit) {
+    std::vector<std::pair<int, std::string>> all;
+    all.reserve(m.size());
+    for (const auto& kv : m) all.emplace_back(kv.second, kv.first);
+    std::sort(all.begin(), all.end(), [](const auto& a, const auto& b) {
+        if (a.first != b.first) return a.first > b.first;
+        return a.second < b.second;
+    });
+    std::vector<std::string> out;
+    for (const auto& kv : all) {
+        if (out.size() >= limit) break;
+        out.push_back(kv.second);
+    }
+    return out;
+}
+
+static void save_pairs() {
+    if (g_pairs_path.empty()) return;
+    std::string tmp = g_pairs_path + ".tmp";
+    FILE* f = fopen(tmp.c_str(), "wb");
+    if (!f) return;
+    for (const auto& kv : g_pairs) {
+        for (const auto& n : kv.second) {
+            fprintf(f, "%s\t%s\t%d\n", kv.first.c_str(), n.first.c_str(), n.second);
+        }
+    }
+    fclose(f);
+    // 先写临时文件再换，断电不会留下半个词库（和用户词库同一套做法）
+    MoveFileExA(tmp.c_str(), g_pairs_path.c_str(), MOVEFILE_REPLACE_EXISTING);
+    g_pairs_dirty = false;
+}
+
+static void load_pairs() {
+    g_pairs_path = pairs_path();
+    FILE* f = fopen(g_pairs_path.c_str(), "rb");
+    if (!f) {
+        logf("pairs: %s not found (first run)", g_pairs_path.c_str());
+        return;
+    }
+    char line[512];
+    size_t n = 0;
+    while (fgets(line, sizeof(line), f)) {
+        std::string s(line);
+        while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) s.pop_back();
+        size_t a = s.find('\t');
+        if (a == std::string::npos) continue;
+        size_t b = s.find('\t', a + 1);
+        if (b == std::string::npos) continue;
+        std::string prev = s.substr(0, a);
+        std::string cur = s.substr(a + 1, b - a - 1);
+        int count = atoi(s.c_str() + b + 1);
+        if (!pair_ok(prev, cur) || count <= 0) continue;
+        g_pairs[prev][cur] = (std::min)(count, PAIR_COUNT_CAP);
+        n++;
+    }
+    fclose(f);
+    logf("pairs: %zu loaded", n);
+}
+
+/// 超了上限就丢一个最弱的"前词"（按它所有后词的次数和算）。
+static void prune_pairs() {
+    while (g_pairs.size() > PAIR_MAX_PREV) {
+        auto weakest = g_pairs.begin();
+        long long weakest_score = -1;
+        for (auto it = g_pairs.begin(); it != g_pairs.end(); ++it) {
+            long long score = 0;
+            for (const auto& kv : it->second) score += kv.second;
+            if (weakest_score < 0 || score < weakest_score) {
+                weakest_score = score;
+                weakest = it;
+            }
+        }
+        g_pairs.erase(weakest);
+        g_pairs_dirty = true;
+    }
+}
+
+/// 记一次"上一个词后面接了 cur"。
+static void learn_pair(const std::string& prev, const std::string& cur) {
+    if (!pair_ok(prev, cur)) return;
+    std::lock_guard<std::mutex> lock(g_pairs_mutex);
+    int& c = g_pairs[prev][cur];
+    if (c >= PAIR_COUNT_CAP) return;
+    c++;
+    g_pairs_dirty = true;
+    prune_pairs();
+    save_pairs();
+    logf("pair %s -> %s (%d)", prev.c_str(), cur.c_str(), c);
+}
+
+/// 上屏 `word` 之后能接什么（最多 3 个）。
+static std::vector<std::string> next_words(const std::string& word, size_t limit) {
+    if (word.empty()) return {};
+    std::lock_guard<std::mutex> lock(g_pairs_mutex);
+    auto it = g_pairs.find(word);
+    if (it == g_pairs.end()) return {};
+    return top_next(it->second, limit);
+}
+
 // ───────────────────────── 查询 ─────────────────────────
 static const int MAX_CANDS = 50;
 
@@ -1741,6 +1879,22 @@ static void serve_client(HANDLE p) {
         return;
     }
 
+    if (type == 9) {
+        // 联想（协议 v9）：[u16 prev_len][prev][u16 cur_len][cur]
+        //   prev 为空 = 只问不学；返回格式和查询一样（[u32 count] + 候选）。
+        uint16_t plen = 0;
+        if (!read_exact(p, &plen, 2)) return;
+        std::string prev(plen, '\0');
+        if (plen && !read_exact(p, &prev[0], plen)) return;
+        uint16_t clen = 0;
+        if (!read_exact(p, &clen, 2)) return;
+        std::string cur(clen, '\0');
+        if (clen && !read_exact(p, &cur[0], clen)) return;
+        if (!prev.empty()) learn_pair(prev, cur);
+        write_response(p, next_words(cur, 3));
+        return;
+    }
+
     if (type == 3) {
         // 撤回学习（协议 v4）：[u32 code_len][code][u16 word_len][word]
         // DLL 发现"上屏后立刻被删掉"就发这个，把刚才那次学习扣回去。
@@ -1955,6 +2109,21 @@ static int run_selftest() {
         ck(match_case("git", "github") == "github", "match_case: 小写原样");
     }
 
+    // 联想（1.1.52）：什么样的词对值得记、取前几个、同次数怎么排
+    {
+        ck(pair_ok("健全", "考核"), "pair_ok: two 2-char words ok");
+        ck(!pair_ok("健", "考核"), "pair_ok: single char prev rejected");
+        ck(!pair_ok("健全", "一二三四五六七八九"), "pair_ok: too long rejected");
+        ck(!pair_ok("code", "考核"), "pair_ok: ascii rejected");
+        ck(!pair_ok("健全", "健全"), "pair_ok: same word rejected");
+        std::map<std::string, int> m = {{"考核", 3}, {"考查", 1}, {"考核体系", 3}};
+        std::vector<std::string> t = top_next(m, 2);
+        ck(t.size() == 2, "top_next: respects limit");
+        ck(t.size() == 2 && t[0] == "考核" && t[1] == "考核体系",
+           "top_next: count desc, then stable by text");
+        ck(top_next(m, 9).size() == 3, "top_next: all when limit bigger");
+    }
+
     if (fails == 0) {
         printf("\nall %d checks passed\n", total);
     } else {
@@ -1978,6 +2147,7 @@ int main(int argc, char** argv) {
     g_user_path = user_dict_path();
     load_user();
     load_en_words();
+    load_pairs();
 
     // 词库巡检命令（不需要 librime、不连管道，可以在引擎运行时跑）
     for (int i = 1; i < argc; i++) {

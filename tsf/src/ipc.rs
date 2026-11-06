@@ -434,6 +434,58 @@ pub fn unlearn(code: &str, word: &str) {
     }
 }
 
+/// 联想：告诉引擎"上一个词后面接了 `cur`"，同时问它 `cur` 后面常接什么。
+///
+/// 协议 v9：`[u8 9][u16 prev_len][prev][u16 cur_len][cur]`，
+/// 响应和查询一样：`[u32 count]` + count * `[u16 len][UTF-8]`。
+///
+/// `prev` 为空 = 只问不学（点联想条之后接着问下一段时用）。
+/// 一次往返同时完成"学一对"和"问下一串"，上屏路径上只多 1~2ms。
+pub fn pair_and_suggest(prev: &str, cur: &str) -> Vec<String> {
+    if cur.is_empty() {
+        return Vec::new();
+    }
+    // SAFETY: 句柄在本函数内配对关闭；读写都带超时
+    unsafe {
+        let Some(pipe) = open_pipe(QUERY_TIMEOUT_MS) else {
+            return Vec::new();
+        };
+        let pb = prev.as_bytes();
+        let cb = cur.as_bytes();
+        let mut req = Vec::with_capacity(5 + pb.len() + cb.len());
+        req.push(9u8);
+        req.extend_from_slice(&(pb.len() as u16).to_le_bytes());
+        req.extend_from_slice(pb);
+        req.extend_from_slice(&(cb.len() as u16).to_le_bytes());
+        req.extend_from_slice(cb);
+        write_all(pipe, &req);
+
+        let mut len_buf = [0u8; 4];
+        if !read_exact_timeout(pipe, &mut len_buf, QUERY_TIMEOUT_MS) {
+            let _ = CloseHandle(pipe);
+            return Vec::new();
+        }
+        let count = u32::from_le_bytes(len_buf) as usize;
+        let mut out = Vec::with_capacity(count.min(8));
+        for _ in 0..count {
+            let mut l2 = [0u8; 2];
+            if !read_exact_timeout(pipe, &mut l2, QUERY_TIMEOUT_MS) {
+                break;
+            }
+            let len = u16::from_le_bytes(l2) as usize;
+            let mut buf = vec![0u8; len];
+            if !read_exact_timeout(pipe, &mut buf, QUERY_TIMEOUT_MS) {
+                break;
+            }
+            if let Ok(s) = String::from_utf8(buf) {
+                out.push(s);
+            }
+        }
+        let _ = CloseHandle(pipe);
+        out
+    }
+}
+
 /// 协议 6 的报文：发起一次 AI 请求。
 ///
 /// `[u8 6][u32 seq][u32 hwnd][u8 action][u16 len][text]`
