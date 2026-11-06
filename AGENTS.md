@@ -122,7 +122,7 @@ cargo build --release --lib --target i686-pc-windows-msvc --target-dir target-st
 引擎是 C++（`rime-server/rime-server.cc`），编译命令写在文件头注释里，需要 32 位 MSVC 环境
 （`vcvars32.bat`）；日常改 DLL 不需要动它。
 
-引擎侧还有一份可单测的纯逻辑：`rime-server.exe --selftest` 跑 61 项断言
+引擎侧还有一份可单测的纯逻辑：`rime-server.exe --selftest` 跑 63 项断言
 （`utf8_char_count` / `strip_separators` / `normalize_boundaries` / `split_lengths` / `learn_key` /
 `should_learn` / `boost_score` / `prune_single_chars`），纯 ASCII 输出，
 不初始化 librime、不碰管道，改学习逻辑后先跑它。

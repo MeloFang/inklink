@@ -121,11 +121,11 @@ static std::mutex g_user_mutex;
 static const int USER_COUNT_CAP = 999;
 /// 最多记多少个"拼音串"（每个串下词数不限）。超了就丢最弱的。
 static const size_t USER_MAX_CODES = 4000;
-/// 少于这么多字的词不学。
+/// 少于这么多字的词不学（**长码**上不学，短码例外，见 should_learn）。
 ///
 /// 单字本来就该由语言模型的整体概率排序，学一份"用户在这个码上选过这个字"
-/// 反而会跟模型打架：实测跑两天就攒出 `de -> 的`、`zai -> 在`、`ge -> 个`
-/// 这类十几条纯噪音，`zai` 那条还会把「在」顶到「再」前面。
+/// 反而会跟模型打架。但短码（`l`、`de`）不一样：码本身就是那个字，模型在几百个
+/// 同首字母的字里按词频猜，用户选一百次也记不住（2026-11-06："打 l 总是出来来"）。
 static const size_t USER_MIN_CHARS = 2;
 
 /// UTF-8 字符数（汉字算 1 个）。候选词长度要用它判断"选了几个字"。
@@ -648,7 +648,16 @@ static std::string learn_key(const std::string& raw_code, const std::string& wor
 static bool should_learn(const std::string& raw_code, const std::string& word) {
     if (word.empty()) return false;
     if (word == strip_separators(raw_code)) return false;
-    if (utf8_char_count(word) < USER_MIN_CHARS) return false;
+    // 单字：只在**码很短**的时候学。
+    //
+    // 打 `l` 想要「了」、打 `de` 想要「的」——这种短码本身就是一个字，模型却在所有
+    // l*/d* 里按词频猜（`l` 给的是 来/里/老/啦/了…，「了」排第五），用户选一百次
+    // 也记不住。2026-11-06 用户报"打 l 总是出来来"。
+    //
+    // 长码不学：`xiangmu` 里选「项」是分词副产品，学了只会跟语言模型打架。
+    if (utf8_char_count(word) < USER_MIN_CHARS && strip_separators(raw_code).size() > 2) {
+        return false;
+    }
     return true;
 }
 
@@ -1826,7 +1835,9 @@ static int run_selftest() {
     ck(learn_key("zhemge", "这个") == "zhemge", "learn_key: mistyped code kept as-is");
     ck(learn_key("x", "西") == "x", "learn_key: single letter");
 
-    ck(!should_learn("de", "的"), "should_learn: single char is not learned");
+    ck(should_learn("l", "了"), "should_learn: single char on a short code is learned");
+    ck(should_learn("de", "的"), "should_learn: single char on a 2-letter code is learned");
+    ck(!should_learn("xiangmu", "项"), "should_learn: single char on a long code is not learned");
     ck(!should_learn("github", "github"), "should_learn: english commit is not learned");
     ck(should_learn("xiangmu", "项目"), "should_learn: normal word is learned");
     ck(should_learn("pikeqiu", "皮克"), "should_learn: two chars is enough");
