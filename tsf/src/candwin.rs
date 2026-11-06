@@ -28,7 +28,7 @@ use windows_sys::Win32::System::Threading::GetCurrentProcessId;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, GetClientRect, GetForegroundWindow,
     GetWindowThreadProcessId, IsWindowVisible, MA_NOACTIVATE, RegisterClassW, SW_HIDE,
-    SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOZORDER, SetWindowPos, ShowWindow, WM_ERASEBKGND,
+    HWND_TOPMOST, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SetWindowPos, ShowWindow, WM_ERASEBKGND,
     WM_LBUTTONDOWN, WM_MOUSEACTIVATE, WM_PAINT, WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
     WS_EX_TOPMOST, WS_POPUP, WindowFromPoint,
 };
@@ -65,14 +65,14 @@ pub fn clear_click_handler() {
 
 const CLASS_NAME: &str = "inklink-candidate";
 
-/// 内边距
-const PAD: i32 = 14;
+/// 内边距（2026-11-06：14 -> 10，用户报"间距太大占屏幕"）
+const PAD: i32 = 10;
 /// 拼音行高
-const PINYIN_H: i32 = 24;
-/// 候选行高
-const ROW_H: i32 = 34;
-/// 单元格最小宽度
-const MIN_CELL_W: i32 = 96;
+const PINYIN_H: i32 = 22;
+/// 候选行高（34 -> 30，同上）
+const ROW_H: i32 = 30;
+/// 单元格最小宽度（96 -> 76：两个字一格的候选不再留出半格空白）
+const MIN_CELL_W: i32 = 76;
 /// 圆角半径
 const CORNER_RADIUS: i32 = 8;
 
@@ -168,14 +168,18 @@ pub fn show(
 
         let (w, h) = window_size(candidates, layout.cols);
         let (x, y) = place(caret, w, h);
+        // HWND_TOPMOST 而不是 SWP_NOZORDER：窗口虽然是 TOPMOST 建的，但宿主自己的
+        // 浮层（WPS 的 AI 面板、Office 的任务窗格）也是 TOPMOST 而且比我们后建，
+        // 光"保持原样"会被它们压在下面 —— 用户打字时看不见候选（2026-11-06 实测）。
+        // SWP_NOACTIVATE 保证抢层级不抢焦点，组合串不会断。
         SetWindowPos(
             hwnd as HWND,
-            std::ptr::null_mut(),
+            HWND_TOPMOST,
             x,
             y,
             w,
             h,
-            SWP_NOZORDER | SWP_NOACTIVATE,
+            SWP_NOACTIVATE,
         );
         // 圆角：用区域把窗口裁成圆角矩形
         let region = CreateRoundRectRgn(0, 0, w + 1, h + 1, CORNER_RADIUS, CORNER_RADIUS);
@@ -307,11 +311,14 @@ pub fn hide() {
 
 /// 计算窗口尺寸：列宽取最长候选，行数按候选数。
 fn window_size(candidates: &[String], cols: usize) -> (i32, i32) {
+    let cols = cols.max(1);
     let rows = candidates.len().div_ceil(cols).max(1) as i32;
-    let cell_w = cell_width(candidates);
-    let w = cell_w * cols as i32 + PAD * 2;
+    // 实际用到的列数：一页只剩 2 个候选时，窗口不该还按 5 个格子撑开
+    let used_cols = candidates.len().clamp(1, cols);
+    let widths = col_widths(candidates, cols);
+    let w = widths.iter().take(used_cols).sum::<i32>() + PAD * 2;
     let h = PINYIN_H + rows * ROW_H + PAD * 2;
-    (w.max(220), h)
+    (w.max(180), h)
 }
 
 /// 窗口内坐标 → 候选下标（点在拼音行或空白处返回 None）。
@@ -323,13 +330,24 @@ fn hit_index(x: i32, y: i32, candidates: &[String], cols: usize) -> Option<usize
     if y < grid_top {
         return None;
     }
-    let cell_w = cell_width(candidates);
-    let col = (x - PAD) / cell_w;
+    let cols = cols.max(1);
+    // 逐列宽度：从左往右量过去，落在哪一列就是哪一列
+    let widths = col_widths(candidates, cols);
+    let mut col = None;
+    let mut left = PAD;
+    for (i, w) in widths.iter().enumerate() {
+        if x >= left && x < left + w {
+            col = Some(i);
+            break;
+        }
+        left += w;
+    }
+    let col = col?;
     let row = (y - grid_top) / ROW_H;
-    if col < 0 || col >= cols as i32 || row < 0 {
+    if row < 0 {
         return None;
     }
-    let idx = row as usize * cols + col as usize;
+    let idx = row as usize * cols + col;
     if idx < candidates.len() {
         Some(idx)
     } else {
@@ -337,26 +355,34 @@ fn hit_index(x: i32, y: i32, candidates: &[String], cols: usize) -> Option<usize
     }
 }
 
-fn cell_width(candidates: &[String]) -> i32 {
+fn col_widths(candidates: &[String], cols: usize) -> Vec<i32> {
+    let cols = cols.max(1);
+    let mut w = vec![MIN_CELL_W; cols];
     unsafe {
         let hdc = GetDC(std::ptr::null_mut());
         if hdc.is_null() {
-            return MIN_CELL_W;
+            return w;
         }
         let font = get_font(&FONT_CAND, 17);
         let old = SelectObject(hdc, font);
-        let mut max_w = MIN_CELL_W;
-        for c in candidates {
-            let text = format!("1.{c}");
+        for (i, c) in candidates.iter().enumerate() {
+            let col = i % cols;
+            // 序号只画在选中行，但宽度按最长的那个算，免得选另一行时文字被挤
+            let text = format!("{}.{c}", col + 1);
             let wide: Vec<u16> = text.encode_utf16().collect();
             let mut size = SIZE { cx: 0, cy: 0 };
             GetTextExtentPoint32W(hdc, wide.as_ptr(), wide.len() as i32, &mut size);
-            max_w = max_w.max(size.cx + 18);
+            w[col] = w[col].max(size.cx + 14);
         }
         SelectObject(hdc, old);
         ReleaseDC(std::ptr::null_mut(), hdc);
-        max_w
     }
+    w
+}
+
+/// 第 `col` 列的左边界（窗口坐标，已含 PAD）。
+fn col_x(widths: &[i32], col: usize) -> i32 {
+    PAD + widths.iter().take(col).sum::<i32>()
 }
 
 /// 注册窗口类（幂等）。
@@ -486,7 +512,7 @@ unsafe fn paint_frame(hdc: windows_sys::Win32::Graphics::Gdi::HDC, client: &RECT
     // 候选网格（大号字，选中项用强调色）
     SelectObject(hdc, cand_font);
     let cands = CANDIDATES.lock().unwrap_or_else(|p| p.into_inner()).clone();
-    let cell_w = cell_width(&cands);
+    let widths = col_widths(&cands, cols);
     let sel = SELECTED.load(Ordering::SeqCst);
     // 只给「选中项所在的那一行」标数字 1~N。
     //
@@ -495,9 +521,9 @@ unsafe fn paint_frame(hdc: windows_sys::Win32::Graphics::Gdi::HDC, client: &RECT
     // 现在一行一标，上下换行、左右/数字选行内。
     let sel_row = sel / cols;
     for (i, c) in cands.iter().enumerate() {
-        let col = (i % cols) as i32;
+        let col = i % cols;
         let row = (i / cols) as i32;
-        let x = PAD + col * cell_w;
+        let x = col_x(&widths, col);
         let y = PAD + PINYIN_H + row * ROW_H;
         if i / cols == sel_row {
             let color = if i == sel { pal.sel } else { pal.num };
@@ -741,7 +767,7 @@ mod tests {
             Some(0)
         );
         // 第一行第三个
-        let cw = cell_width(&cands);
+        let cw = col_widths(&cands, cols)[0];
         assert_eq!(
             hit_index(PAD + cw * 2 + 3, PAD + PINYIN_H + 5, &cands, cols),
             Some(2)
@@ -762,7 +788,7 @@ mod tests {
     #[test]
     fn 列数变化后命中测试跟着走() {
         let cands: Vec<String> = (0..7).map(|i| format!("词{i}")).collect();
-        let cw = cell_width(&cands);
+        let cw = col_widths(&cands, 3)[0];
         // 3 列时，第 4 个候选在第 2 行第 1 格
         assert_eq!(
             hit_index(PAD + 3, PAD + PINYIN_H + ROW_H + 5, &cands, 3),
