@@ -27,8 +27,8 @@ use windows_sys::Win32::Graphics::Gdi::{
 use windows_sys::Win32::System::Threading::GetCurrentProcessId;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, GetClientRect, GetForegroundWindow,
-    GetWindowThreadProcessId, IsWindowVisible, MA_NOACTIVATE, RegisterClassW, SW_HIDE,
-    HWND_TOPMOST, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SetWindowPos, ShowWindow, WM_ERASEBKGND,
+    GetWindowThreadProcessId, HWND_TOPMOST, IsWindowVisible, MA_NOACTIVATE, RegisterClassW,
+    SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SetWindowPos, ShowWindow, WM_ERASEBKGND,
     WM_LBUTTONDOWN, WM_MOUSEACTIVATE, WM_PAINT, WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
     WS_EX_TOPMOST, WS_POPUP, WindowFromPoint,
 };
@@ -172,15 +172,7 @@ pub fn show(
         // 浮层（WPS 的 AI 面板、Office 的任务窗格）也是 TOPMOST 而且比我们后建，
         // 光"保持原样"会被它们压在下面 —— 用户打字时看不见候选（2026-11-06 实测）。
         // SWP_NOACTIVATE 保证抢层级不抢焦点，组合串不会断。
-        SetWindowPos(
-            hwnd as HWND,
-            HWND_TOPMOST,
-            x,
-            y,
-            w,
-            h,
-            SWP_NOACTIVATE,
-        );
+        SetWindowPos(hwnd as HWND, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE);
         // 圆角：用区域把窗口裁成圆角矩形
         let region = CreateRoundRectRgn(0, 0, w + 1, h + 1, CORNER_RADIUS, CORNER_RADIUS);
         SetWindowRgn(hwnd as HWND, region, 1);

@@ -661,7 +661,10 @@ pub fn set_too_long_pasted(chars: usize, max: usize) {
         s.phase = Phase::TooLong;
         s.source.clear();
         s.result.clear();
-        s.note = Some((false, format!("{chars} 字，一次最多 {max} 字。换短一点的一段。")));
+        s.note = Some((
+            false,
+            format!("{chars} 字，一次最多 {max} 字。换短一点的一段。"),
+        ));
         true
     });
 }
@@ -1398,7 +1401,14 @@ fn paint_panel(c: &mut Canvas, m: i32, dark: bool, hover: Hit, snap: Snap) {
                 &solid(if hot { pal.hover } else { pal.field_border }),
             );
         }
-        text(hdc, &r, "粘贴", if hot { pal.text } else { pal.dim }, fonts.small, line | DT_CENTER);
+        text(
+            hdc,
+            &r,
+            "粘贴",
+            if hot { pal.text } else { pal.dim },
+            fonts.small,
+            line | DT_CENTER,
+        );
     }
 
     if !in_result {
