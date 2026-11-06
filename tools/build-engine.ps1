@@ -70,6 +70,14 @@ if ($Dest) {
     New-Item -ItemType Directory -Force $Dest | Out-Null
     Copy-Item $exe (Join-Path $Dest 'rime-server.exe') -Force
     Write-Host "  -> $(Join-Path $Dest 'rime-server.exe')" -ForegroundColor Green
+    # 英文补全词表（1.1.46）：引擎按 exe 同目录找 en-words.txt，漏了就是"打 gith 不补 github"
+    $words = Join-Path $src 'en-words.txt'
+    if (Test-Path $words) {
+        Copy-Item $words (Join-Path $Dest 'en-words.txt') -Force
+        Write-Host "  -> $(Join-Path $Dest 'en-words.txt')" -ForegroundColor Green
+    } else {
+        Write-Host '  警告：没有 en-words.txt，英文补全不可用' -ForegroundColor Yellow
+    }
 }
 
 Remove-Item (Join-Path $src '*.obj') -Force -ErrorAction SilentlyContinue

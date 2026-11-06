@@ -50,7 +50,8 @@ inklink/
 ├─ ui/                   【已退役，源码留作回退】旧独立浮条进程（1.1.10 起不构建/不部署/不自启，见 ADR-0008）
 ├─ settings/             设置窗 inklink-settings.exe（P2a：一页原生小窗；P4b 加了 AI 三项，只改 HKCU\Software\inklink\Config）
 ├─ rime-server/          C++ 引擎服务（链 librime，x86）
-│  └─ rime-server.cc     协议 [u8 type] + 查询/选词；个人词库学习层 + --selftest
+│  ├─ rime-server.cc     协议 [u8 type] + 查询/选词；个人词库学习层 + 英文前缀补全 + --selftest
+│  └─ en-words.txt       英文补全词表（4 万词，按词频排序；引擎按 exe 同目录找它）
 ├─ rime-config/          引擎侧配置源
 │  └─ fuzzy.yaml         模糊音七组开关（默认全关）
 ├─ installer/            安装/卸载脚本模板（版本号由打包脚本注入）
@@ -121,7 +122,7 @@ cargo build --release --lib --target i686-pc-windows-msvc --target-dir target-st
 引擎是 C++（`rime-server/rime-server.cc`），编译命令写在文件头注释里，需要 32 位 MSVC 环境
 （`vcvars32.bat`）；日常改 DLL 不需要动它。
 
-引擎侧还有一份可单测的纯逻辑：`rime-server.exe --selftest` 跑 52 项断言
+引擎侧还有一份可单测的纯逻辑：`rime-server.exe --selftest` 跑 61 项断言
 （`utf8_char_count` / `strip_separators` / `normalize_boundaries` / `split_lengths` / `learn_key` /
 `should_learn` / `boost_score` / `prune_single_chars`），纯 ASCII 输出，
 不初始化 librime、不碰管道，改学习逻辑后先跑它。

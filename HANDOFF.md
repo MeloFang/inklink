@@ -651,7 +651,9 @@ powershell -ExecutionPolicy Bypass -File tools\probe-ai.ps1 -Action 0 -Text hell
 
 ### 打包踩到的两个真 bug（1.1.37 的包受影响）
 
-1. `release.ps1` 把 `$ENGime\data` 拷到 `$filesime` 时，目标目录不存在会把 **data 的内容
+1. `release.ps1` 把 `$ENG
+ime\data` 拷到 `$files
+ime` 时，目标目录不存在会把 **data 的内容
    拍平**到 `rime\` 下；安装脚本按 `rime\data` 找，静默跳过 → 装完**没有词库，一个候选都没有**。
 2. `install.ps1` 从来没拷 `inklink-settings.exe`（浮条菜单的「设置…」点了没反应）。
    两处都已修，并补了自检项（rime 数据 / 设置窗）。
@@ -712,6 +714,32 @@ librime 对纯字母会返回满 50 个中文，而"追加原始英文"那段被
 
 **还欠真机手测**：Kiro/记事本里上屏后退格一次删一个字；面板在文档里选字能实时出现；彩光转动；
 `wangjia` 翻到「佳」以外的单字。
+### 1.1.46：英文联想补全（2026-11-06）
+
+打完 `gith` 想要 `github`，之前只有"原样上屏"。librime 只认拼音，英文词塞进 rime 词典
+也只会被当拼音码（ADR-0009 同一个结论），所以自带一份词表在引擎里做前缀补全。
+
+- 词表 `rime-server/en-words.txt`：4 万词，一行一个、越靠前越常用。来自 Norvig 的
+  `count_1w`（Google Web 语料，取前 4 万），再补 ~96 个技术词（github / vscode /
+  javascript / kubernetes / ollama / obsidian…）插在第 5000 名附近——排名只在同前缀的
+  候选之间比较，插中间是让 `jav` 能先给 java/javascript 而不是被生僻词挤掉。
+- 引擎启动时读进内存（40k 词约 300 KB，加载 <10ms），按词排序后二分找前缀区间，
+  再按词频名次取前 6 个；`--selftest` 用假词表验（61 项断言）。
+- 只在"看着就是英文"时补：纯字母、无分词边界、原样候选排在第一屏（`pos <= 1`）。
+  像拼音的 `shi`/`code` 一个英文词都不塞，`xiangmu` 这类多音节输入完全不受影响。
+- 补全占的是第一屏的位置，候选已经满 50 个时挤掉最后一个（最不常用的中文）腾位。
+- 大小写跟随输入：`Git` → `Github`，`GIT` → `GITHUB`。
+- 选中补全就是普通候选：`learn()` 照常记账，下次同一个前缀它排更前。
+
+实测（WPS + 记事本，走管道查的同一份引擎）：`gith` → github / gitee / githubcom，
+`git` → git / gitattributes / gitee / github / gitignore / gitlab，`ol` → old / older /
+oldest / ollama / olympic，`jav` → java / javascript / javadoc / javac；
+`shi` / `xiangmu` / `nimabi` 的候选一个字没变。
+
+打包链路：`build-engine.ps1 -Dest` 顺带拷词表，`release.ps1` 把它归到 `eng/`，
+`install.ps1` 装到 `C:\inklink-engine\en-words.txt` 并加进自检。漏了不会崩，只是没有补全
+（引擎日志 `en words: ... not found`）。
+
 ### 还没做的（留给 P6 / M3）
 
 - 结果写进文档后**不能撤回**（它不属于组合串，`UndoMs` 那套管不到）。

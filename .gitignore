@@ -57,6 +57,9 @@ Thumbs.db
 /rime-server/*.out
 /rime-server/*.err
 /rime-server/*.txt
+# 例外：英文补全词表是**构建输入**（4 万词、按词频排序），必须入库 ——
+# 让 CI 下载会让打出来的包和本地验证过的不是同一份词表（同 data/upstream/ice 的理由）。
+!/rime-server/en-words.txt
 
 # 安装包产物（二进制与 zip 不进 git；脚本与说明保留）
 /dist/

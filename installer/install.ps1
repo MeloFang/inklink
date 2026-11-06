@@ -70,6 +70,8 @@ if (Test-Path "$SRC\inklink.ico") { Install-File "$SRC\inklink.ico" "$PF\inklink
 if (Test-Path "$SRC\inklink-badge.ico") { Install-File "$SRC\inklink-badge.ico" "$PF\inklink-badge.ico" | Out-Null }
 Install-File "$SRC\rime-server.exe" "$ENG\rime-server.exe" | Out-Null
 Install-File "$SRC\rime.dll"        "$ENG\rime.dll"        | Out-Null
+# 英文补全词表（1.1.46）：引擎按 exe 同目录找它，漏了就是"打 gith 不补 github"
+if (Test-Path "$SRC\en-words.txt") { Install-File "$SRC\en-words.txt" "$ENG\en-words.txt" | Out-Null }
 # 设置窗（P2a/P4b）：浮条 ☰ 的「设置…」按 DLL 同目录找它。漏装的话菜单点了没反应。
 if (Test-Path "$SRC\inklink-settings.exe") { Install-File "$SRC\inklink-settings.exe" "$PF\inklink-settings.exe" | Out-Null }
 
@@ -179,6 +181,7 @@ $checks = @(
     @{ Name = '引擎 exe';   Ok = (Test-Path "$ENG\rime-server.exe") },
     @{ Name = 'rime.dll';   Ok = (Test-Path "$ENG\rime.dll") },
     @{ Name = 'rime 数据'; Ok = (Test-Path "$ENG\rime\data\default.yaml") },
+    @{ Name = '英文词表';  Ok = (Test-Path "$ENG\en-words.txt") },
     @{ Name = '设置窗';    Ok = (Test-Path "$PF\inklink-settings.exe") },
     @{ Name = 'COM 64 位';  Ok = ((Get-ItemProperty $com64 -ErrorAction SilentlyContinue).'(default)' -eq $dll64) },
     @{ Name = 'COM 32 位';  Ok = ((Get-ItemProperty $com32 -ErrorAction SilentlyContinue).'(default)' -eq $dll32) },

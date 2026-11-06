@@ -31,7 +31,7 @@ Write-Host "== 打包 inklink $version ==" -ForegroundColor Cyan
 # ── 前置检查 ───────────────────────────────────────────────────
 $dll64 = Join-Path $tsf 'target-static\release\inklink_tsf.dll'
 $dll32 = Join-Path $tsf 'target-static\i686-pc-windows-msvc\release\inklink_tsf.dll'
-foreach ($p in @($dll64, $dll32, "$ENG\rime-server.exe", "$ENG\rime.dll", "$ENG\rime\data")) {
+foreach ($p in @($dll64, $dll32, "$ENG\rime-server.exe", "$ENG\rime.dll", "$ENG\rime\data", "$ENG\en-words.txt")) {
     if (-not (Test-Path $p)) { throw "缺少 $p —— 先构建 DLL（tools\deploy-local.ps1）或确认引擎目录完整" }
 }
 
@@ -63,6 +63,7 @@ Copy-Item (Join-Path $root 'installer\inklink.ico') (Join-Path $files 'inklink.i
 Copy-Item (Join-Path $root 'installer\inklink-badge.ico') (Join-Path $files 'inklink-badge.ico') -Force
 Copy-Item "$ENG\rime-server.exe" $files -Force
 Copy-Item "$ENG\rime.dll"        $files -Force
+Copy-Item "$ENG\en-words.txt"    $files -Force
 # 设置窗（P2a）：和 DLL 同目录，浮条菜单的「设置…」按同目录找它
 $settingsExe = Join-Path $root 'settings\target\release\inklink-settings.exe'
 if (-not (Test-Path $settingsExe)) { throw "没有设置窗产物：$settingsExe（先跑 tools\deploy-local.ps1 或 cargo build -p inklink-settings --release）" }
@@ -163,7 +164,7 @@ $nEntry = 0
 foreach ($f in (Get-ChildItem $files -Recurse -File)) {
     $rel = $f.FullName.Substring($files.Length + 1).Replace('\', '/')
     # 装到哪：引擎那一坨（rime*）进 C:\inklink-engine，其余进 Program Files\inklink
-    $prefix = if ($rel -like 'rime/*' -or $rel -eq 'rime-server.exe' -or $rel -eq 'rime.dll') { 'eng/' } else { 'pf/' }
+    $prefix = if ($rel -like 'rime/*' -or $rel -eq 'rime-server.exe' -or $rel -eq 'rime.dll' -or $rel -eq 'en-words.txt') { 'eng/' } else { 'pf/' }
     $name = [System.Text.Encoding]::UTF8.GetBytes($prefix + $rel)
     $data = [System.IO.File]::ReadAllBytes($f.FullName)
     $bw.Write([uint32]$name.Length)

@@ -15,6 +15,7 @@
 #include <sddl.h>
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -862,6 +863,102 @@ static std::string user_dict_path() {
 }
 
 
+// ───────────────────── 英文补全词表 ─────────────────────
+// 打 `gith` 想要 `github`：librime 只认拼音，纯英文输入它只能切成「给/过/跟」，
+// 补全只能自己带一份词表（`en-words.txt`，4 万词、按词频排序、与 rime-server.exe 同目录）。
+//
+// 为什么不塞进 rime 的词典：librime 的查询按拼音切分，英文词进去只会被当成拼音码，
+// 排序也压不过语言模型 —— 和 ADR-0009 对个人语料的结论一样。
+static std::vector<std::pair<std::string, uint32_t>> g_en_words;   // (词, 词频名次)，按词排序
+static bool g_en_tried = false;
+
+/// 读同目录的 `en-words.txt`：一行一个词，越靠前越常用。
+static void load_en_words() {
+    if (g_en_tried) return;
+    g_en_tried = true;
+    const std::string path = exe_dir() + "\\en-words.txt";
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) {
+        logf("en words: %s not found (no completion)", path.c_str());
+        return;
+    }
+    char buf[128];
+    uint32_t rank = 0;
+    while (fgets(buf, sizeof(buf), f)) {
+        std::string s(buf);
+        while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) s.pop_back();
+        if (s.size() < 2 || s.size() > 32) continue;
+        bool ok = true;
+        for (char c : s) {
+            if (c < 'a' || c > 'z') { ok = false; break; }
+        }
+        if (!ok) continue;
+        g_en_words.emplace_back(s, rank++);
+    }
+    fclose(f);
+    std::sort(g_en_words.begin(), g_en_words.end(),
+              [](const std::pair<std::string, uint32_t>& a,
+                 const std::pair<std::string, uint32_t>& b) { return a.first < b.first; });
+    logf("en words: %zu loaded", g_en_words.size());
+}
+
+/// 词表里以 `prefix` 开头的词，按词频名次取前 `limit` 个（不含 prefix 本身）。
+/// 纯函数，`--selftest` 里用假词表验。前缀短于 2 个字母不补全（`a` 会命中几千个）。
+static std::vector<std::string> prefix_words(
+    const std::vector<std::pair<std::string, uint32_t>>& dict, const std::string& prefix,
+    size_t limit) {
+    std::vector<std::string> out;
+    if (prefix.size() < 2 || limit == 0) return out;
+    auto it = std::lower_bound(
+        dict.begin(), dict.end(), prefix,
+        [](const std::pair<std::string, uint32_t>& a, const std::string& p) { return a.first < p; });
+    std::vector<std::pair<uint32_t, const std::string*>> hits;
+    for (; it != dict.end(); ++it) {
+        if (it->first.compare(0, prefix.size(), prefix) != 0) break;
+        // 和输入一模一样的那个词不算"补全"——原样候选由调用方自己插
+        if (it->first.size() == prefix.size()) continue;
+        hits.emplace_back(it->second, &it->first);
+        if (hits.size() >= 2000) break;   // 极端前缀（`re`）够挑了，别再往下扫
+    }
+    std::sort(hits.begin(), hits.end(),
+              [](const std::pair<uint32_t, const std::string*>& a,
+                 const std::pair<uint32_t, const std::string*>& b) { return a.first < b.first; });
+    for (const auto& h : hits) {
+        if (out.size() >= limit) break;
+        out.push_back(*h.second);
+    }
+    return out;
+}
+
+/// 跟着用户打的大小写：`Git` → `Github`，`GIT` → `GITHUB`，`git` 原样。
+static std::string match_case(const std::string& typed, const std::string& word) {
+    if (typed.empty() || word.empty()) return word;
+    if (typed[0] < 'A' || typed[0] > 'Z') return word;   // 用户打的是小写，原样给
+    bool all_upper = typed.size() >= 2;
+    for (char c : typed) {
+        if (c < 'A' || c > 'Z') { all_upper = false; break; }
+    }
+    std::string out = word;
+    if (all_upper) {
+        for (char& c : out) c = (char)toupper((unsigned char)c);
+        return out;
+    }
+    out[0] = (char)toupper((unsigned char)out[0]);
+    return out;
+}
+
+/// 给纯字母输入补几个英文词（`gith` → github / gitee / …）。纯函数入口，只读全局词表。
+static std::vector<std::string> english_completions(const std::string& typed, size_t limit) {
+    load_en_words();
+    if (g_en_words.empty()) return {};
+    std::string lower;
+    lower.reserve(typed.size());
+    for (char c : typed) lower.push_back((char)tolower((unsigned char)c));
+    std::vector<std::string> out = prefix_words(g_en_words, lower, limit);
+    for (std::string& w : out) w = match_case(typed, w);
+    return out;
+}
+
 // ───────────────────────── 查询 ─────────────────────────
 static const int MAX_CANDS = 50;
 
@@ -985,7 +1082,8 @@ static std::vector<std::string> query(const std::string& code, const std::string
         out.swap(merged);
     }
 
-    // 英文候选：把原始输入作为一个候选追加（github、vscode 这类英文词）。
+    // 英文候选：把原始输入作为候选追加（github、vscode 这类英文词），
+    // 再补几个以它开头的英文词（1.1.46：`gith` → github / gitee / …）。
     // librime 只认拼音，纯英文会被切成 给/过/跟，用户就没法直接上屏英文了。
     // 用户打了分词边界（`xi'an`）就是在说"这是拼音"，不再塞英文字母候选。
     if (flat.size() >= 2 && flat == code) {
@@ -994,31 +1092,49 @@ static std::vector<std::string> query(const std::string& code, const std::string
             if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'))) { is_pure_alpha = false; break; }
         }
         if (is_pure_alpha) {
+            // 不像拼音时英文原样要留在第一屏：没有纠错结果（github/vscode）排最前；
+            // 有纠错结果说明可能是打错的拼音（niihao → 你好），让纠错占第一，
+            // 原样紧跟其后（`update` 这种"恰好差一个字母就是合法拼音"的英文词
+            // 因此仍然一眼能看到）。像拼音的（`code`）原样排最后，一直如此。
+            //
+            // 2026-10-28：再补一条 —— 前缀能连着切出两个完整音节，说明用户是在打
+            // 拼音、只是后面打坏了（`shashahs` → sha|sha|…），这种情况原始字母
+            // 也不该抢第一屏：搜狗、微信输入法都是直接给中文，用户选中即是中文，
+            // 想要英文按 Shift/回车即可。真正的英文词（`github`/`hello`/`test`）
+            // 前缀一个音节都凑不出两个，仍然排第一。
+            size_t pos = out.size();   // 默认：排在候选最后
+            if (!looks_pinyin && corrected.empty()) {
+                bool pinyin_typo = split_lengths(flat).size() >= 2;
+                pos = pinyin_typo ? out.size() : 0;
+            } else if (!looks_pinyin) {
+                pos = 1;
+            }
             auto it = std::find(out.begin(), out.end(), flat);
             if (it == out.end()) {
                 // 候选满 50 个时先挤掉最后一个：librime 对 github/hello 这种纯英文
                 // 会吐满一页中文（给/过/国…），原来的 `out.size() < MAX_CANDS` 守卫
                 // 让原始英文**永远挤不进去**，用户连"原样上屏"都点不到。
                 if (out.size() >= (size_t)MAX_CANDS) out.pop_back();
-                // 不像拼音时英文原样要留在第一屏：没有纠错结果（github/vscode）排最前；
-                // 有纠错结果说明可能是打错的拼音（niihao → 你好），让纠错占第一，
-                // 原样紧跟其后（`update` 这种"恰好差一个字母就是合法拼音"的英文词
-                // 因此仍然一眼能看到）。像拼音的（`code`）原样排最后，一直如此。
-                //
-                // 2026-10-28：再补一条 —— 前缀能连着切出两个完整音节，说明用户是在打
-                // 拼音、只是后面打坏了（`shashahs` → sha|sha|…），这种情况原始字母
-                // 也不该抢第一屏：搜狗、微信输入法都是直接给中文，用户选中即是中文，
-                // 想要英文按 Shift/回车即可。真正的英文词（`github`/`hello`/`test`）
-                // 前缀一个音节都凑不出两个，仍然排第一。
-                size_t pos = out.size();   // 默认：排在候选最后
-                if (!looks_pinyin && corrected.empty()) {
-                    bool pinyin_typo = split_lengths(flat).size() >= 2;
-                    pos = pinyin_typo ? out.size() : 0;
-                } else if (!looks_pinyin) {
-                    pos = 1;
-                }
                 if (pos > out.size()) pos = out.size();
                 out.insert(out.begin() + pos, flat);
+            } else {
+                pos = (size_t)(it - out.begin());
+            }
+            // 补全只补"看着就是英文"的输入（原样在第一屏）。像拼音的 `shi`/`code`
+            // 用户多半在打中文，一个英文词都不塞，免得把中文顶下去。
+            if (pos <= 1) {
+                std::vector<std::string> compl = english_completions(flat, 6);
+                size_t at = pos + 1;
+                for (const std::string& w : compl) {
+                    if (std::find(out.begin(), out.end(), w) != out.end()) continue;
+                    if (at >= out.size()) { out.push_back(w); ++at; continue; }
+                    // 候选已经满 50 个：挤掉最后一个（最不常用的中文）给补全腾位。
+                    // 不挤的话 `github` 这种一页塞满中文的输入一个补全都进不来。
+                    if (out.size() >= (size_t)MAX_CANDS) out.pop_back();
+                    if (at > out.size()) at = out.size();
+                    out.insert(out.begin() + at, w);
+                    ++at;
+                }
             }
         }
     }
@@ -1805,6 +1921,29 @@ static int run_selftest() {
            std::string::npos,
        "ai_error_text: missing model tells how to pull");
 
+    // 英文补全（1.1.46）：词表排序、前缀匹配、词频名次、大小写跟随
+    {
+        std::vector<std::pair<std::string, uint32_t>> dict = {
+            {"git", 1}, {"gitee", 2}, {"github", 0}, {"githubcom", 4}, {"gizmo", 3},
+        };
+        std::sort(dict.begin(), dict.end(),
+                  [](const std::pair<std::string, uint32_t>& a,
+                     const std::pair<std::string, uint32_t>& b) { return a.first < b.first; });
+        std::vector<std::string> c = prefix_words(dict, "git", 6);
+        ck(c.size() == 3, "prefix_words: git 命中 3 个（不含原样）");
+        ck(c.size() == 3 && c[0] == "github" && c[1] == "gitee" && c[2] == "githubcom",
+           "prefix_words: 按词频名次排");
+        ck(prefix_words(dict, "gi", 2).size() == 2 && prefix_words(dict, "gi", 2)[0] == "github",
+           "prefix_words: limit 取最常用的");
+        // gir 之类不在表里；`gi` 命中 git/gitee/github/githubcom/gizmo 五个
+        ck(prefix_words(dict, "gi", 99).size() == 5, "prefix_words: gi 命中 5 个");
+        ck(prefix_words(dict, "zz", 6).empty(), "prefix_words: 没命中给空");
+        ck(prefix_words(dict, "g", 6).empty(), "prefix_words: 单字母不补全");
+        ck(match_case("Git", "github") == "Github", "match_case: 首字母大写跟随");
+        ck(match_case("GIT", "github") == "GITHUB", "match_case: 全大写跟随");
+        ck(match_case("git", "github") == "github", "match_case: 小写原样");
+    }
+
     if (fails == 0) {
         printf("\nall %d checks passed\n", total);
     } else {
@@ -1827,6 +1966,7 @@ int main(int argc, char** argv) {
     // 用户词库（个人词库）：启动就加载，第一次查询就能用上历史选择
     g_user_path = user_dict_path();
     load_user();
+    load_en_words();
 
     // 词库巡检命令（不需要 librime、不连管道，可以在引擎运行时跑）
     for (int i = 1; i < argc; i++) {
