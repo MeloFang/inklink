@@ -1241,10 +1241,14 @@ fn draw_run(hdc: HDC, x: i32, y: i32, s: &str, font: HGDIOBJ) -> i32 {
 fn tokenize(s: &str) -> Vec<(String, bool)> {
     let mut out: Vec<(String, bool)> = Vec::new();
     for c in s.chars() {
-        let latin = is_latin_char(c);
+        if !is_latin_char(c) {
+            // 中文每个字单独一个 token（可以随便断行）；只有西文才成串
+            out.push((c.to_string(), false));
+            continue;
+        }
         match out.last_mut() {
-            Some((buf, is_lat)) if *is_lat == latin => buf.push(c),
-            _ => out.push((c.to_string(), latin)),
+            Some((buf, true)) => buf.push(c),
+            _ => out.push((c.to_string(), true)),
         }
     }
     out
