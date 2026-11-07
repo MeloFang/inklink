@@ -67,10 +67,32 @@ def extract(text, rel):
         for b in BOLD.findall(line):
             add(b, 4)
         han = ''.join(CJK.findall(line))
-        for n in (2, 3, 4):
+        # 2~6 字：5、6 字是公司里的长词（嘉兴分公司、降本增效专项），
+        # 只出 2~4 字的话长词会被切成碎片（兴分、嘉兴分），反而更脏
+        for n in (2, 3, 4, 5, 6):
             for i in range(len(han) - n + 1):
                 add(han[i:i + n], 1)
     return terms
+
+
+def read_docx(path):
+    """Word 文档 -> 纯文本（段落 + 表格单元格）。没装 python-docx 就跳过。"""
+    try:
+        import docx
+    except ImportError:
+        print('skip (no python-docx):', path)
+        return ''
+    try:
+        d = docx.Document(path)
+    except Exception as e:
+        print('skip', path, e)
+        return ''
+    parts = [p.text for p in d.paragraphs]
+    for t in d.tables:
+        for row in t.rows:
+            for cell in row.cells:
+                parts.append(cell.text)
+    return '\n'.join(parts)
 
 
 def scan(vault, cache_path):
@@ -84,9 +106,20 @@ def scan(vault, cache_path):
     seen = set()
     for root, _, files in os.walk(vault):
         for f in files:
-            if not f.lower().endswith('.md'):
-                continue
+            low = f.lower()
             p = os.path.join(root, f)
+            if low.endswith('.docx'):
+                text = read_docx(p)
+                if not text.strip():
+                    continue
+            elif low.endswith(('.md', '.markdown', '.txt')):
+                try:
+                    text = open(p, encoding='utf-8', errors='ignore').read()
+                except Exception as e:
+                    print("skip", p, e)
+                    continue
+            else:
+                continue
             rel = os.path.relpath(p, vault)
             try:
                 st = os.stat(p)
@@ -101,11 +134,6 @@ def scan(vault, cache_path):
                     d["freq"] += info["freq"]
                     d["files"].update(info.get("files", []))
                 seen.add(rel)
-                continue
-            try:
-                text = open(p, encoding='utf-8', errors='ignore').read()
-            except Exception as e:
-                print("skip", p, e)
                 continue
             t = extract(text, rel)
             cache[rel] = {

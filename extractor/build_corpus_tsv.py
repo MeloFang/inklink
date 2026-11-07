@@ -18,6 +18,10 @@ import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_DICT = os.path.join(ROOT, 'data', 'upstream', 'ice', '8105.dict.yaml')
+# rime-ice 基础词库：里面已经有的常用词不用再塞进语料（打了本来就在前几页）
+BASE_DICT = os.path.join(ROOT, 'data', 'upstream', 'ice', 'base.dict.yaml')
+# 基础词库里权重 >= 这个值的算"已经够常用"，语料表里跳过
+KNOWN_WEIGHT = 1000
 
 
 def load_pinyin(path):
@@ -49,17 +53,49 @@ def load_pinyin(path):
     return {k: v[1] for k, v in best.items()}
 
 
+def load_known_words(path, threshold):
+    """基础词库里权重 >= threshold 的词（这些词 librime 本来就给得出来）。"""
+    known = set()
+    if not os.path.exists(path):
+        return known
+    body = False
+    with io.open(path, encoding='utf-8', errors='ignore') as f:
+        for line in f:
+            s = line.rstrip('\n')
+            if not body:
+                if s.strip() == '...':
+                    body = True
+                continue
+            if not s or s.startswith('#'):
+                continue
+            parts = s.split('\t')
+            if len(parts) < 3:
+                continue
+            try:
+                w = int(parts[2])
+            except ValueError:
+                continue
+            if w >= threshold:
+                known.add(parts[0])
+    return known
+
+
 def is_cjk(ch):
     return '\u4e00' <= ch <= '\u9fff'
 
 
-def build(terms, pinyin, max_terms):
+def build(terms, pinyin, max_terms, known=None):
+    known = known or set()
     rows = []
+    skipped_known = 0
     skipped_no_pinyin = 0
     for term, info in terms.items():
         t = term.strip()
         # 只收 2~8 个汉字：太短没意义，太长是整句（那属于 AI 的活，不是候选）
         if not (2 <= len(t) <= 8) or not all(is_cjk(c) for c in t):
+            continue
+        if t in known:
+            skipped_known += 1
             continue
         syl = []
         for c in t:
@@ -72,6 +108,27 @@ def build(terms, pinyin, max_terms):
             rows.append((' '.join(syl), t, weight))
             continue
         skipped_no_pinyin += 1
+    # 去掉"碎片"：`嘉兴分`、`兴分` 这种是长词（`嘉兴分公司`）的滑窗产物。
+    # 规则：只要有一个更长的词包含它、且那个词的出现次数不比它少，它就是碎片。
+    # 做法：把所有长词的子串记一份"被包含时的最大权重"，再回头筛（避免 O(n^2)）。
+    containing_max = {}
+    for _code, word, weight in rows:
+        n = len(word)
+        if n < 3:
+            continue
+        for i in range(n):
+            for j in range(i + 2, n + 1):
+                if j - i == n:
+                    continue  # 整词自己不算
+                sub = word[i:j]
+                if len(sub) < 2:
+                    continue
+                prev = containing_max.get(sub)
+                if prev is None or weight > prev:
+                    containing_max[sub] = weight
+    drop = {w for _c, w, wt in rows if containing_max.get(w, -1) >= wt}
+    rows = [r for r in rows if r[1] not in drop]
+
     seen = set()
     uniq = []
     for r in rows:
@@ -81,7 +138,8 @@ def build(terms, pinyin, max_terms):
         seen.add(key)
         uniq.append(r)
     uniq.sort(key=lambda r: (-r[2], r[1]))
-    return uniq[:max_terms], skipped_no_pinyin
+    dropped_fragment = len(drop)
+    return uniq[:max_terms], skipped_no_pinyin, skipped_known, dropped_fragment
 
 
 def main():
@@ -89,7 +147,7 @@ def main():
     ap.add_argument('-Terms', '--terms', default=os.path.join(ROOT, 'extractor', 'terms.json'))
     ap.add_argument('-Out', '--out', default=os.path.join(
         os.environ.get('LOCALAPPDATA', '.'), 'inklink', 'corpus.tsv'))
-    ap.add_argument('-Max', '--max', type=int, default=2000)
+    ap.add_argument('-Max', '--max', type=int, default=5000)
     ap.add_argument('-Dict', '--dict', default=DEFAULT_DICT)
     args = ap.parse_args()
 
@@ -97,7 +155,8 @@ def main():
         sys.exit('找不到 terms.json：%s（先跑 tools\\import-corpus.ps1 或 scan_vault.py）' % args.terms)
     terms = json.load(io.open(args.terms, encoding='utf-8'))
     pinyin = load_pinyin(args.dict)
-    rows, skipped = build(terms, pinyin, args.max)
+    known = load_known_words(BASE_DICT, KNOWN_WEIGHT)
+    rows, skipped, skipped_known, fragments = build(terms, pinyin, args.max, known)
 
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     with io.open(args.out, 'w', encoding='utf-8', newline='\n') as f:
@@ -108,6 +167,10 @@ def main():
     print('写进语料表：%d 条（上限 %d）' % (len(rows), args.max))
     if skipped:
         print('跳过（字表里没有读音）：%d' % skipped)
+    if skipped_known:
+        print('跳过（基础词库已够常用）：%d' % skipped_known)
+    if fragments:
+        print('跳过（是长词的碎片）：%d' % fragments)
     for code, word, weight in rows[:8]:
         print('  %-18s %s  (w=%d)' % (code, word, weight))
 

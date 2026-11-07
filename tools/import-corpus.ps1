@@ -15,7 +15,7 @@ param(
     # 输出文件；默认 %LOCALAPPDATA%\inklink\corpus.tsv
     [string]$Out = (Join-Path $env:LOCALAPPDATA 'inklink\corpus.tsv'),
     # 最多保留多少条（按权重截断）
-    [int]$Max = 2000
+    [int]$Max = 5000
 )
 
 $ErrorActionPreference = 'Stop'
