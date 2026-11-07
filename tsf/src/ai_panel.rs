@@ -72,11 +72,20 @@ const PAD: i32 = 18;
 const BOTTOM_MARGIN: i32 = 24;
 
 const FONT_UI_FALLBACK: &str = "Microsoft YaHei UI";
-/// 用户点名要的公文标题体（2026-11-07）。**只在用户自己装了的时候用**。
+
+/// 标题用的公文标题体（用户 2026-11-07 点名）。
 ///
 /// 方正小标宋是商业字体，本机是 WPS 装的（`C:\ProgramData\Kingsoft\office6\muifont\GB2312\FZXBSJW.TTF`）。
 /// 开源项目不能把它打进安装包，所以这里做的是"有就用、没有就退回雅黑 UI"。
-const FONT_UI_GONGWEN: &str = "方正小标宋简体";
+const FONT_TITLE_GONGWEN: &str = "方正小标宋简体";
+
+/// 正文的字体链，装哪个用哪个（用户要"仿宋 / 仿宋_GB2312 / 其他开源仿宋"）。
+///
+/// - `仿宋_GB2312`：Office/WPS 常装，中文公文正文的默认体
+/// - `仿宋`：Windows 自带（simfang.ttf）
+/// - `Noto Serif SC`：思源宋体，**开源（OFL）**，前两个都没有时的开源兜底
+/// - 最后退回雅黑 UI
+const FONT_BODY_CHAIN: [&str; 4] = ["仿宋_GB2312", "仿宋", "Noto Serif SC", "Microsoft YaHei UI"];
 
 /// 用 GDI 问一句"这个字族在不在"（EnumFontFamiliesExW 命中即 true）。
 fn face_available(face: &str) -> bool {
@@ -117,17 +126,27 @@ unsafe extern "system" fn enum_face_cb(
     0 // 找到一个就停
 }
 
-/// 面板正文用哪个字体（结果缓存：每次重画都问一遍 GDI 没必要）。
-fn ui_face() -> &'static str {
+/// 在候选链里挑第一个装了的字体（结果缓存：每帧问一遍 GDI 没必要）。
+fn first_face(cands: &[&'static str]) -> &'static str {
+    cands
+        .iter()
+        .copied()
+        .find(|f| face_available(f))
+        .unwrap_or(FONT_UI_FALLBACK)
+}
+
+/// 标题：公文标题体。
+fn title_face() -> &'static str {
     use std::sync::OnceLock;
     static FACE: OnceLock<&'static str> = OnceLock::new();
-    FACE.get_or_init(|| {
-        if face_available(FONT_UI_GONGWEN) {
-            FONT_UI_GONGWEN
-        } else {
-            FONT_UI_FALLBACK
-        }
-    })
+    FACE.get_or_init(|| first_face(&[FONT_TITLE_GONGWEN]))
+}
+
+/// 正文：仿宋优先，开源思源宋体兜底。
+fn body_face() -> &'static str {
+    use std::sync::OnceLock;
+    static FACE: OnceLock<&'static str> = OnceLock::new();
+    FACE.get_or_init(|| first_face(&FONT_BODY_CHAIN))
 }
 /// Win10/11 自带的图标字体（齿轮、关闭、地球、笔……）。
 const FONT_ICON: &str = "Segoe MDL2 Assets";
@@ -1169,10 +1188,10 @@ struct Fonts {
 impl Fonts {
     fn new() -> Self {
         Fonts {
-            title: make_font(15, 700, ui_face()),
-            body: make_font(13, 400, ui_face()),
-            bold: make_font(13, 600, ui_face()),
-            small: make_font(12, 400, ui_face()),
+            title: make_font(16, 700, title_face()),
+            body: make_font(14, 400, body_face()),
+            bold: make_font(14, 600, body_face()),
+            small: make_font(13, 400, body_face()),
             icon: make_font(14, 400, FONT_ICON),
             sym: make_font(14, 400, "Segoe UI Symbol"),
         }
