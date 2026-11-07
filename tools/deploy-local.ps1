@@ -81,6 +81,12 @@ $target32 = Join-Path $PF "inklink_tsf32_$version.dll"
 New-Item -ItemType Directory -Force $PF | Out-Null
 Copy-Item $dll64 $target64 -Force
 Copy-Item $dll32 $target32 -Force
+# 随包字体（朱雀仿宋）：AI 面板按 <DLL 目录>\fonts 私有加载
+$fontsSrc = Join-Path $root 'installer\fonts'
+if (Test-Path $fontsSrc) {
+    New-Item -ItemType Directory -Force (Join-Path $PF 'fonts') | Out-Null
+    Copy-Item "$fontsSrc\*" (Join-Path $PF 'fonts') -Force
+}
 
 # 语言列表里那一行的图标（DllRegisterServer 会按 DLL 同目录的 inklink.ico 找它）
 $ico = Join-Path $root 'installer\inklink.ico'

@@ -61,6 +61,12 @@ Copy-Item $dll64 (Join-Path $files 'inklink_tsf.dll')   -Force
 Copy-Item $dll32 (Join-Path $files 'inklink_tsf32.dll') -Force
 Copy-Item (Join-Path $root 'installer\inklink.ico') (Join-Path $files 'inklink.ico') -Force
 Copy-Item (Join-Path $root 'installer\inklink-badge.ico') (Join-Path $files 'inklink-badge.ico') -Force
+# 随包字体（朱雀仿宋，OFL-1.1）：装到 Program Files\inklink\fonts，DLL 用 FR_PRIVATE 私有加载
+$fontsSrc = Join-Path $root 'installer\fonts'
+if (Test-Path $fontsSrc) {
+    Copy-Item $fontsSrc $files -Recurse -Force
+    Write-Host ('  字体 ' + ((Get-ChildItem $fontsSrc -File).Count) + ' 个') -ForegroundColor DarkGray
+}
 Copy-Item "$ENG\rime-server.exe" $files -Force
 Copy-Item "$ENG\rime.dll"        $files -Force
 Copy-Item "$ENG\en-words.txt"    $files -Force

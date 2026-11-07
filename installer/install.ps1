@@ -74,6 +74,11 @@ Install-File "$SRC\rime.dll"        "$ENG\rime.dll"        | Out-Null
 if (Test-Path "$SRC\en-words.txt") { Install-File "$SRC\en-words.txt" "$ENG\en-words.txt" | Out-Null }
 # 设置窗（P2a/P4b）：浮条 ☰ 的「设置…」按 DLL 同目录找它。漏装的话菜单点了没反应。
 if (Test-Path "$SRC\inklink-settings.exe") { Install-File "$SRC\inklink-settings.exe" "$PF\inklink-settings.exe" | Out-Null }
+# 随包字体（朱雀仿宋，OFL）：DLL 按 <DLL 目录>\fonts 私有加载
+if (Test-Path "$SRC\fonts") {
+    New-Item -ItemType Directory -Force "$PF\fonts" | Out-Null
+    Copy-Item "$SRC\fonts\*" "$PF\fonts" -Recurse -Force
+}
 
 # rime 数据必须落到 $ENG\rime\data（1.1.37 的包把内容拍平到了 rime\ 下，装完引擎没词库）。
 # 这里显式建目录再拷内容，两种包结构都能装。
@@ -182,6 +187,7 @@ $checks = @(
     @{ Name = 'rime.dll';   Ok = (Test-Path "$ENG\rime.dll") },
     @{ Name = 'rime 数据'; Ok = (Test-Path "$ENG\rime\data\default.yaml") },
     @{ Name = '英文词表';  Ok = (Test-Path "$ENG\en-words.txt") },
+    @{ Name = '随包字体';  Ok = (Test-Path "$PF\fonts\ZhuqueFangsong-Regular.ttf") },
     @{ Name = '设置窗';    Ok = (Test-Path "$PF\inklink-settings.exe") },
     @{ Name = 'COM 64 位';  Ok = ((Get-ItemProperty $com64 -ErrorAction SilentlyContinue).'(default)' -eq $dll64) },
     @{ Name = 'COM 32 位';  Ok = ((Get-ItemProperty $com32 -ErrorAction SilentlyContinue).'(default)' -eq $dll32) },

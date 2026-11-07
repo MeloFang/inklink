@@ -85,45 +85,87 @@ const FONT_TITLE_GONGWEN: &str = "方正小标宋简体";
 /// - `仿宋`：Windows 自带（simfang.ttf）
 /// - `Noto Serif SC`：思源宋体，**开源（OFL）**，前两个都没有时的开源兜底
 /// - 最后退回雅黑 UI
-const FONT_BODY_CHAIN: [&str; 4] = ["仿宋_GB2312", "仿宋", "Noto Serif SC", "Microsoft YaHei UI"];
+const FONT_BODY_CHAIN: [&str; 6] = [
+    // 随安装包带的朱雀仿宋（OFL，见 ensure_bundled_font）；预览版的族名带后缀
+    "朱雀仿宋（预览测试版）",
+    "朱雀仿宋",
+    "Zhuque Fangsong",
+    "仿宋_GB2312",
+    "仿宋",
+    "Noto Serif SC",
+];
+/// 西文统一用 Times New Roman（系统自带，公文正文的西文习惯字体）。
+const FONT_LATIN: &str = "Times New Roman";
 
-/// 用 GDI 问一句"这个字族在不在"（EnumFontFamiliesExW 命中即 true）。
+/// 用 GDI 问一句"这个字族在不在"。
+///
+/// 做法：拿这个族名建一个字体，再 `GetTextFaceW` 读回**实际**选中的族名 ——
+/// 没装时 GDI 会静默替换成别的字体，读回来的名字就不一样（这个办法对
+/// `AddFontResourceEx(FR_PRIVATE)` 私有加载的字体也有效，枚举那套不一定看得到）。
 fn face_available(face: &str) -> bool {
-    use windows_sys::Win32::Graphics::Gdi::{
-        DEFAULT_CHARSET, EnumFontFamiliesExW, LOGFONTW, ReleaseDC,
-    };
+    use windows_sys::Win32::Graphics::Gdi::{CreateFontW, DeleteObject, GetTextFaceW};
     unsafe {
-        let mut lf: LOGFONTW = std::mem::zeroed();
-        lf.lfCharSet = DEFAULT_CHARSET as u8;
-        let w = wide(face);
-        for (i, u) in w.iter().take(31).enumerate() {
-            lf.lfFaceName[i] = *u;
+        let name = wide(face);
+        let f = CreateFontW(
+            -14,
+            0,
+            0,
+            0,
+            400,
+            0,
+            0,
+            0,
+            1, // DEFAULT_CHARSET
+            0,
+            0,
+            0,
+            0,
+            name.as_ptr(),
+        );
+        if f.is_null() {
+            return false;
         }
         let hdc = windows_sys::Win32::Graphics::Gdi::GetDC(std::ptr::null_mut());
         if hdc.is_null() {
+            DeleteObject(f);
             return false;
         }
-        let mut found: i32 = 0;
-        EnumFontFamiliesExW(
-            hdc,
-            &lf,
-            Some(enum_face_cb),
-            &mut found as *mut i32 as isize,
-            0,
-        );
-        ReleaseDC(std::ptr::null_mut(), hdc);
-        found != 0
+        let old = SelectObject(hdc, f);
+        let mut buf = [0u16; 128];
+        let n = GetTextFaceW(hdc, 128, buf.as_mut_ptr());
+        SelectObject(hdc, old);
+        DeleteObject(f);
+        windows_sys::Win32::Graphics::Gdi::ReleaseDC(std::ptr::null_mut(), hdc);
+        if n <= 1 {
+            return false;
+        }
+        let got = String::from_utf16_lossy(&buf[..(n as usize - 1)]);
+        got == face
     }
 }
 
-unsafe extern "system" fn enum_face_cb(
-    _lf: *const windows_sys::Win32::Graphics::Gdi::LOGFONTW,
-    _tm: *const windows_sys::Win32::Graphics::Gdi::TEXTMETRICW,
-    _ty: u32,
-    lparam: isize,
-) -> i32 {
-    unsafe { *(lparam as *mut i32) = 1 };
-    0 // 找到一个就停
+/// 把随安装包带的字体**私有**加载进本进程（`FR_PRIVATE`：只对当前进程可见，
+/// 不往系统字体目录里塞东西，也不用管理员权限）。
+///
+/// 为什么带：仿宋_GB2312 是 Office/WPS 装的，不是每台机器都有；用户要求
+/// "所有人看到同一个仿宋"，所以随包带一份开源的朱雀仿宋（OFL-1.1）。
+fn ensure_bundled_font() {
+    use std::sync::Once;
+    use windows_sys::Win32::Graphics::Gdi::AddFontResourceExW;
+    const FR_PRIVATE: u32 = 0x10;
+    const FR_NOT_ENUM: u32 = 0x20;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| unsafe {
+        let dll = crate::registry::dll_path();
+        let dir = match dll.rfind('\\') {
+            Some(i) => &dll[..i],
+            None => "",
+        };
+        let path = format!("{dir}\\fonts\\ZhuqueFangsong-Regular.ttf");
+        let w = wide(&path);
+        let n = AddFontResourceExW(w.as_ptr(), FR_PRIVATE | FR_NOT_ENUM, std::ptr::null_mut());
+        crate::log_line(&format!("font: bundled zhuque loaded={n} ({path})"));
+    });
 }
 
 /// 在候选链里挑第一个装了的字体（结果缓存：每帧问一遍 GDI 没必要）。
@@ -139,14 +181,20 @@ fn first_face(cands: &[&'static str]) -> &'static str {
 fn title_face() -> &'static str {
     use std::sync::OnceLock;
     static FACE: OnceLock<&'static str> = OnceLock::new();
-    FACE.get_or_init(|| first_face(&[FONT_TITLE_GONGWEN]))
+    FACE.get_or_init(|| {
+        ensure_bundled_font();
+        first_face(&[FONT_TITLE_GONGWEN])
+    })
 }
 
 /// 正文：仿宋优先，开源思源宋体兜底。
 fn body_face() -> &'static str {
     use std::sync::OnceLock;
     static FACE: OnceLock<&'static str> = OnceLock::new();
-    FACE.get_or_init(|| first_face(&FONT_BODY_CHAIN))
+    FACE.get_or_init(|| {
+        ensure_bundled_font();
+        first_face(&FONT_BODY_CHAIN)
+    })
 }
 /// Win10/11 自带的图标字体（齿轮、关闭、地球、笔……）。
 const FONT_ICON: &str = "Segoe MDL2 Assets";
@@ -1137,23 +1185,171 @@ fn pixel(c: u32) -> u32 {
     ((r as u32) << 16) | ((g as u32) << 8) | b as u32
 }
 
-fn text(hdc: HDC, r: &RECT, s: &str, fg: u32, font: HGDIOBJ, flags: u32) {
-    if s.is_empty() {
-        return;
+/// 一个字符算不算"西文"（ASCII）。中文标点全角不算，走中文字体。
+fn is_latin_char(c: char) -> bool {
+    (c as u32) < 0x80
+}
+
+/// 一个 run（同一种字体的连续字符）的宽度。
+fn run_width(hdc: HDC, s: &str, font: HGDIOBJ) -> i32 {
+    let buf: Vec<u16> = s.encode_utf16().collect();
+    if buf.is_empty() {
+        return 0;
     }
-    let buf = wide(s);
-    let mut rr = *r;
+    let mut sz = SIZE { cx: 0, cy: 0 };
     unsafe {
         let old = SelectObject(hdc, font);
-        SetTextColor(hdc, fg);
+        windows_sys::Win32::Graphics::Gdi::GetTextExtentPoint32W(
+            hdc,
+            buf.as_ptr(),
+            buf.len() as i32,
+            &mut sz,
+        );
+        SelectObject(hdc, old);
+    }
+    sz.cx
+}
+
+/// 用指定字体在 (x, y) 画一段，返回宽度。
+fn draw_run(hdc: HDC, x: i32, y: i32, s: &str, font: HGDIOBJ) -> i32 {
+    if s.is_empty() {
+        return 0;
+    }
+    let buf = wide(s);
+    unsafe {
+        let old = SelectObject(hdc, font);
+        let mut rr = RECT {
+            left: x,
+            top: y,
+            right: x + 2000,
+            bottom: y + 60,
+        };
         DrawTextW(
             hdc,
             buf.as_ptr(),
             (buf.len() - 1) as i32,
             &mut rr,
-            flags | DT_NOPREFIX,
+            DT_LEFT | DT_SINGLELINE | DT_NOPREFIX,
         );
         SelectObject(hdc, old);
+    }
+    run_width(hdc, s, font)
+}
+
+/// 把字符串切成 token：连续的西文（含空格）算一个，中文一个字一个。
+/// 返回 `(片段, 是不是西文)`。
+fn tokenize(s: &str) -> Vec<(String, bool)> {
+    let mut out: Vec<(String, bool)> = Vec::new();
+    for c in s.chars() {
+        let latin = is_latin_char(c);
+        match out.last_mut() {
+            Some((buf, is_lat)) if *is_lat == latin => buf.push(c),
+            _ => out.push((c.to_string(), latin)),
+        }
+    }
+    out
+}
+
+/// 画一段文字：西文用 `latin`、中文用 `cjk`，支持单行和多行（`DT_WORDBREAK`）。
+///
+/// 为什么要自己排：GDI 的字体链接只在"缺字形"时才换字体，而仿宋/思源都自带西文字形，
+/// 所以 `SetText` 一个字体画不出"中文仿宋 + 西文 Times New Roman"的混排。
+fn text(hdc: HDC, r: &RECT, s: &str, fg: u32, cjk: HGDIOBJ, latin: HGDIOBJ, flags: u32) {
+    if s.is_empty() {
+        return;
+    }
+    unsafe { SetTextColor(hdc, fg) };
+    // 行高：取两种字体里高的那个
+    let lh = {
+        let (a, b) = (font_height(hdc, cjk), font_height(hdc, latin));
+        a.max(b)
+    };
+    let single = flags & DT_SINGLELINE != 0;
+    let toks = tokenize(s);
+    if single {
+        // 先量总宽，再按 DT_CENTER / DT_RIGHT 摆起点（自己排了就不能再交给 DrawText）
+        let total: i32 = toks
+            .iter()
+            .map(|(t, is_lat)| run_width(hdc, t, if *is_lat { latin } else { cjk }))
+            .sum();
+        let mut x = if flags & DT_CENTER != 0 {
+            r.left + ((r.right - r.left) - total) / 2
+        } else if flags & windows_sys::Win32::Graphics::Gdi::DT_RIGHT != 0 {
+            r.right - total
+        } else {
+            r.left
+        };
+        // 竖直居中：和原来 DT_VCENTER 的观感一致
+        let y = r.top + ((r.bottom - r.top) - lh) / 2;
+        for (t, is_lat) in toks {
+            let f = if is_lat { latin } else { cjk };
+            x += draw_run(hdc, x, y.max(r.top), &t, f);
+        }
+        return;
+    }
+    // 多行：按宽度贪心断行
+    let max_w = r.right - r.left;
+    let mut line: Vec<(String, bool)> = Vec::new();
+    let mut line_w = 0;
+    let mut y = r.top;
+    let mut flush = |line: &mut Vec<(String, bool)>, y: &mut i32, x0: i32, out: &mut bool| {
+        if line.is_empty() {
+            return;
+        }
+        let mut x = x0;
+        for (t, is_lat) in line.iter() {
+            let f = if *is_lat { latin } else { cjk };
+            x += draw_run(hdc, x, *y, t, f);
+        }
+        let _ = out;
+        line.clear();
+        *y += lh;
+    };
+    for (t, is_lat) in toks {
+        let f = if is_lat { latin } else { cjk };
+        let w = run_width(hdc, &t, f);
+        if line_w + w > max_w && !line.is_empty() {
+            let mut dummy = false;
+            flush(&mut line, &mut y, r.left, &mut dummy);
+            line_w = 0;
+        }
+        // 太长的西文单词按字符硬断
+        if w > max_w && is_lat {
+            for ch in t.chars() {
+                let cs = ch.to_string();
+                let cw = run_width(hdc, &cs, latin);
+                if line_w + cw > max_w && !line.is_empty() {
+                    let mut dummy = false;
+                    flush(&mut line, &mut y, r.left, &mut dummy);
+                    line_w = 0;
+                }
+                line.push((cs, true));
+                line_w += cw;
+            }
+            continue;
+        }
+        line.push((t, is_lat));
+        line_w += w;
+    }
+    if !line.is_empty() {
+        let mut dummy = false;
+        flush(&mut line, &mut y, r.left, &mut dummy);
+    }
+}
+
+/// 字体行高（含升降部）。
+fn font_height(hdc: HDC, font: HGDIOBJ) -> i32 {
+    use windows_sys::Win32::Graphics::Gdi::{GetTextMetricsW, TEXTMETRICW};
+    unsafe {
+        let old = SelectObject(hdc, font);
+        let mut tm: TEXTMETRICW = std::mem::zeroed();
+        let ok = GetTextMetricsW(hdc, &mut tm);
+        SelectObject(hdc, old);
+        if ok != 0 {
+            (tm.tmHeight + tm.tmExternalLeading).max(1)
+        } else {
+            16
+        }
     }
 }
 
@@ -1183,6 +1379,8 @@ struct Fonts {
     small: HGDIOBJ,
     icon: HGDIOBJ,
     sym: HGDIOBJ,
+    /// 西文用 Times New Roman（用户 2026-11-07 要求），中文仍用上面那套
+    latin: HGDIOBJ,
 }
 
 impl Fonts {
@@ -1194,6 +1392,7 @@ impl Fonts {
             small: make_font(13, 400, body_face()),
             icon: make_font(14, 400, FONT_ICON),
             sym: make_font(14, 400, "Segoe UI Symbol"),
+            latin: make_font(14, 400, FONT_LATIN),
         }
     }
 }
@@ -1387,6 +1586,7 @@ fn paint_panel(c: &mut Canvas, m: i32, dark: bool, hover: Hit, snap: Snap) {
         ICON_SPARKLE,
         pal.accent,
         fonts.sym,
+        fonts.sym,
         line | DT_LEFT,
     );
     text(
@@ -1400,6 +1600,7 @@ fn paint_panel(c: &mut Canvas, m: i32, dark: bool, hover: Hit, snap: Snap) {
         "AI 助手",
         pal.text,
         fonts.title,
+        fonts.latin,
         line | DT_LEFT | DT_END_ELLIPSIS,
     );
     let icon_fg = |hh: Hit| if hover == hh { pal.text } else { pal.dim };
@@ -1409,6 +1610,7 @@ fn paint_panel(c: &mut Canvas, m: i32, dark: bool, hover: Hit, snap: Snap) {
         ICON_SETTINGS,
         icon_fg(Hit::Settings),
         fonts.icon,
+        fonts.icon,
         line | DT_CENTER,
     );
     text(
@@ -1416,6 +1618,7 @@ fn paint_panel(c: &mut Canvas, m: i32, dark: bool, hover: Hit, snap: Snap) {
         &o(&l.close),
         ICON_CLOSE,
         icon_fg(Hit::Close),
+        fonts.icon,
         fonts.icon,
         line | DT_CENTER,
     );
@@ -1431,6 +1634,7 @@ fn paint_panel(c: &mut Canvas, m: i32, dark: bool, hover: Hit, snap: Snap) {
         ),
         ICON_SPARKLE,
         pal.accent,
+        fonts.sym,
         fonts.sym,
         DT_LEFT | DT_SINGLELINE,
     );
@@ -1452,6 +1656,7 @@ fn paint_panel(c: &mut Canvas, m: i32, dark: bool, hover: Hit, snap: Snap) {
         source_line(phase, &source),
         src_fg,
         fonts.body,
+        fonts.latin,
         wrap,
     );
     text(
@@ -1460,6 +1665,7 @@ fn paint_panel(c: &mut Canvas, m: i32, dark: bool, hover: Hit, snap: Snap) {
         &chip_label,
         pal.accent,
         fonts.small,
+        fonts.latin,
         line | DT_CENTER,
     );
     if accepts_paste(phase) {
@@ -1483,6 +1689,7 @@ fn paint_panel(c: &mut Canvas, m: i32, dark: bool, hover: Hit, snap: Snap) {
             "粘贴",
             if hot { pal.text } else { pal.dim },
             fonts.small,
+            fonts.latin,
             line | DT_CENTER,
         );
     }
@@ -1504,6 +1711,7 @@ fn paint_panel(c: &mut Canvas, m: i32, dark: bool, hover: Hit, snap: Snap) {
                 icon,
                 ifg,
                 fonts.icon,
+                fonts.icon,
                 line | DT_LEFT,
             );
             text(
@@ -1512,6 +1720,7 @@ fn paint_panel(c: &mut Canvas, m: i32, dark: bool, hover: Hit, snap: Snap) {
                 name,
                 tfg,
                 fonts.bold,
+                fonts.latin,
                 line | DT_LEFT,
             );
             text(
@@ -1520,6 +1729,7 @@ fn paint_panel(c: &mut Canvas, m: i32, dark: bool, hover: Hit, snap: Snap) {
                 desc,
                 pal.dim,
                 fonts.small,
+                fonts.latin,
                 line | DT_LEFT | DT_END_ELLIPSIS,
             );
         }
@@ -1533,6 +1743,7 @@ fn paint_panel(c: &mut Canvas, m: i32, dark: bool, hover: Hit, snap: Snap) {
                 "打开设置",
                 0x00FF_FFFF,
                 fonts.bold,
+                fonts.latin,
                 line | DT_CENTER,
             );
         }
@@ -1547,6 +1758,7 @@ fn paint_panel(c: &mut Canvas, m: i32, dark: bool, hover: Hit, snap: Snap) {
             msg,
             fg,
             fonts.small,
+            fonts.latin,
             DT_LEFT | DT_WORDBREAK | DT_EDITCONTROL,
         );
     } else {
@@ -1562,6 +1774,7 @@ fn paint_panel(c: &mut Canvas, m: i32, dark: bool, hover: Hit, snap: Snap) {
             icon,
             pal.accent,
             fonts.icon,
+            fonts.icon,
             line | DT_LEFT,
         );
         text(
@@ -1570,6 +1783,7 @@ fn paint_panel(c: &mut Canvas, m: i32, dark: bool, hover: Hit, snap: Snap) {
             &result_title(phase, action),
             pal.text,
             fonts.bold,
+            fonts.latin,
             line | DT_LEFT,
         );
         let rb = o(&l.result_box);
@@ -1599,11 +1813,12 @@ fn paint_panel(c: &mut Canvas, m: i32, dark: bool, hover: Hit, snap: Snap) {
                 msg,
                 if *ok { pal.ok } else { pal.danger },
                 fonts.small,
+                fonts.latin,
                 line | DT_LEFT | DT_END_ELLIPSIS,
             );
             br.bottom = nr.top - scale(2);
         }
-        text(hdc, &br, &body, fg, fonts.body, wrap);
+        text(hdc, &br, &body, fg, fonts.body, fonts.latin, wrap);
         for (r, label, on) in [
             (&l.copy, "复制", done),
             (&l.regen, "重新生成", settled),
@@ -1615,6 +1830,7 @@ fn paint_panel(c: &mut Canvas, m: i32, dark: bool, hover: Hit, snap: Snap) {
                 label,
                 if on { pal.text } else { pal.dim },
                 fonts.body,
+                fonts.latin,
                 line | DT_CENTER,
             );
         }
@@ -1625,6 +1841,7 @@ fn paint_panel(c: &mut Canvas, m: i32, dark: bool, hover: Hit, snap: Snap) {
             "确定",
             cf_fg,
             fonts.bold,
+            fonts.latin,
             line | DT_CENTER,
         );
     }
