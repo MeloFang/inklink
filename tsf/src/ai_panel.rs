@@ -1458,7 +1458,7 @@ fn result_title(phase: Phase, action: u8) -> String {
 
 /// 最后一步：按外形给整张图上 alpha，混进渐变描边，外面加一圈往下偏的柔和阴影。
 /// 输出是预乘 alpha（`UpdateLayeredWindow` 要的格式）。
-fn finish(px: &mut [u32], w: i32, h: i32, m: i32, radius: f32, border_w: f32, shadow: f32) {
+pub(crate) fn finish(px: &mut [u32], w: i32, h: i32, m: i32, radius: f32, border_w: f32, shadow: f32) {
     let k = dpi_k();
     let (x0, y0, x1, y1) = (m as f32, m as f32, (w - m) as f32, (h - m) as f32);
     let (cx, cy) = ((x0 + x1) / 2.0, (y0 + y1) / 2.0);

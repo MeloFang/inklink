@@ -601,6 +601,19 @@ fn merge_sentence_code(code: &str, next: &str) -> String {
 static LAST_BACKSPACE: Mutex<Option<(isize, i32)>> = Mutex::new(None);
 
 /// 这次退格是不是新的一下（同一条消息只算一次）。纯逻辑，可单测。
+/// 数字键 1/2/3 -> 联想词下标（0/1/2）。别的键给 None。
+///
+/// 抽成纯函数：`OnTestKeyDown` 和 `OnKeyDown` 两处必须用同一个判断，
+/// 否则会出现"认领了但没处理"（数字被吃掉）或者"没认领但想处理"（数字进了文档）。
+fn hint_pick_index(vk: u32) -> Option<usize> {
+    match vk {
+        0x31 => Some(0),
+        0x32 => Some(1),
+        0x33 => Some(2),
+        _ => None,
+    }
+}
+
 fn is_new_backspace(slot: &mut Option<(isize, i32)>, lparam: isize, time: i32) -> bool {
     if *slot == Some((lparam, time)) {
         return false;
@@ -1599,10 +1612,13 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
         // 标点开关关掉时，空闲态干脆不认领标点键：应用自己出半角标点。
         // 这比"认领下来再转回半角"干净得多 —— 后者要猜键盘布局，还要自己 SetText。
         let punct_passthrough = !punct_mode && !composing;
+        // 联想条开着时，1/2/3 是"选第几个联想词"，必须认领，否则数字会被打进文档。
+        let hint_digit = !composing && hint_pick_index(vk).is_some();
         let claim = self.can_compose(pic.as_ref())
-            && ((should_claim(vk, composing, shift_held(), caps_on(), !chinese_mode)
-                && !(punct_passthrough && is_punct_key(vk, shift_held())))
-                || (undo && vk == VK_BACK));
+            && (hint_digit
+                || ((should_claim(vk, composing, shift_held(), caps_on(), !chinese_mode)
+                    && !(punct_passthrough && is_punct_key(vk, shift_held())))
+                    || (undo && vk == VK_BACK)));
         log_line(&format!("test vk={vk} claim={claim} composing={composing}"));
         Ok(BOOL(if claim { 1 } else { 0 }))
     }
@@ -1650,6 +1666,16 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
 
         if !composable {
             return Ok(BOOL(0));
+        }
+
+        // ── 联想条的数字选择（1/2/3）──
+        // 先于一切：用户刚上屏一个词、联想条还在，按 1 就是选第一个联想词。
+        if let Some(i) = hint_pick_index(vk) {
+            let tips = hint::current();
+            if !self.is_composing() && i < tips.len() {
+                let _ = self.handle_hint_click(i);
+                return Ok(BOOL(1));
+            }
         }
 
         // ── 误选撤回 ──
