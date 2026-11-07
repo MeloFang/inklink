@@ -988,10 +988,23 @@ librime 对 `github`/`hello` 这种纯字母会吐满 50 个中文（给/过/国
 退格撤回只认"光标没动过"的那一次；面板打开后再改选区需要关掉重开才会重新读取。
 
 
-#### M2 切片 1：笔记术语进候选（⬜ 下一步，ADR-0009）
+#### M2 切片 1：笔记术语进候选（✅ 2026-11-07，ADR-0009）
 
 目标：**笔记里的词，打一遍就出来，而且排在前面**。这是 M2 的第一块，不做目录监听、
 不做自动增量，先要一条能验收的闭环。
+
+**落地情况（2026-11-07）**：
+
+- `extractor/build_corpus_tsv.py`（新）：terms.json + 8105 字表 → `corpus.tsv`（码 \t 词 \t 权重），
+  只收 2~8 个汉字、多音字取权重最高的读音、上限 `-Max` 条
+- `tools/import-corpus.ps1`（新）：`-Notes <目录>` 一条命令跑完 scan_vault → build_corpus_tsv
+- `rime-server/rime-server.cc`：`load_corpus()`（启动读 `%LOCALAPPDATA%\inklink\corpus.tsv`）+
+  `apply_corpus()`（查询末尾把命中的词顶到最前）+ `--review-corpus` 诊断
+- 排序：语料 > 用户学习词 > librime 原序（语料最后压，所以永远第一）
+- selftest 71 → 77（键归一化、置顶、去重、空表）
+
+**实测**：测试笔记写「项目代号赤兔」，导入后打 `chitu` 第一条是「赤兔」，
+打 `xiangmudaihaochitu` 第一条是「项目代号赤兔」。
 
 **验收**：在 `C:\dsh\work\notes`（或任意 Markdown 目录）里写「项目代号赤兔」，跑一次导入，
 打 `chitu` 第一条是「赤兔」；删掉语料重建后恢复原状。

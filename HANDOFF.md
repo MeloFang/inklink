@@ -792,6 +792,24 @@ oldest / ollama / olympic，`jav` → java / javascript / javadoc / javac；
 **还欠真机手测**：这台机器的自动化抢不到前台（`SetForegroundWindow` 被拒），
 需要人工打「健全」上屏、「考核」上屏，看联想条是否出现「激励体系」。
 
+### M2 切片 1：笔记词汇进候选（2026-11-07）
+
+「笔记里的词，打一遍就出来」——M2 的第一块闭环打通了。
+
+- 管线：`tools/import-corpus.ps1 -Notes <目录>`
+  → `extractor/scan_vault.py`（已有的抽取器，标题/双链/标签/粗体/重复算权重）
+  → `extractor/build_corpus_tsv.py`（新：8105 字表做字→音，多音字取权重最高）
+  → `%LOCALAPPDATA%\inklink\corpus.tsv`
+- 引擎：启动读入 `g_corpus`，`query()` 末尾 `apply_corpus()` 把命中的词顶到最前
+  （**不改 Rime 方案**，理由见 ADR-0009）；`rime-server.exe --review-corpus` 看条数。
+- 排序：语料 > 用户学习词 > librime。
+- selftest 71 → 77。
+
+实测：写「项目代号赤兔」→ 导入 → 打 `chitu` 第一条「赤兔」，`xiangmudaihaochitu` 第一条「项目代号赤兔」。
+
+**还没做**：目录监听/增量导入（现在要手动跑一次）；语料参与"被选中次数回调"的权重调整；
+M2 之后是 M3（AI 实体）。
+
 ### 还没做的（留给 P6 / M3）
 
 - 结果写进文档后**不能撤回**（它不属于组合串，`UndoMs` 那套管不到）。

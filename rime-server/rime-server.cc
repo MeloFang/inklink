@@ -1109,6 +1109,93 @@ static std::vector<std::string> next_words(const std::string& word, size_t limit
 // ───────────────────────── 查询 ─────────────────────────
 static const int MAX_CANDS = 50;
 
+// ───────────────────── 个人语料（M2）─────────────────────
+// 笔记里出现的词（`赤兔`、`光纤入户`）不在 rime 词库里，打 `chitu` 永远出不来。
+// 抽取管线扫 Markdown -> terms.json -> corpus.tsv，这里启动时读入，查询时把命中的词
+// 顶到最前面。**不改 Rime 方案**：合并词库试过，权重再大也压不过语言模型（见 ADR-0009）。
+//
+// 文件：%LOCALAPPDATA%\inklink\corpus.tsv，一行 `码 \t 词 \t 权重`。
+static std::map<std::string, std::vector<std::pair<std::string, int>>> g_corpus;
+static std::string g_corpus_path;
+/// 每个码最多带多少个语料词（再多也翻不到，白占候选位）
+static const size_t CORPUS_MAX_PER_CODE = 8;
+
+static std::string corpus_path() {
+    std::string user = user_dict_path();
+    size_t slash = user.find_last_of("\\/");
+    std::string dir = (slash == std::string::npos) ? std::string() : user.substr(0, slash + 1);
+    return dir + "corpus.tsv";
+}
+
+/// 语料表的键：去掉分词符和空格的拼音串（`chi tu` 和 `chitu` 是同一个键）。
+static std::string corpus_key(const std::string& code) {
+    return strip_separators(normalize_boundaries(code));
+}
+
+/// 把语料词顶到候选最前面：已有的先删掉再插（不重复），按权重序。纯函数，可单测。
+static void corpus_apply(std::vector<std::string>& out,
+                         const std::vector<std::pair<std::string, int>>& words) {
+    if (words.empty()) return;
+    std::vector<std::string> ordered;
+    ordered.reserve(words.size());
+    for (const auto& kv : words) ordered.push_back(kv.first);
+    for (const auto& w : ordered) {
+        out.erase(std::remove(out.begin(), out.end(), w), out.end());
+    }
+    size_t at = 0;
+    for (const auto& w : ordered) {
+        if (at > out.size()) at = out.size();
+        out.insert(out.begin() + (std::ptrdiff_t)at, w);
+        ++at;
+    }
+    if (out.size() > (size_t)MAX_CANDS) out.resize(MAX_CANDS);
+}
+
+static void load_corpus() {
+    g_corpus_path = corpus_path();
+    FILE* f = fopen(g_corpus_path.c_str(), "rb");
+    if (!f) {
+        logf("corpus: %s not found (run tools\\import-corpus.ps1)", g_corpus_path.c_str());
+        return;
+    }
+    char line[1024];
+    size_t n = 0;
+    while (fgets(line, sizeof(line), f)) {
+        std::string s(line);
+        while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) s.pop_back();
+        if (s.empty() || s[0] == '#') continue;
+        size_t a = s.find('\t');
+        if (a == std::string::npos) continue;
+        size_t b = s.find('\t', a + 1);
+        std::string code = s.substr(0, a);
+        std::string word = (b == std::string::npos) ? s.substr(a + 1) : s.substr(a + 1, b - a - 1);
+        int weight = (b == std::string::npos) ? 1 : atoi(s.c_str() + b + 1);
+        if (code.empty() || word.empty()) continue;
+        g_corpus[corpus_key(code)].emplace_back(word, weight);
+        n++;
+    }
+    fclose(f);
+    for (auto& kv : g_corpus) {
+        std::sort(kv.second.begin(), kv.second.end(),
+                  [](const std::pair<std::string, int>& x, const std::pair<std::string, int>& y) {
+                      if (x.second != y.second) return x.second > y.second;
+                      return x.first < y.first;
+                  });
+        if (kv.second.size() > CORPUS_MAX_PER_CODE) kv.second.resize(CORPUS_MAX_PER_CODE);
+    }
+    logf("corpus: %zu codes / %zu entries", g_corpus.size(), n);
+}
+
+/// 查询末尾：命中的语料词顶到最前（用户学习词之后、librime 之前）。
+static void apply_corpus(const std::string& code, std::vector<std::string>& out) {
+    if (g_corpus.empty()) return;
+    auto it = g_corpus.find(corpus_key(code));
+    if (it == g_corpus.end()) return;
+    corpus_apply(out, it->second);
+    logf("corpus hit %s -> %zu", code.c_str(), it->second.size());
+}
+
+
 /// 多音节输入里单字候选放哪、给多少。
 ///
 /// librime 对 `xiangmu` 会把第一个音节的单字（想/向/相/…）夹在词中间，像刷屏，
@@ -1333,6 +1420,9 @@ static std::vector<std::string> query(const std::string& code, const std::string
     // 传**带边界**的原始码：`xi'an` 下学过的「西安」只在打 `xi'an` 时提前，
     // 打 `xian` 仍然是「先」（这就是分词边界学习）。
     apply_user_boost(code, app, out);
+
+    // 个人语料最后压上来：笔记里的词优先级最高（ADR-0009：语料 > 学习词 > 模型）
+    apply_corpus(code, out);
 
     // 组合留着，下次查询开头会清
     return out;
@@ -2124,6 +2214,25 @@ static int run_selftest() {
         ck(top_next(m, 9).size() == 3, "top_next: all when limit bigger");
     }
 
+    // 个人语料（M2）：键归一化 + 顶到最前 + 去重
+    {
+        ck(corpus_key("chi tu") == "chitu", "corpus_key: strips spaces");
+        ck(corpus_key("xi'an") == "xian", "corpus_key: strips boundary marks");
+        std::vector<std::string> out = {"词", "次", "赤兔", "翅"};
+        std::vector<std::pair<std::string, int>> words = {{"赤兔", 9}};
+        corpus_apply(out, words);
+        ck(!out.empty() && out[0] == "赤兔", "corpus_apply: hit goes first");
+        ck(std::count(out.begin(), out.end(), "赤兔") == 1, "corpus_apply: no duplicate");
+        std::vector<std::pair<std::string, int>> two = {{"赤兔", 9}, {"翅", 3}};
+        std::vector<std::string> out2 = {"词", "翅"};
+        corpus_apply(out2, two);
+        ck(out2.size() >= 2 && out2[0] == "赤兔" && out2[1] == "翅",
+           "corpus_apply: keeps weight order");
+        std::vector<std::string> out3;
+        corpus_apply(out3, {});
+        ck(out3.empty(), "corpus_apply: empty words is a no-op");
+    }
+
     if (fails == 0) {
         printf("\nall %d checks passed\n", total);
     } else {
@@ -2148,12 +2257,27 @@ int main(int argc, char** argv) {
     load_user();
     load_en_words();
     load_pairs();
+    load_corpus();
 
     // 词库巡检命令（不需要 librime、不连管道，可以在引擎运行时跑）
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
         if (arg == "--review-dict") return dict_command("review", "", "");
         if (arg == "--prune-single") return dict_command("prune-single", "", "");
+        if (arg == "--review-corpus") {
+            printf("corpus: %s\n", g_corpus_path.c_str());
+            size_t words = 0;
+            for (const auto& kv : g_corpus) words += kv.second.size();
+            printf("codes=%zu entries=%zu\n", g_corpus.size(), words);
+            size_t shown = 0;
+            for (const auto& kv : g_corpus) {
+                if (shown++ >= 10) break;
+                printf("  %-20s", kv.first.c_str());
+                for (const auto& w : kv.second) printf(" %s(%d)", w.first.c_str(), w.second);
+                printf("\n");
+            }
+            return 0;
+        }
         if (arg == "--forget") {
             // argv 里带中文时是 ANSI（中文系统上是 GBK）编码，内部一律 UTF-8，
             // 不转的话 `--forget wojude 我局的` 永远匹配不上。
