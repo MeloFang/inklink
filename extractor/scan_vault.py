@@ -95,7 +95,7 @@ def read_docx(path):
     return '\n'.join(parts)
 
 
-def scan(vault, cache_path):
+def scan(vault, cache_path, excludes=()):
     cache = {}
     if os.path.exists(cache_path):
         try:
@@ -108,6 +108,8 @@ def scan(vault, cache_path):
         for f in files:
             low = f.lower()
             p = os.path.join(root, f)
+            if any(x and x.lower() in p.lower() for x in excludes):
+                continue
             if low.endswith('.docx'):
                 text = read_docx(p)
                 if not text.strip():
@@ -162,8 +164,25 @@ if __name__ == '__main__':
     vault = sys.argv[1] if len(sys.argv) > 1 else cfg.get('vault_path', '.')
     base = os.path.dirname(os.path.abspath(__file__))
     cache_path = os.path.join(base, '.cache', 'vault_cache.json')
-    terms = scan(vault, cache_path)
+    excludes = []
+    if '--exclude' in sys.argv:
+        argi = sys.argv.index('--exclude')
+        excludes = [a for a in sys.argv[argi + 1:] if not a.startswith('--')]
+        sys.argv = sys.argv[:argi] + [a for a in sys.argv[argi + 1:] if a.startswith('--')]
+    terms = scan(vault, cache_path, excludes)
     outp = os.path.join(base, 'terms.json')
+    if '--merge' in sys.argv and os.path.exists(outp):
+        try:
+            prev = json.load(open(outp, encoding='utf-8'))
+        except Exception:
+            prev = {}
+        for term, info in prev.items():
+            # scan() 返回的 files 是 list（落盘前转过了），这里按 list 合并
+            d = terms.setdefault(term, {"weight": 0, "freq": 0, "files": []})
+            d["weight"] += info.get("weight", 0)
+            d["freq"] += info.get("freq", 0)
+            d["files"] = sorted(set(d["files"]) | set(info.get("files", [])))
+        print("merged with previous terms.json:", len(prev))
     json.dump(terms, open(outp, 'w', encoding='utf-8'), ensure_ascii=False, indent=1)
     print("vault:", os.path.abspath(vault))
     print("提取术语数:", len(terms))

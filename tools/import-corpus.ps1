@@ -10,22 +10,37 @@
 # **改完要重启引擎**（rime-server.exe）才生效：把正在跑的进程结束掉，下次打字会自动拉起。
 
 param(
-    # Markdown 目录（Obsidian vault 根目录或任意笔记目录）
-    [Parameter(Mandatory = $true)][string]$Notes,
+    # Markdown 目录（Obsidian vault 根目录或任意笔记目录），可以给多个：-Notes A,B
+    [string[]]$Notes = @('E:\Obsidian\News Releases'),
     # 输出文件；默认 %LOCALAPPDATA%\inklink\corpus.tsv
     [string]$Out = (Join-Path $env:LOCALAPPDATA 'inklink\corpus.tsv'),
     # 最多保留多少条（按权重截断）
-    [int]$Max = 5000
+    [int]$Max = 5000,
+    # 跳过的目录/文件名关键字（Obsidian vault 里这些别扫）
+    [string[]]$Exclude = @('.obsidian', '.trash', '.git', '模板', '_archive', 'assets')
 )
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 
-if (-not (Test-Path $Notes)) { throw "笔记目录不存在：$Notes" }
+# `-File` 调用时 `-Notes A,B` 会当成一个字符串，这里按逗号拆开（`-Command` 下本来就是数组）
+$Notes = @($Notes | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+
+foreach ($n in $Notes) {
+    if (-not (Test-Path $n)) { throw "笔记目录不存在：$n" }
+}
 
 Write-Host "== 扫描笔记 ==" -ForegroundColor Cyan
-python (Join-Path $root 'extractor\scan_vault.py') $Notes
-if ($LASTEXITCODE -ne 0) { throw "scan_vault.py 失败（退出码 $LASTEXITCODE）" }
+$first = $true
+foreach ($n in $Notes) {
+    Write-Host ("  扫描: " + $n) -ForegroundColor DarkGray
+    $argv = @((Join-Path $root 'extractor\scan_vault.py'), $n)
+    if ($Exclude.Count -gt 0) { $argv += '--exclude'; $argv += $Exclude }
+    if (-not $first) { $argv += '--merge' }
+    python @argv
+    if ($LASTEXITCODE -ne 0) { throw "scan_vault.py 失败（退出码 $LASTEXITCODE）" }
+    $first = $false
+}
 
 Write-Host ''
 Write-Host "== 生成语料表 ==" -ForegroundColor Cyan
