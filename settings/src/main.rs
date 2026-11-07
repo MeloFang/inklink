@@ -38,6 +38,8 @@ const ID_UNDO: usize = 105;
 const ID_AI_ENABLE: usize = 106;
 const ID_AI_ENDPOINT: usize = 107;
 const ID_AI_MODEL: usize = 108;
+/// 语料表路径（笔记词汇进候选用的那张表）
+const ID_CORPUS: usize = 109;
 const ID_SAVE: usize = 1001;
 const ID_RESET: usize = 1002;
 const ID_CLOSE: usize = 1003;
@@ -69,6 +71,7 @@ struct Ui {
     ai_enable: HWND,
     ai_endpoint: HWND,
     ai_model: HWND,
+    corpus: HWND,
     status: HWND,
 }
 
@@ -86,6 +89,8 @@ fn read_form(ui: &Ui) -> Result<Config, String> {
         ai_enabled: checked(ui.ai_enable),
         ai_endpoint: endpoint_or_default(&text_of(ui.ai_endpoint)),
         ai_model: model_or_default(&text_of(ui.ai_model)),
+        // 语料表可以留空（= 用 %LOCALAPPDATA%\inklink\corpus.tsv）
+        corpus_path: text_of(ui.corpus).trim().to_string(),
     })
 }
 
@@ -99,6 +104,8 @@ struct Config {
     ai_enabled: bool,
     ai_endpoint: String,
     ai_model: String,
+    /// 空 = 用默认位置
+    corpus_path: String,
 }
 
 /// 地址留空就当默认值。**不能把空串写进注册表**：引擎那边空串也会退回默认，
@@ -260,6 +267,7 @@ fn default_config() -> Config {
         ai_enabled: false,
         ai_endpoint: DEF_ENDPOINT.to_string(),
         ai_model: DEF_MODEL.to_string(),
+        corpus_path: String::new(),
     }
 }
 
@@ -284,6 +292,7 @@ fn load_config() -> Config {
         let ai_enabled = matches!(read_dword(h, "AI_Enable"), Some(v) if v != 0);
         let ai_endpoint = read_sz(h, "AI_Endpoint").unwrap_or_else(|| DEF_ENDPOINT.to_string());
         let ai_model = read_sz(h, "AI_Model").unwrap_or_else(|| DEF_MODEL.to_string());
+        let corpus_path = read_sz(h, "CorpusPath").unwrap_or_default();
         RegCloseKey(h);
         Config {
             dark,
@@ -294,6 +303,7 @@ fn load_config() -> Config {
             ai_enabled,
             ai_endpoint,
             ai_model,
+            corpus_path,
         }
     }
 }
@@ -310,7 +320,8 @@ fn save_config(c: Config) -> bool {
             && write_dword(h, "UndoMs", c.undo_ms)
             && write_dword(h, "AI_Enable", if c.ai_enabled { 1 } else { 0 })
             && write_sz(h, "AI_Endpoint", &c.ai_endpoint)
-            && write_sz(h, "AI_Model", &c.ai_model);
+            && write_sz(h, "AI_Model", &c.ai_model)
+            && write_sz(h, "CorpusPath", &c.corpus_path);
         RegCloseKey(h);
         ok
     }
@@ -468,12 +479,21 @@ unsafe fn build_ui(hwnd: HWND) {
     label("模型名", 16, 270, 100);
     let ai_model = edit_text(&c.ai_model, 16, 290, 380, ID_AI_MODEL);
 
+    // ── 个人语料（M2）─────────────────────────────────────
+    label(
+        "语料表（笔记里的词；留空 = 默认位置）",
+        16,
+        320,
+        380,
+    );
+    let corpus = edit_text(&c.corpus_path, 16, 342, 380, ID_CORPUS);
+
     let status = child(
         "STATIC",
         "改完点保存，下一次按键就生效，不用重启。",
         0,
         16,
-        326,
+        386,
         380,
         18,
         hwnd,
@@ -481,9 +501,9 @@ unsafe fn build_ui(hwnd: HWND) {
     );
     add(status);
 
-    button("保存", 16, 354, 76, ID_SAVE);
-    button("恢复默认", 100, 354, 90, ID_RESET);
-    button("关闭", 198, 354, 76, ID_CLOSE);
+    button("保存", 16, 412, 76, ID_SAVE);
+    button("恢复默认", 100, 412, 90, ID_RESET);
+    button("关闭", 198, 412, 76, ID_CLOSE);
 
     UI.with(|u| {
         let mut u = u.borrow_mut();
@@ -495,6 +515,7 @@ unsafe fn build_ui(hwnd: HWND) {
         u.ai_enable = ai_enable;
         u.ai_endpoint = ai_endpoint;
         u.ai_model = ai_model;
+        u.corpus = corpus;
         u.status = status;
     });
 }
@@ -542,6 +563,7 @@ impl Ui {
             ai_enable: self.ai_enable,
             ai_endpoint: self.ai_endpoint,
             ai_model: self.ai_model,
+            corpus: self.corpus,
             status: self.status,
         }
     }
@@ -566,6 +588,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     SendMessageW(ui.ai_enable, BM_SETCHECK as u32, 0, 0);
                     set_text(ui.ai_endpoint, DEF_ENDPOINT);
                     set_text(ui.ai_model, DEF_MODEL);
+                    set_text(ui.corpus, "");
                     set_text(ui.status, "已填回默认值 —— 还要点一次“保存”才写进去。");
                 }
                 ID_CLOSE => {
@@ -613,7 +636,7 @@ fn main() {
             CW_USEDEFAULT,
             CW_USEDEFAULT,
             424,
-            420,
+            478,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
             std::ptr::null_mut(),

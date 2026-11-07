@@ -1120,7 +1120,13 @@ static std::string g_corpus_path;
 /// 每个码最多带多少个语料词（再多也翻不到，白占候选位）
 static const size_t CORPUS_MAX_PER_CODE = 8;
 
+/// 注册表读字符串（实现在 AI 段；语料这里先声明）。
+static std::string reg_string(HKEY root, const char* path, const char* name);
+
 static std::string corpus_path() {
+    // 设置窗里的「语料表」路径优先：别人用的时候可以指向自己的语料表
+    std::string custom = reg_string(HKEY_CURRENT_USER, "Software\\inklink\\Config", "CorpusPath");
+    if (!custom.empty()) return custom;
     std::string user = user_dict_path();
     size_t slash = user.find_last_of("\\/");
     std::string dir = (slash == std::string::npos) ? std::string() : user.substr(0, slash + 1);
@@ -1415,14 +1421,17 @@ static std::vector<std::string> query(const std::string& code, const std::string
         }
     }
 
+    // 优先级（2026-11-08 定）：**用户亲手选过的词 > 个人语料 > 语言模型**。
+    //
+    // 先铺语料（保证笔记里的词一定能出现），再让学习词把它们顶下去 ——
+    // 用户亲手选过的那一下是比"笔记里出现过"更强的信号；选错了还有退格撤回
+    // （`unlearn`）兜底。
+    apply_corpus(code, out);
+
     // 用户词库：这个拼音下用户选过的词提前（次数多的更前）。
-    // 放在纠错/英文兜底之后、返回之前 —— 用户的手动选择优先级最高。
     // 传**带边界**的原始码：`xi'an` 下学过的「西安」只在打 `xi'an` 时提前，
     // 打 `xian` 仍然是「先」（这就是分词边界学习）。
     apply_user_boost(code, app, out);
-
-    // 个人语料最后压上来：笔记里的词优先级最高（ADR-0009：语料 > 学习词 > 模型）
-    apply_corpus(code, out);
 
     // 组合留着，下次查询开头会清
     return out;
