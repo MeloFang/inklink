@@ -81,11 +81,21 @@ $target32 = Join-Path $PF "inklink_tsf32_$version.dll"
 New-Item -ItemType Directory -Force $PF | Out-Null
 Copy-Item $dll64 $target64 -Force
 Copy-Item $dll32 $target32 -Force
+
+# 注册表指向新 DLL 必须紧跟拷贝 —— 后面任何一步失败（字体/设置窗被占用）都不能
+# 把系统留在"新文件已拷、注册表还在指旧 DLL"的半吊子状态（2026-11-08 实际踩到）。
+Set-ItemProperty "HKLM:\SOFTWARE\Classes\CLSID\$CLSID\InprocServer32" -Name '(default)' -Value $target64
+Set-ItemProperty "HKLM:\SOFTWARE\Classes\Wow6432Node\CLSID\$CLSID\InprocServer32" -Name '(default)' -Value $target32
+
 # 随包字体（朱雀仿宋）：AI 面板按 <DLL 目录>\fonts 私有加载
 $fontsSrc = Join-Path $root 'installer\fonts'
 if (Test-Path $fontsSrc) {
     New-Item -ItemType Directory -Force (Join-Path $PF 'fonts') | Out-Null
-    Copy-Item "$fontsSrc\*" (Join-Path $PF 'fonts') -Force
+    try {
+        Copy-Item "$fontsSrc\*" (Join-Path $PF 'fonts') -Force -ErrorAction Stop
+    } catch {
+        Write-Host "  字体跳过（正被占用，重启后重跑 -NoBump 即可）：$($_.Exception.Message)" -ForegroundColor Yellow
+    }
 }
 
 # 语言列表里那一行的图标（DllRegisterServer 会按 DLL 同目录的 inklink.ico 找它）
@@ -98,8 +108,11 @@ if (Test-Path $ico) { Copy-Item $ico (Join-Path $PF 'inklink.ico') -Force
 $settingsExe = Join-Path $root 'settings\target\release\inklink-settings.exe'
 if (Test-Path $settingsExe) {
     $dstSet = Join-Path $PF 'inklink-settings.exe'
-    if (Test-Path $dstSet) { Move-Item $dstSet "$dstSet.old" -Force -ErrorAction SilentlyContinue }
-    Copy-Item $settingsExe $dstSet -Force
+    try {
+        Copy-Item $settingsExe $dstSet -Force -ErrorAction Stop
+    } catch {
+        Write-Host "  设置窗跳过（先关掉「inklink 设置」再跑一次 -NoBump）：$($_.Exception.Message)" -ForegroundColor Yellow
+    }
 }
 
 # 浮条现在画在 DLL 里（宿主进程内，搜狗那种），不再有独立的 inklink-ui.exe。
