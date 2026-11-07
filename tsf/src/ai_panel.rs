@@ -71,7 +71,64 @@ const PAD: i32 = 18;
 /// 面板离工作区底边的距离（任务栏上方留一点空）。
 const BOTTOM_MARGIN: i32 = 24;
 
-const FONT_UI: &str = "Microsoft YaHei UI";
+const FONT_UI_FALLBACK: &str = "Microsoft YaHei UI";
+/// 用户点名要的公文标题体（2026-11-07）。**只在用户自己装了的时候用**。
+///
+/// 方正小标宋是商业字体，本机是 WPS 装的（`C:\ProgramData\Kingsoft\office6\muifont\GB2312\FZXBSJW.TTF`）。
+/// 开源项目不能把它打进安装包，所以这里做的是"有就用、没有就退回雅黑 UI"。
+const FONT_UI_GONGWEN: &str = "方正小标宋简体";
+
+/// 用 GDI 问一句"这个字族在不在"（EnumFontFamiliesExW 命中即 true）。
+fn face_available(face: &str) -> bool {
+    use windows_sys::Win32::Graphics::Gdi::{
+        DEFAULT_CHARSET, EnumFontFamiliesExW, LOGFONTW, ReleaseDC,
+    };
+    unsafe {
+        let mut lf: LOGFONTW = std::mem::zeroed();
+        lf.lfCharSet = DEFAULT_CHARSET as u8;
+        let w = wide(face);
+        for (i, u) in w.iter().take(31).enumerate() {
+            lf.lfFaceName[i] = *u;
+        }
+        let hdc = windows_sys::Win32::Graphics::Gdi::GetDC(std::ptr::null_mut());
+        if hdc.is_null() {
+            return false;
+        }
+        let mut found: i32 = 0;
+        EnumFontFamiliesExW(
+            hdc,
+            &lf,
+            Some(enum_face_cb),
+            &mut found as *mut i32 as isize,
+            0,
+        );
+        ReleaseDC(std::ptr::null_mut(), hdc);
+        found != 0
+    }
+}
+
+unsafe extern "system" fn enum_face_cb(
+    _lf: *const windows_sys::Win32::Graphics::Gdi::LOGFONTW,
+    _tm: *const windows_sys::Win32::Graphics::Gdi::TEXTMETRICW,
+    _ty: u32,
+    lparam: isize,
+) -> i32 {
+    unsafe { *(lparam as *mut i32) = 1 };
+    0 // 找到一个就停
+}
+
+/// 面板正文用哪个字体（结果缓存：每次重画都问一遍 GDI 没必要）。
+fn ui_face() -> &'static str {
+    use std::sync::OnceLock;
+    static FACE: OnceLock<&'static str> = OnceLock::new();
+    FACE.get_or_init(|| {
+        if face_available(FONT_UI_GONGWEN) {
+            FONT_UI_GONGWEN
+        } else {
+            FONT_UI_FALLBACK
+        }
+    })
+}
 /// Win10/11 自带的图标字体（齿轮、关闭、地球、笔……）。
 const FONT_ICON: &str = "Segoe MDL2 Assets";
 const ICON_SETTINGS: &str = "\u{E713}";
@@ -1112,10 +1169,10 @@ struct Fonts {
 impl Fonts {
     fn new() -> Self {
         Fonts {
-            title: make_font(15, 700, FONT_UI),
-            body: make_font(13, 400, FONT_UI),
-            bold: make_font(13, 600, FONT_UI),
-            small: make_font(12, 400, FONT_UI),
+            title: make_font(15, 700, ui_face()),
+            body: make_font(13, 400, ui_face()),
+            bold: make_font(13, 600, ui_face()),
+            small: make_font(12, 400, ui_face()),
             icon: make_font(14, 400, FONT_ICON),
             sym: make_font(14, 400, "Segoe UI Symbol"),
         }
