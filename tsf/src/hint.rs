@@ -15,11 +15,12 @@ use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, SIZE, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
     BeginPaint, CreateFontW, CreatePen, CreateSolidBrush, DT_LEFT, DT_SINGLELINE, DT_VCENTER,
     DeleteObject, DrawTextW, EndPaint, FillRect, GetDC, GetStockObject, GetTextExtentPoint32W, HDC,
-    PAINTSTRUCT, PS_SOLID, ReleaseDC, RoundRect, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
+    PAINTSTRUCT, PS_SOLID, ReleaseDC, RoundRect, SelectObject, SetBkMode, SetTextColor,
+    TRANSPARENT,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, GetForegroundWindow, HWND_TOPMOST, IsWindowVisible,
-    KillTimer, MA_NOACTIVATE, RegisterClassW, SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SetTimer,
+    CreateWindowExW, DefWindowProcW, GetForegroundWindow, HWND_TOPMOST, IsWindowVisible, KillTimer,
+    MA_NOACTIVATE, RegisterClassW, SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SetTimer,
     SetWindowPos, ShowWindow, WM_ERASEBKGND, WM_LBUTTONDOWN, WM_MOUSEACTIVATE, WM_PAINT, WM_TIMER,
     WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
@@ -214,13 +215,7 @@ fn place(caret: (i32, i32, i32), w: i32, h: i32) -> (i32, i32) {
     let mut area_top = 0;
     let mut area_bottom = 1080;
     unsafe {
-        let mon = MonitorFromPoint(
-            POINT {
-                x: cx,
-                y: bottom,
-            },
-            MONITOR_DEFAULTTONEAREST,
-        );
+        let mon = MonitorFromPoint(POINT { x: cx, y: bottom }, MONITOR_DEFAULTTONEAREST);
         if !mon.is_null() {
             let mut mi: MONITORINFO = std::mem::zeroed();
             mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
@@ -288,7 +283,12 @@ unsafe fn paint(hwnd: HWND) {
 
     let dark = crate::config::snapshot().dark;
     let (bg, border, text, hover) = if dark {
-        (0x0022_1E1E_u32, 0x0042_3A3A_u32, 0x00F1_EC_EC_u32, 0x0032_2A2A_u32)
+        (
+            0x0022_1E1E_u32,
+            0x0042_3A3A_u32,
+            0x00F1_EC_EC_u32,
+            0x0032_2A2A_u32,
+        )
     } else {
         (0x00FF_FFFF, 0x00E0_E0E0, 0x0022_2222, 0x00F2_EEFF)
     };
@@ -383,11 +383,7 @@ pub fn set_hover(index: isize) {
         let hwnd = HWND_CELL.load(Ordering::SeqCst);
         if hwnd != 0 && unsafe { IsWindowVisible(hwnd as HWND) } != 0 {
             unsafe {
-                windows_sys::Win32::Graphics::Gdi::InvalidateRect(
-                    hwnd as HWND,
-                    std::ptr::null(),
-                    0,
-                )
+                windows_sys::Win32::Graphics::Gdi::InvalidateRect(hwnd as HWND, std::ptr::null(), 0)
             };
         }
     }

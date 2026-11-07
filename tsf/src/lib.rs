@@ -210,7 +210,7 @@ impl TextService {
     fn new() -> Self {
         Self {
             inner: TextServiceInner {
-            last_word: Mutex::new(None),
+                last_word: Mutex::new(None),
                 thread_mgr: Mutex::new(None),
                 keystroke_mgr: Mutex::new(None),
                 tid: Mutex::new(0),
@@ -853,7 +853,11 @@ impl TextService_Impl {
         let ascii = word.chars().all(|c| c.is_ascii());
         let usable = !ascii && (2..=8).contains(&chars);
         let prev = {
-            let mut last = self.inner.last_word.lock().unwrap_or_else(|p| p.into_inner());
+            let mut last = self
+                .inner
+                .last_word
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
             let prev = last.take();
             if usable {
                 *last = Some(word.to_string());
@@ -886,7 +890,11 @@ impl TextService_Impl {
         self.request_edit(EditAction::Insert(word.clone()));
         // 链式联想：上一段是 from，这一段是 word —— 顺手把这对也学了。
         let next = ipc::pair_and_suggest(&from, &word);
-        *self.inner.last_word.lock().unwrap_or_else(|p| p.into_inner()) = Some(word.clone());
+        *self
+            .inner
+            .last_word
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(word.clone());
         if !next.is_empty() {
             let caret = self
                 .inner
