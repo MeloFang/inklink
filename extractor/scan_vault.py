@@ -44,32 +44,36 @@ def load_config():
 def extract(text, rel):
     terms = {}
 
-    def add(term, w):
+    def add(term, w, structured=False):
         term = term.strip().strip('#').strip()
         if not term or not CJK.search(term):
             return
         if any(ch.isspace() for ch in term):   # 含空白的整句（如长标题）不入库
             return
-        d = terms.setdefault(term, {"weight": 0, "freq": 0, "files": set()})
+        d = terms.setdefault(term, {"weight": 0, "freq": 0, "files": set(), "structured": False})
         d["weight"] += w
         d["freq"] += 1
         d["files"].add(rel)
+        if structured:
+            d["structured"] = True
 
     for line in text.splitlines():
         m = HEADING.match(line)
         if m:
-            add(m.group(2), 10)
+            add(m.group(2), 10, True)
             continue
         for t in TAG.findall(line):
-            add(t, 6)
+            add(t, 6, True)
         for w in WIKILINK.findall(line):
-            add(w.split('/')[-1].strip(), 8)
+            add(w.split('/')[-1].strip(), 8, True)
         for b in BOLD.findall(line):
-            add(b, 4)
+            add(b, 4, True)
         han = ''.join(CJK.findall(line))
         # 2~6 字：5、6 字是公司里的长词（嘉兴分公司、降本增效专项），
         # 只出 2~4 字的话长词会被切成碎片（兴分、嘉兴分），反而更脏
-        for n in (2, 3, 4, 5, 6):
+        # 只滑 2~4 字：5、6 字的滑窗产物几乎全是碎片（公司多举措推 这种），
+        # 真正长的词靠标题/加粗/双链这类结构标记收进来（add 不限长度）。
+        for n in (2, 3, 4):
             for i in range(len(han) - n + 1):
                 add(han[i:i + n], 1)
     return terms
@@ -131,24 +135,28 @@ def scan(vault, cache_path, excludes=()):
             old = cache.get(rel)
             if old and old.get('m') == sig['m'] and old.get('s') == sig['s'] and 't' in old:
                 for term, info in old['t'].items():
-                    d = agg.setdefault(term, {"weight": 0, "freq": 0, "files": set()})
+                    d = agg.setdefault(term, {"weight": 0, "freq": 0, "files": set(), "structured": False})
                     d["weight"] += info["weight"]
                     d["freq"] += info["freq"]
                     d["files"].update(info.get("files", []))
+                    if info.get("structured"):
+                        d["structured"] = True
                 seen.add(rel)
                 continue
             t = extract(text, rel)
             cache[rel] = {
                 "m": sig['m'], "s": sig['s'],
-                "t": {k: {"weight": v["weight"], "freq": v["freq"], "files": list(v["files"])}
+                "t": {k: {"weight": v["weight"], "freq": v["freq"], "files": list(v["files"]), "structured": v.get("structured", False)}
                       for k, v in t.items()},
             }
             seen.add(rel)
             for term, info in t.items():
-                d = agg.setdefault(term, {"weight": 0, "freq": 0, "files": set()})
+                d = agg.setdefault(term, {"weight": 0, "freq": 0, "files": set(), "structured": False})
                 d["weight"] += info["weight"]
                 d["freq"] += info["freq"]
                 d["files"].update(info["files"])
+                if info.get("structured"):
+                    d["structured"] = True
     for k in list(cache.keys()):
         if k not in seen:
             del cache[k]

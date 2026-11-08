@@ -53,6 +53,27 @@ def load_pinyin(path):
     return {k: v[1] for k, v in best.items()}
 
 
+def load_all_words(path):
+    """基础词库里的全部词（用来判断"是不是真词"）。"""
+    words = set()
+    if not os.path.exists(path):
+        return words
+    body = False
+    with io.open(path, encoding='utf-8', errors='ignore') as f:
+        for line in f:
+            s = line.rstrip('\n')
+            if not body:
+                if s.strip() == '...':
+                    body = True
+                continue
+            if not s or s.startswith('#'):
+                continue
+            parts = s.split('\t')
+            if len(parts) >= 2:
+                words.add(parts[0])
+    return words
+
+
 def load_known_words(path, threshold):
     """基础词库里权重 >= threshold 的词（这些词 librime 本来就给得出来）。"""
     known = set()
@@ -84,8 +105,10 @@ def is_cjk(ch):
     return '\u4e00' <= ch <= '\u9fff'
 
 
-def build(terms, pinyin, max_terms, known=None):
+def build(terms, pinyin, max_terms, known=None, all_words=None):
     known = known or set()
+    all_words = all_words or set()
+    skipped_fragment = 0
     rows = []
     skipped_known = 0
     skipped_no_pinyin = 0
@@ -139,7 +162,7 @@ def build(terms, pinyin, max_terms, known=None):
         uniq.append(r)
     uniq.sort(key=lambda r: (-r[2], r[1]))
     dropped_fragment = len(drop)
-    return uniq[:max_terms], skipped_no_pinyin, skipped_known, dropped_fragment
+    return uniq[:max_terms], skipped_no_pinyin, skipped_known, dropped_fragment + skipped_fragment
 
 
 def main():
@@ -156,7 +179,8 @@ def main():
     terms = json.load(io.open(args.terms, encoding='utf-8'))
     pinyin = load_pinyin(args.dict)
     known = load_known_words(BASE_DICT, KNOWN_WEIGHT)
-    rows, skipped, skipped_known, fragments = build(terms, pinyin, args.max, known)
+    all_words = load_all_words(BASE_DICT)
+    rows, skipped, skipped_known, fragments = build(terms, pinyin, args.max, known, all_words)
 
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     with io.open(args.out, 'w', encoding='utf-8', newline='\n') as f:
