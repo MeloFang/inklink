@@ -17,7 +17,7 @@ param(
     # 最多保留多少条（按权重截断）
     [int]$Max = 5000,
     # 跳过的目录/文件名关键字（Obsidian vault 里这些别扫）
-    [string[]]$Exclude = @('.obsidian', '.trash', '.git', '模板', '_archive', 'assets')
+    [string[]]$Exclude = @('.obsidian', '.trash', '.git', '模板', '_archive', '_docx原件', 'assets')
 )
 
 $ErrorActionPreference = 'Stop'

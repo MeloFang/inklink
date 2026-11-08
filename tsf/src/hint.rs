@@ -179,6 +179,11 @@ pub fn hide() {
             ShowWindow(hwnd as HWND, SW_HIDE);
         }
     }
+    // 词表必须跟着清掉：数字键的选择判断看的是"现在有没有联想词"，
+    // 只隐藏窗口会让按键把上一次联想的词插进文档（2026-11-08 用户实测）。
+    TIPS.lock().unwrap_or_else(|p| p.into_inner()).clear();
+    *SOURCE.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    HOVER.store(-1, Ordering::SeqCst);
 }
 
 /// 光标下面弹一条联想。`caret` 是 `(x, 顶边, 底边)`，和候选窗同一套坐标。

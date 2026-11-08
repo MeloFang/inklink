@@ -1613,7 +1613,9 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
         // 这比"认领下来再转回半角"干净得多 —— 后者要猜键盘布局，还要自己 SetText。
         let punct_passthrough = !punct_mode && !composing;
         // 联想条开着时，1/2/3 是"选第几个联想词"，必须认领，否则数字会被打进文档。
-        let hint_digit = !composing && hint_pick_index(vk).is_some();
+        // 必须连着 `is_visible()` 一起判：只判"有没有词"的话，窗口刚自己收起、
+        // 词表还没清干净的那一下会把数字吃掉（或者反过来把词插进文档）。
+        let hint_digit = !composing && hint::is_visible() && hint_pick_index(vk).is_some();
         let claim = self.can_compose(pic.as_ref())
             && (hint_digit
                 || ((should_claim(vk, composing, shift_held(), caps_on(), !chinese_mode)
@@ -1672,7 +1674,7 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
         // 先于一切：用户刚上屏一个词、联想条还在，按 1 就是选第一个联想词。
         if let Some(i) = hint_pick_index(vk) {
             let tips = hint::current();
-            if !self.is_composing() && i < tips.len() {
+            if !self.is_composing() && hint::is_visible() && i < tips.len() {
                 let _ = self.handle_hint_click(i);
                 return Ok(BOOL(1));
             }
