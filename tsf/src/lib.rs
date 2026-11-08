@@ -1671,9 +1671,6 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
         // 光标不在可编辑区域时一个键都不认领，否则会在没有光标的地方冒出候选窗
         let composable = self.can_compose(pic.as_ref());
 
-        // 只要开始按键，联想条就收起来（它只在"刚上屏、还没接着写"那一小段有用）
-        hint::hide();
-
         // 存下输入上下文，编辑会话要用
         self.store_context(pic);
 
@@ -1705,6 +1702,12 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                 return Ok(BOOL(1));
             }
         }
+
+        // 除了上面那几个"联想条自己的键"，别的键一按就把联想条收起来
+        // （它只在"刚上屏、还没接着写"那一小段有用）。
+        // **必须放在联想键之后**：放在前面会把 TIPS 清掉，按 1/空格就什么都不发生
+        // ——1.1.58 就是这么坏的（2026-11-08 用户实测"数字和空格都出不来"）。
+        hint::hide();
 
         // ── 误选撤回 ──
         // 上屏后 2 秒内按退格，把刚上屏的几个字删光就说明那一下选错了：
