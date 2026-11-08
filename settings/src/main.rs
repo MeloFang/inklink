@@ -28,6 +28,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WNDCLASSW, WS_BORDER, WS_CAPTION, WS_CHILD, WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
 };
 
+mod corpus;
+
 const KEY_PATH: &str = r"Software\inklink\Config";
 
 const ID_COLS: usize = 101;
@@ -126,6 +128,14 @@ fn model_or_default(s: &str) -> String {
     } else {
         t.to_string()
     }
+}
+
+/// 语料表的默认位置（%LOCALAPPDATA%\inklink\corpus.tsv）。
+fn dirs_corpus() -> std::path::PathBuf {
+    let base = std::env::var_os("LOCALAPPDATA")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    base.join("inklink").join("corpus.tsv")
 }
 
 fn checked(h: HWND) -> bool {
@@ -524,10 +534,29 @@ fn on_save(hwnd: HWND) {
     let ui = UI.with(|u| u.borrow().to_snapshot());
     match read_form(&ui) {
         Ok(c) => {
+            let notes = c.corpus_path.clone();
             if save_config(c) {
-                UI.with(|u| unsafe {
-                    set_text(u.borrow().status, "已保存 —— 下一次按键生效。")
-                });
+                if notes.trim().is_empty() {
+                    UI.with(|u| unsafe {
+                        set_text(u.borrow().status, "已保存 —— 下一次按键生效。")
+                    });
+                } else {
+                    // 顺手把笔记目录转成语料表：用户只要填目录，不用再跑脚本
+                    let exe_dir = std::env::current_exe()
+                        .ok()
+                        .and_then(|p| p.parent().map(|x| x.to_path_buf()))
+                        .unwrap_or_default();
+                    let out = dirs_corpus();
+                    let report = corpus::rebuild(std::path::Path::new(&notes), &out, &exe_dir);
+                    let msg = match report {
+                        Ok(r) => format!(
+                            "已保存，并导入 {} 篇笔记 / {} 条语料。",
+                            r.files, r.entries
+                        ),
+                        Err(e) => format!("已保存，但导入失败：{e}"),
+                    };
+                    UI.with(|u| unsafe { set_text(u.borrow().status, &msg) });
+                }
             } else {
                 unsafe {
                     let msg = wide("写注册表失败。\n\n可能是权限问题，试试以管理员身份运行。");

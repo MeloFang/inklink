@@ -70,6 +70,7 @@ if (Test-Path $fontsSrc) {
 Copy-Item "$ENG\rime-server.exe" $files -Force
 Copy-Item "$ENG\rime.dll"        $files -Force
 Copy-Item "$ENG\en-words.txt"    $files -Force
+Copy-Item (Join-Path $root 'installer\pinyin.tsv') (Join-Path $files 'pinyin.tsv') -Force
 # 设置窗（P2a）：和 DLL 同目录，浮条菜单的「设置…」按同目录找它
 $settingsExe = Join-Path $root 'settings\target\release\inklink-settings.exe'
 if (-not (Test-Path $settingsExe)) { throw "没有设置窗产物：$settingsExe（先跑 tools\deploy-local.ps1 或 cargo build -p inklink-settings --release）" }
