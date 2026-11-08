@@ -23,6 +23,12 @@ param(
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 
+# 设置窗里填的「笔记目录」优先（HKCU\Software\inklink\Config\NotesDir）
+if ($PSBoundParameters.ContainsKey('Notes') -eq $false) {
+    $cfg = Get-ItemProperty -Path 'HKCU:\Software\inklink\Config' -Name NotesDir -ErrorAction SilentlyContinue
+    if ($cfg -and $cfg.NotesDir) { $Notes = @($cfg.NotesDir) }
+}
+
 # `-File` 调用时 `-Notes A,B` 会当成一个字符串，这里按逗号拆开（`-Command` 下本来就是数组）
 $Notes = @($Notes | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
 

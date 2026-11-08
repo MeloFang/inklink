@@ -89,7 +89,7 @@ fn read_form(ui: &Ui) -> Result<Config, String> {
         ai_enabled: checked(ui.ai_enable),
         ai_endpoint: endpoint_or_default(&text_of(ui.ai_endpoint)),
         ai_model: model_or_default(&text_of(ui.ai_model)),
-        // 语料表可以留空（= 用 %LOCALAPPDATA%\inklink\corpus.tsv）
+        // 笔记目录可以留空（= 导入脚本用内置默认）
         corpus_path: text_of(ui.corpus).trim().to_string(),
     })
 }
@@ -104,7 +104,7 @@ struct Config {
     ai_enabled: bool,
     ai_endpoint: String,
     ai_model: String,
-    /// 空 = 用默认位置
+    /// 笔记目录（Obsidian 库）；空 = 导入脚本用内置默认
     corpus_path: String,
 }
 
@@ -292,7 +292,7 @@ fn load_config() -> Config {
         let ai_enabled = matches!(read_dword(h, "AI_Enable"), Some(v) if v != 0);
         let ai_endpoint = read_sz(h, "AI_Endpoint").unwrap_or_else(|| DEF_ENDPOINT.to_string());
         let ai_model = read_sz(h, "AI_Model").unwrap_or_else(|| DEF_MODEL.to_string());
-        let corpus_path = read_sz(h, "CorpusPath").unwrap_or_default();
+        let corpus_path = read_sz(h, "NotesDir").unwrap_or_default();
         RegCloseKey(h);
         Config {
             dark,
@@ -321,7 +321,7 @@ fn save_config(c: Config) -> bool {
             && write_dword(h, "AI_Enable", if c.ai_enabled { 1 } else { 0 })
             && write_sz(h, "AI_Endpoint", &c.ai_endpoint)
             && write_sz(h, "AI_Model", &c.ai_model)
-            && write_sz(h, "CorpusPath", &c.corpus_path);
+            && write_sz(h, "NotesDir", &c.corpus_path);
         RegCloseKey(h);
         ok
     }
@@ -481,7 +481,7 @@ unsafe fn build_ui(hwnd: HWND) {
 
     // ── 个人语料（M2）─────────────────────────────────────
     label(
-        "语料表（笔记里的词；留空 = 默认位置）",
+        "笔记目录（Obsidian 库；留空 = E:\\Obsidian\\News Releases）",
         16,
         320,
         380,
