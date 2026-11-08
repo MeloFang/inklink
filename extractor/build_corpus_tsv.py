@@ -12,6 +12,7 @@
 
 import argparse
 import io
+import itertools
 import json
 import os
 import sys
@@ -48,9 +49,12 @@ def load_pinyin(path):
                 w = int(parts[2]) if len(parts) > 2 else 0
             except ValueError:
                 w = 0
-            if ch not in best or w > best[ch][0]:
-                best[ch] = (w, py)
-    return {k: v[1] for k, v in best.items()}
+            # 多音字：每个读音都留（按权重降序），一个词要按组合登记多条
+            lst = best.setdefault(ch, [])
+            if py not in [x[1] for x in lst]:
+                lst.append((w, py))
+            lst.sort(reverse=True)
+    return {k: [py for _w, py in v[:3]] for k, v in best.items()}
 
 
 def load_all_words(path):
@@ -120,15 +124,28 @@ def build(terms, pinyin, max_terms, known=None, all_words=None):
         if t in known:
             skipped_known += 1
             continue
-        syl = []
+        choices = []
         for c in t:
-            p = pinyin.get(c)
-            if not p:
+            rs = pinyin.get(c) or []
+            if not rs:
                 break
-            syl.append(p)
+            choices.append(rs[:2])  # 每个字最多两种读音
         else:
             weight = int(info.get('weight', 1) or 1)
-            rows.append((' '.join(syl), t, weight))
+            total = 1
+            for rs in choices:
+                total *= len(rs)
+            if total > 6:
+                variants = [tuple(rs[0] for rs in choices)]
+            else:
+                variants = list(itertools.product(*choices))
+            seen_codes = set()
+            for combo in variants:
+                code = ' '.join(combo)
+                if code in seen_codes:
+                    continue
+                seen_codes.add(code)
+                rows.append((code, t, weight))
             continue
         skipped_no_pinyin += 1
     # 去掉"碎片"：`嘉兴分`、`兴分` 这种是长词（`嘉兴分公司`）的滑窗产物。
