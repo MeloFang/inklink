@@ -1587,6 +1587,9 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
     ) -> windows::core::Result<BOOL> {
         let vk = wparam.0 as u32;
         const VK_BACK: u32 = 0x08;
+        const VK_SPACE: u32 = 0x20;
+        const VK_LEFT: u32 = 0x25;
+        const VK_RIGHT: u32 = 0x27;
         // 「这次按键是 Shift 组合键」这件事必须在这里就记下：
         // 下面可能一个键都不认领（`Shift+=` → `+` 交给应用、英文模式下所有键都放行），
         // 那种情况下 TSF 不会再调 OnKeyDown，只在 OnKeyDown 里记就会漏掉，
@@ -1616,8 +1619,16 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
         // 必须连着 `is_visible()` 一起判：只判"有没有词"的话，窗口刚自己收起、
         // 词表还没清干净的那一下会把数字吃掉（或者反过来把词插进文档）。
         let hint_digit = !composing && hint::is_visible() && hint_pick_index(vk).is_some();
+        // 左右键在联想条里翻；空格只在用户已经用左右键进去之后才认领（否则会吃掉正常空格）
+        let hint_nav = !composing
+            && hint::is_visible()
+            && (vk == VK_LEFT || vk == VK_RIGHT);
+        let hint_space = !composing
+            && vk == VK_SPACE
+            && hint::is_visible()
+            && hint::focused();
         let claim = self.can_compose(pic.as_ref())
-            && (hint_digit
+            && (hint_digit || hint_nav || hint_space
                 || ((should_claim(vk, composing, shift_held(), caps_on(), !chinese_mode)
                     && !(punct_passthrough && is_punct_key(vk, shift_held())))
                     || (undo && vk == VK_BACK)));
@@ -1672,6 +1683,21 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
 
         // ── 联想条的数字选择（1/2/3）──
         // 先于一切：用户刚上屏一个词、联想条还在，按 1 就是选第一个联想词。
+        // 左右键：在联想条里移动选中项
+        if (vk == VK_LEFT || vk == VK_RIGHT) && hint::is_visible() && !self.is_composing() {
+            let delta = if vk == VK_LEFT { -1 } else { 1 };
+            if hint::move_sel(delta) {
+                return Ok(BOOL(1));
+            }
+        }
+        // 空格：用户已经用左右键进到联想条里了，就是"确认选中的那个词"
+        if vk == VK_SPACE
+            && let Some(i) = hint::take_space()
+        {
+            let _ = self.handle_hint_click(i);
+            return Ok(BOOL(1));
+        }
+
         if let Some(i) = hint_pick_index(vk) {
             let tips = hint::current();
             if !self.is_composing() && hint::is_visible() && i < tips.len() {

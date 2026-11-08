@@ -39,6 +39,11 @@ static REGISTERED: AtomicBool = AtomicBool::new(false);
 static TIPS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 static SOURCE: Mutex<Option<String>> = Mutex::new(None);
 static HOVER: AtomicIsize = AtomicIsize::new(-1);
+/// 键盘选中的下标（`-1` = 还没用键盘选过）。
+static SEL: AtomicIsize = AtomicIsize::new(-1);
+/// 用户有没有用左右键"进到"联想条里。空格只在进去之后才算确认 ——
+/// 否则刚上屏一个词就按空格（想打个空格）会被当成选联想词。
+static FOCUSED: AtomicBool = AtomicBool::new(false);
 
 const PAD: i32 = 6;
 /// 本体外面留的发光/阴影边
@@ -184,6 +189,8 @@ pub fn hide() {
     TIPS.lock().unwrap_or_else(|p| p.into_inner()).clear();
     *SOURCE.lock().unwrap_or_else(|p| p.into_inner()) = None;
     HOVER.store(-1, Ordering::SeqCst);
+    SEL.store(-1, Ordering::SeqCst);
+    FOCUSED.store(false, Ordering::SeqCst);
 }
 
 /// 光标下面弹一条联想。`caret` 是 `(x, 顶边, 底边)`，和候选窗同一套坐标。
@@ -195,6 +202,8 @@ pub fn show(tips: &[String], caret: (i32, i32, i32), from: &str) {
     *TIPS.lock().unwrap_or_else(|p| p.into_inner()) = tips.to_vec();
     *SOURCE.lock().unwrap_or_else(|p| p.into_inner()) = Some(from.to_string());
     HOVER.store(-1, Ordering::SeqCst);
+    SEL.store(-1, Ordering::SeqCst);
+    FOCUSED.store(false, Ordering::SeqCst);
 
     unsafe {
         ensure_window();
@@ -231,7 +240,11 @@ fn present(hwnd: HWND) -> bool {
     }
     let widths: Vec<i32> = it.iter().map(|(_, ww)| *ww).collect();
     let k = scale(1) as f32;
-    let hov = HOVER.load(Ordering::SeqCst);
+    let hov = if FOCUSED.load(Ordering::SeqCst) {
+        SEL.load(Ordering::SeqCst)
+    } else {
+        HOVER.load(Ordering::SeqCst)
+    };
 
     // 底色：整条一块圆角卡片
     {
@@ -456,6 +469,56 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             0
         }
         _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+    }
+}
+
+/// 用户按了左右键：在联想词之间移动选中项。返回 true 表示这次按键被吃掉了。
+///
+/// 第一次按就"进到"联想条里（`FOCUSED`），之后空格才是"确认选中项"。
+pub fn move_sel(delta: isize) -> bool {
+    if !is_visible() {
+        return false;
+    }
+    let n = TIPS.lock().unwrap_or_else(|p| p.into_inner()).len() as isize;
+    if n <= 0 {
+        return false;
+    }
+    let cur = SEL.load(Ordering::SeqCst);
+    let next = if cur < 0 {
+        // 还没选中：往右选第一个，往左选最后一个
+        if delta > 0 { 0 } else { n - 1 }
+    } else {
+        (cur + delta).clamp(0, n - 1)
+    };
+    SEL.store(next, Ordering::SeqCst);
+    FOCUSED.store(true, Ordering::SeqCst);
+    let hwnd = HWND_CELL.load(Ordering::SeqCst);
+    if hwnd != 0 {
+        unsafe { present(hwnd as HWND) };
+    }
+    crate::log_line(&format!("hint: sel {next}"));
+    true
+}
+
+/// 用户有没有用左右键进到联想条里（空格认领要用）。
+pub fn focused() -> bool {
+    is_visible() && FOCUSED.load(Ordering::SeqCst)
+}
+
+/// 空格：只有用户已经用左右键进到联想条里了，才当作"确认选中项"。
+pub fn take_space() -> Option<usize> {
+    if !is_visible() || !FOCUSED.load(Ordering::SeqCst) {
+        return None;
+    }
+    let sel = SEL.load(Ordering::SeqCst);
+    if sel < 0 {
+        return None;
+    }
+    let n = TIPS.lock().unwrap_or_else(|p| p.into_inner()).len();
+    if (sel as usize) < n {
+        Some(sel as usize)
+    } else {
+        None
     }
 }
 
