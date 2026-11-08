@@ -13,9 +13,8 @@ use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering};
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
-    AC_SRC_ALPHA, AC_SRC_OVER, BLENDFUNCTION, DT_CENTER, DT_SINGLELINE, DT_VCENTER, DeleteObject,
-    GetDC, ReleaseDC, SelectObject, SetBkMode, TRANSPARENT, CreateFontW,
-    GetTextExtentPoint32W,
+    AC_SRC_ALPHA, AC_SRC_OVER, BLENDFUNCTION, CreateFontW, DT_CENTER, DT_SINGLELINE, DT_VCENTER,
+    DeleteObject, GetDC, GetTextExtentPoint32W, ReleaseDC, SelectObject, SetBkMode, TRANSPARENT,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, GetForegroundWindow, HWND_TOPMOST, IsWindowVisible, KillTimer,
@@ -66,24 +65,7 @@ fn wide(s: &str) -> Vec<u16> {
 
 fn make_font(px: i32, weight: i32) -> windows_sys::Win32::Graphics::Gdi::HFONT {
     let face = wide("Microsoft YaHei UI");
-    unsafe {
-        CreateFontW(
-            -px,
-            0,
-            0,
-            0,
-            weight,
-            0,
-            0,
-            0,
-            1,
-            0,
-            0,
-            0,
-            0,
-            face.as_ptr(),
-        )
-    }
+    unsafe { CreateFontW(-px, 0, 0, 0, weight, 0, 0, 0, 1, 0, 0, 0, 0, face.as_ptr()) }
 }
 
 /// 每个联想词的文字（带序号）与宽度。
@@ -120,10 +102,8 @@ fn outer_size() -> (i32, i32) {
     if it.is_empty() {
         return (0, 0);
     }
-    let w: i32 = it.iter().map(|(_, w)| *w).sum::<i32>()
-        + GAP * (it.len() as i32 - 1)
-        + PAD * 2
-        + GLOW * 2;
+    let w: i32 =
+        it.iter().map(|(_, w)| *w).sum::<i32>() + GAP * (it.len() as i32 - 1) + PAD * 2 + GLOW * 2;
     (w, ITEM_H + PAD * 2 + GLOW * 2)
 }
 
@@ -292,10 +272,7 @@ fn present(hwnd: HWND) -> bool {
                 let b = bg.2 as f32 * (1.0 - hot) + hb as f32 * hot;
                 let ai = (a * 255.0 + 0.5) as u32;
                 if let Some(slot) = px.get_mut((y * w + x) as usize) {
-                    *slot = (ai << 24)
-                        | ((r as u32) << 16)
-                        | ((g as u32) << 8)
-                        | (b as u32);
+                    *slot = (ai << 24) | ((r as u32) << 16) | ((g as u32) << 8) | (b as u32);
                 }
             }
         }
@@ -317,11 +294,7 @@ fn present(hwnd: HWND) -> bool {
             };
             let t = wide(label);
             let fg = if i as isize == hov {
-                if dark {
-                    0x00F1_EC_EC
-                } else {
-                    0x0022_2222
-                }
+                if dark { 0x00F1_EC_EC } else { 0x0022_2222 }
             } else if dark {
                 0x00C8_C2_C2
             } else {
@@ -380,13 +353,7 @@ fn place(caret: (i32, i32, i32), w: i32, h: i32) -> (i32, i32) {
     let mut area_top = 0;
     let mut area_bottom = 1080;
     unsafe {
-        let mon = MonitorFromPoint(
-            POINT {
-                x: cx,
-                y: bottom,
-            },
-            MONITOR_DEFAULTTONEAREST,
-        );
+        let mon = MonitorFromPoint(POINT { x: cx, y: bottom }, MONITOR_DEFAULTTONEAREST);
         if !mon.is_null() {
             let mut mi: MONITORINFO = std::mem::zeroed();
             mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;

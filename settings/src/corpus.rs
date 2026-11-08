@@ -35,7 +35,11 @@ fn load_pinyin(exe_dir: &Path) -> HashMap<char, Vec<String>> {
                 continue;
             };
             let Some(c) = ch.chars().next() else { continue };
-            let list: Vec<String> = py.split(',').filter(|s| !s.is_empty()).map(String::from).collect();
+            let list: Vec<String> = py
+                .split(',')
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .collect();
             if !list.is_empty() {
                 map.insert(c, list);
             }
@@ -169,7 +173,9 @@ pub fn rebuild(notes: &Path, out_path: &Path, exe_dir: &Path) -> Result<Report, 
                     continue;
                 }
                 let sub: String = chars[i..j].iter().collect();
-                let e = containing.entry(Box::leak(sub.into_boxed_str())).or_insert(0);
+                let e = containing
+                    .entry(Box::leak(sub.into_boxed_str()))
+                    .or_insert(0);
                 if *w > *e {
                     *e = *w;
                 }
@@ -231,5 +237,8 @@ pub fn rebuild(notes: &Path, out_path: &Path, exe_dir: &Path) -> Result<Report, 
     for l in &lines {
         let _ = writeln!(f, "{l}");
     }
-    Ok(Report { files, entries: lines.len() })
+    Ok(Report {
+        files,
+        entries: lines.len(),
+    })
 }

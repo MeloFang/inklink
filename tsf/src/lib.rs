@@ -1620,15 +1620,12 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
         // 词表还没清干净的那一下会把数字吃掉（或者反过来把词插进文档）。
         let hint_digit = !composing && hint::is_visible() && hint_pick_index(vk).is_some();
         // 左右键在联想条里翻；空格只在用户已经用左右键进去之后才认领（否则会吃掉正常空格）
-        let hint_nav = !composing
-            && hint::is_visible()
-            && (vk == VK_LEFT || vk == VK_RIGHT);
-        let hint_space = !composing
-            && vk == VK_SPACE
-            && hint::is_visible()
-            && hint::focused();
+        let hint_nav = !composing && hint::is_visible() && (vk == VK_LEFT || vk == VK_RIGHT);
+        let hint_space = !composing && vk == VK_SPACE && hint::is_visible() && hint::focused();
         let claim = self.can_compose(pic.as_ref())
-            && (hint_digit || hint_nav || hint_space
+            && (hint_digit
+                || hint_nav
+                || hint_space
                 || ((should_claim(vk, composing, shift_held(), caps_on(), !chinese_mode)
                     && !(punct_passthrough && is_punct_key(vk, shift_held())))
                     || (undo && vk == VK_BACK)));

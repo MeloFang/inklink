@@ -24,8 +24,9 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, GetWindowTextW,
     IsDialogMessageW, MessageBoxW, PostQuitMessage, RegisterClassW, SendMessageW, SetWindowTextW,
     ShowWindow, TranslateMessage, BM_GETCHECK, BM_SETCHECK, BS_AUTOCHECKBOX, CW_USEDEFAULT,
-    ES_AUTOHSCROLL, ES_NUMBER, MB_ICONERROR, MB_OK, MSG, SW_SHOW, WM_COMMAND, WM_CREATE, WM_DESTROY,
-    WNDCLASSW, WS_BORDER, WS_CAPTION, WS_CHILD, WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
+    ES_AUTOHSCROLL, ES_NUMBER, MB_ICONERROR, MB_OK, MSG, SW_SHOW, WM_COMMAND, WM_CREATE,
+    WM_DESTROY, WNDCLASSW, WS_BORDER, WS_CAPTION, WS_CHILD, WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP,
+    WS_VISIBLE,
 };
 
 mod corpus;
@@ -42,6 +43,7 @@ const ID_AI_ENDPOINT: usize = 107;
 const ID_AI_MODEL: usize = 108;
 /// 语料表路径（笔记词汇进候选用的那张表）
 const ID_CORPUS: usize = 109;
+const ID_IMPORT: usize = 110;
 const ID_SAVE: usize = 1001;
 const ID_RESET: usize = 1002;
 const ID_CLOSE: usize = 1003;
@@ -490,12 +492,7 @@ unsafe fn build_ui(hwnd: HWND) {
     let ai_model = edit_text(&c.ai_model, 16, 290, 380, ID_AI_MODEL);
 
     // ── 个人语料（M2）─────────────────────────────────────
-    label(
-        "笔记目录（Obsidian 库；留空 = E:\\Obsidian\\News Releases）",
-        16,
-        320,
-        380,
-    );
+    label("笔记目录（Obsidian 库；留空 = 不启用）", 16, 320, 380);
     let corpus = edit_text(&c.corpus_path, 16, 342, 380, ID_CORPUS);
 
     let status = child(
@@ -514,6 +511,7 @@ unsafe fn build_ui(hwnd: HWND) {
     button("保存", 16, 412, 76, ID_SAVE);
     button("恢复默认", 100, 412, 90, ID_RESET);
     button("关闭", 198, 412, 76, ID_CLOSE);
+    button("立即导入", 286, 412, 100, ID_IMPORT);
 
     UI.with(|u| {
         let mut u = u.borrow_mut();
@@ -528,6 +526,30 @@ unsafe fn build_ui(hwnd: HWND) {
         u.corpus = corpus;
         u.status = status;
     });
+}
+
+/// 只导入、不保存设置：给用户一个"我现在就想生成"的按钮。
+fn on_import() {
+    let ui = UI.with(|u| u.borrow().to_snapshot());
+    let notes = text_of(ui.corpus).trim().to_string();
+    if notes.is_empty() {
+        set_status("先在上面填笔记目录，再点导入。");
+        return;
+    }
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|x| x.to_path_buf()))
+        .unwrap_or_default();
+    let out = dirs_corpus();
+    let msg = match corpus::rebuild(std::path::Path::new(&notes), &out, &exe_dir) {
+        Ok(r) => format!("导入完成：{} 篇笔记 / {} 条语料。", r.files, r.entries),
+        Err(e) => format!("导入失败：{e}"),
+    };
+    set_status(&msg);
+}
+
+fn set_status(msg: &str) {
+    UI.with(|u| unsafe { set_text(u.borrow().status, msg) });
 }
 
 fn on_save(hwnd: HWND) {
@@ -549,10 +571,9 @@ fn on_save(hwnd: HWND) {
                     let out = dirs_corpus();
                     let report = corpus::rebuild(std::path::Path::new(&notes), &out, &exe_dir);
                     let msg = match report {
-                        Ok(r) => format!(
-                            "已保存，并导入 {} 篇笔记 / {} 条语料。",
-                            r.files, r.entries
-                        ),
+                        Ok(r) => {
+                            format!("已保存，并导入 {} 篇笔记 / {} 条语料。", r.files, r.entries)
+                        }
                         Err(e) => format!("已保存，但导入失败：{e}"),
                     };
                     UI.with(|u| unsafe { set_text(u.borrow().status, &msg) });
@@ -623,6 +644,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 ID_CLOSE => {
                     DestroyWindow(hwnd);
                 }
+                ID_IMPORT => on_import(),
+                _ => {}
                 _ => {}
             }
             0
