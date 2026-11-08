@@ -132,12 +132,14 @@ Step 4 '配置引擎路径...'
 New-Item -Path 'HKLM:\SOFTWARE\inklink' -Force | Out-Null
 Set-ItemProperty 'HKLM:\SOFTWARE\inklink' -Name 'EnginePath' -Value "$ENG\rime-server.exe"
 
-# ── 5. 开机自启引擎 ────────────────────────────────────────────
+# ── 5. 不设开机自启（引擎由输入法按需拉起）────────────────────
 Write-Host ''
-Step 5 '设置开机自启...'
+Step 5 '清理开机自启...'
+# 以前在 Run 里挂 rime-server.exe：它是控制台程序，每次登录都闪一个黑框。
+# 现在引擎由 DLL 在第一次打字时用 CREATE_NO_WINDOW 拉起，自启既没必要也难看。
+# 这一段保留是为了把老版本留下的那条删掉。
 $run = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
-New-Item -Path $run -Force | Out-Null
-Set-ItemProperty $run -Name 'inklink-engine' -Value "`"$ENG\rime-server.exe`""
+Remove-ItemProperty -Path $run -Name 'inklink-engine' -ErrorAction SilentlyContinue
 
 # ── 6. 加入输入法列表 ──────────────────────────────────────────
 # 这一段最容易在「非中文系统 / 精简系统」上失败（Windows.Globalization 模块
