@@ -1297,7 +1297,14 @@ static std::vector<std::string> query(const std::string& code, const std::string
         exact = collect_candidates(g_exact, flat, EXACT_HEAD);
     }
 
-    out = collect_candidates(g_session, flat, MAX_CANDS);
+    // 给 librime 的码**保留撇号边界**：`zhen'ge` 会被切成 zhen+ge，
+    // 而拍平成 `zhenge` 只会按最长匹配切成 zheng+e（用户打撇号等于白打）。
+    // 老习惯的 `xiang-mu`（连字符）会被 normalize_boundaries 统一成 `'`。
+    // 带边界查不到时再退回拍平版本，保证行为不倒退。
+    out = collect_candidates(g_session, normalize_boundaries(code), MAX_CANDS);
+    if (out.empty() && normalize_boundaries(code) != flat) {
+        out = collect_candidates(g_session, flat, MAX_CANDS);
+    }
     if (out.empty() && exact.empty()) {
         if (corrected.empty()) return out;
         return corrected;   // 连 rime 都喂不进去，直接给纠错结果
