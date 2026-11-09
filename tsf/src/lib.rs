@@ -3089,7 +3089,7 @@ fn shift_or_caps() -> bool {
 /// 用 `GetKeyState` 而不是 `GetAsyncKeyState`：后者的低字节（开关状态）
 /// 在 MSDN 里明确标注"不可靠"，实测开了 CapsLock 仍返回 0，导致大写失效。
 /// `GetKeyState` 返回的是"当前线程处理最后一条消息时"的状态，正是我们要的。
-fn caps_on() -> bool {
+pub(crate) fn caps_on() -> bool {
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetKeyState;
     const VK_CAPITAL: i32 = 0x14;
     // SAFETY: 纯查询

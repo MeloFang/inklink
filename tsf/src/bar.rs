@@ -1673,7 +1673,10 @@ unsafe fn paint_bar(c: &mut Canvas, hover: i32, dark: bool) {
     }
 
     // 第二格：中/英。开=激活色，关=灰。
-    let (mode_text, mode_fg) = if chinese {
+    // Caps Lock 开着时显示 A：这时打出来的就是大写字母，只显示"中"会误导
+    let (mode_text, mode_fg) = if crate::caps_on() {
+        ("A", pal.accent)
+    } else if chinese {
         ("中", pal.accent)
     } else {
         ("英", pal.dim)
