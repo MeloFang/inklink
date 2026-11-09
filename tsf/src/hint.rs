@@ -39,7 +39,6 @@ static TIPS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 static SOURCE: Mutex<Option<String>> = Mutex::new(None);
 static HOVER: AtomicIsize = AtomicIsize::new(-1);
 
-
 const PAD: i32 = 6;
 /// 本体外面留的发光/阴影边
 const GLOW: i32 = 9;

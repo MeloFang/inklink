@@ -1625,10 +1625,8 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                 || ((should_claim(vk, composing, shift_held(), caps_on(), !chinese_mode)
                     && !(punct_passthrough && is_punct_key(vk, shift_held())))
                     || (undo && vk == VK_BACK)));
-        // 大写锁定开着时，字母键**不认领**：用户要的就是大写字母，
-        // 认领下来只会弹一个空候选窗（2026-11-09 用户反馈）。
-        let caps_letter = caps_on() && (0x41..=0x5A).contains(&vk);
-        let claim = claim && !caps_letter;
+        // 大写锁定**不影响打字**（用户确认：照常走中文、弹候选窗）；
+        // 浮条那边会把「中」显示成「A」，用来提示当前开了大写。
         log_line(&format!("test vk={vk} claim={claim} composing={composing}"));
         Ok(BOOL(if claim { 1 } else { 0 }))
     }
@@ -2572,6 +2570,8 @@ fn should_claim(vk: u32, composing: bool, shift: bool, caps: bool, english: bool
 
     // 空闲：只有"无 Shift/CapsLock 的纯字母"才启动拼写
     // 纯字母（无 Shift/CapsLock）→ 认领，开始拼写
+    // 空闲：``纯字母``才闲始拼写。
+    // Caps Lock 开着 = 临时英文直出（不认领、不弹候选窗），浮条显示「A」提示。
     if (VK_A..=VK_Z).contains(&vk) && !shift && !caps {
         return true;
     }
@@ -3706,6 +3706,7 @@ mod tests {
             !should_claim(VK_A_KEY, false, true, false, false),
             "Shift 按住应放行"
         );
+        // Caps Lock 开着 = 临时英文直出：不认领，字母直接进文档
         assert!(
             !should_claim(VK_A_KEY, false, false, true, false),
             "CapsLock 开着应放行"
