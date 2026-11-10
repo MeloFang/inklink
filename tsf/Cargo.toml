@@ -1,6 +1,6 @@
 [package]
 name = "inklink-tsf"
-version = "2.0.6"
+version = "2.0.7"
 edition = "2024"
 description = "inklink 的 TSF 文本服务（薄壳）"
 

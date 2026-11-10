@@ -3022,44 +3022,65 @@ fn apply_pick(
     Some(EditAction::PickCompose(pick, buffer.clone()))
 }
 
-/// 轻量容错：拼音串切不成音节时（多打/打错几个字母），试着删掉一小段再切。
+/// 拼音串能不能被音节完整覆盖（每个字母都归到某个音节）。
+fn fully_syllabic(flat: &str) -> bool {
+    let lens = crate::pinyin::split_lengths(flat);
+    lens.iter().sum::<usize>() == flat.chars().count()
+}
+
+/// 容错变体：**换位**（手滑）与**删**（多打/打错）。
 ///
-/// `shihikan` 里的 `hi` 不是音节 —— 删掉就变成 `shikan`，至少能从"是"变成"试看"。
-/// 只做"删"，不做"补"：补音节（`shikan` → `shishikan`「试试看」）靠 Rime 的
-/// corrector / 纠错表，见 PLAN.md 的「纠错」条目。
-///
-/// 返回最多 3 个候选串，按删除长度短的优先。
+/// 触发条件统一：`flat` 本身切不成音节（能切就正常查，不用猜）。
+///   1. 相邻换位   `nihoa`    -> `nihao`
+///   2. 删 2~3 个  `shihikan` -> `shikan`（hi 不是音节）
+/// "补音节"（`shikan` -> `shishikan` 试试看）在这一层做不了：`shikan` 本身是
+/// 合法切分，走正常查询，输入法无从得知用户想多打一个音节 —— 那要在候选层
+/// 纠错，见 PLAN.md「纠错」。
 fn typo_variants(flat: &str) -> Vec<String> {
-    let bytes: Vec<char> = flat.chars().collect();
-    let n = bytes.len();
-    if n < 3 {
-        return Vec::new();
-    }
-    let full = |s: &str| -> bool {
-        let lens = crate::pinyin::split_lengths(s);
-        lens.iter().sum::<usize>() == s.chars().count()
-    };
-    if full(flat) {
+    let chars: Vec<char> = flat.chars().collect();
+    let n = chars.len();
+    if n < 3 || fully_syllabic(flat) {
         return Vec::new();
     }
     let mut out: Vec<String> = Vec::new();
-    for del in 2..=3usize {
-        for start in 0..n.saturating_sub(del) {
-            let mut cand: String = String::new();
-            for (i, c) in bytes.iter().enumerate() {
-                if i >= start && i < start + del {
-                    continue;
-                }
-                cand.push(*c);
-            }
-            if cand.len() == n - del && full(&cand) && !out.contains(&cand) {
-                out.push(cand);
-                if out.len() >= 3 {
-                    return out;
-                }
-            }
+    let mut push = |cand: String, out: &mut Vec<String>| -> bool {
+        if fully_syllabic(&cand) && !out.contains(&cand) {
+            out.push(cand);
+            return out.len() >= 6;
+        }
+        false
+    };
+
+    // 1) 相邻换位（最常见的手滑）：shikhan -> shihkan
+    for i in 0..n - 1 {
+        let mut cand = chars.clone();
+        cand.swap(i, i + 1);
+        let cand: String = cand.into_iter().collect();
+        if push(cand, &mut out) {
+            return out;
         }
     }
+
+    // 2) 删 2~3 个连续字母（多打/打错）：shihikan 删 hi -> shikan
+    for del in 2..=3usize {
+        let mut done = false;
+        for start in 0..=n.saturating_sub(del) {
+            let cand: String = chars
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| !(*i >= start && *i < start + del))
+                .map(|(_, c)| c)
+                .collect();
+            if cand.len() == n - del && push(cand, &mut out) {
+                done = true;
+                break;
+            }
+        }
+        if done {
+            return out;
+        }
+    }
+
     out
 }
 
@@ -3765,6 +3786,26 @@ mod tests {
             !should_claim(VK_A_KEY, false, false, true, false),
             "CapsLock 开着应放行"
         );
+    }
+
+    #[test]
+    fn 容错_删换补() {
+        // 删：hi 不是音节
+        let v = typo_variants("shihikan");
+        assert!(
+            v.contains(&"shikan".to_string()),
+            "删掉 hi -> shikan，实际 {v:?}"
+        );
+        // 换位：nihoa 相邻交换 o/a 得 nihao（ni|hao）
+        let v = typo_variants("nihoa");
+        assert!(
+            v.contains(&"nihao".to_string()),
+            "换位 -> nihao，实际 {v:?}"
+        );
+        // 补音节在这一层做不了：shikan 是合法切分，直接走正常查询
+        assert!(typo_variants("shikan").is_empty());
+        // 正常拼音不产生变体
+        assert!(typo_variants("nihao").is_empty());
     }
 
     #[test]
