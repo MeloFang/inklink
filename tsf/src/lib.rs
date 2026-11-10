@@ -3028,18 +3028,25 @@ fn fully_syllabic(flat: &str) -> bool {
     lens.iter().sum::<usize>() == flat.chars().count()
 }
 
-/// 容错变体：**换位**（手滑）与**删**（多打/打错）。
+/// 容错变体：三类，全部只动 1 个字母（覆盖绝大多数手滑）：
+///
+///   1. 相邻换位   `nihoa`    -> `nihao`（打反了）
+///   2. 补 1 字母  `zhge`     -> `zhege`（少打了一个 e；这是"想打 zhege"的情形）
+///   3. 删 1~3 字母 `shihikan` -> `shikan`（多打了 hi；hi 不是音节）
 ///
 /// 触发条件统一：`flat` 本身切不成音节（能切就正常查，不用猜）。
-///   1. 相邻换位   `nihoa`    -> `nihao`
-///   2. 删 2~3 个  `shihikan` -> `shikan`（hi 不是音节）
-/// "补音节"（`shikan` -> `shishikan` 试试看）在这一层做不了：`shikan` 本身是
-/// 合法切分，走正常查询，输入法无从得知用户想多打一个音节 —— 那要在候选层
-/// 纠错，见 PLAN.md「纠错」。
+/// 生成顺序即尝试顺序：换位最先（一个编辑搞定），补字母按 e/i/u/a 的常用序，
+/// 删按 1/2/3。`query_with_fallback` 逐个试，第一个查到候选的就收手（最多试 4 个，
+/// 同步路径 50ms 预算之内，见 ADR-0002）。
+///
+/// "补音节"（`shikan` -> `shishikan`）在这一层做不了：合法切分走正常查询，
+/// 输入法无从得知用户想多打一个音节 —— 那要在候选层纠，见 PLAN.md「纠错」。
 fn typo_variants(flat: &str) -> Vec<String> {
+    const LETTER_ORDER: &[char] = &['e', 'i', 'u', 'a', 'o', 'n', 'g', 'h'];
+
     let chars: Vec<char> = flat.chars().collect();
     let n = chars.len();
-    if n < 3 || fully_syllabic(flat) {
+    if n < 2 || n > 12 || fully_syllabic(flat) {
         return Vec::new();
     }
     let mut out: Vec<String> = Vec::new();
@@ -3051,7 +3058,7 @@ fn typo_variants(flat: &str) -> Vec<String> {
         false
     };
 
-    // 1) 相邻换位（最常见的手滑）：shikhan -> shihkan
+    // 1) 相邻换位
     for i in 0..n - 1 {
         let mut cand = chars.clone();
         cand.swap(i, i + 1);
@@ -3061,17 +3068,34 @@ fn typo_variants(flat: &str) -> Vec<String> {
         }
     }
 
-    // 2) 删 2~3 个连续字母（多打/打错）：shihikan 删 hi -> shikan
-    for del in 2..=3usize {
+    // 2) 补 1 个字母（按常用韵母首字母排序）
+    if n <= 8 {
+        'outer: for pos in 0..=n {
+            for letter in LETTER_ORDER {
+                let mut cand = chars.clone();
+                cand.insert(pos, *letter);
+                let cand: String = cand.into_iter().collect();
+                if push(cand, &mut out) {
+                    break 'outer;
+                }
+            }
+        }
+    }
+
+    // 3) 删 1~3 个连续字母
+    for del in 1..=3usize {
+        if del >= n {
+            break;
+        }
         let mut done = false;
-        for start in 0..=n.saturating_sub(del) {
+        for start in 0..=n - del {
             let cand: String = chars
                 .iter()
                 .enumerate()
                 .filter(|(i, _)| !(*i >= start && *i < start + del))
                 .map(|(_, c)| c)
                 .collect();
-            if cand.len() == n - del && push(cand, &mut out) {
+            if push(cand, &mut out) {
                 done = true;
                 break;
             }
@@ -3080,7 +3104,6 @@ fn typo_variants(flat: &str) -> Vec<String> {
             return out;
         }
     }
-
     out
 }
 
@@ -3091,9 +3114,10 @@ fn query_with_fallback(code: &str) -> (Vec<String>, usize) {
     if strip_separators(&code).is_empty() {
         return (Vec::new(), 0);
     }
-    // 先赌一把"多打/打错了几个字母"：切不成音节时删一小段再查
+    // 先赌一把"打错了"：切不成音节时生成变体（换位/补/删）逐个试。
+    // 最多试 4 个：同步路径 50ms 预算（ADR-0002），一条管道往返 ~2ms。
     let flat0 = strip_separators(&code);
-    for cand in typo_variants(&flat0) {
+    for cand in typo_variants(&flat0).into_iter().take(4) {
         let r = ipc::query(&cand);
         if !r.is_empty() {
             let len = cand.chars().count();
@@ -3790,21 +3814,26 @@ mod tests {
 
     #[test]
     fn 容错_删换补() {
-        // 删：hi 不是音节
-        let v = typo_variants("shihikan");
-        assert!(
-            v.contains(&"shikan".to_string()),
-            "删掉 hi -> shikan，实际 {v:?}"
-        );
-        // 换位：nihoa 相邻交换 o/a 得 nihao（ni|hao）
+        // 换位：nihoa -> nihao
         let v = typo_variants("nihoa");
         assert!(
             v.contains(&"nihao".to_string()),
             "换位 -> nihao，实际 {v:?}"
         );
-        // 补音节在这一层做不了：shikan 是合法切分，直接走正常查询
+        // 少打一个字母：zhge -> zhege（这个）。zhe 是常用韵母，排第一
+        let v = typo_variants("zhge");
+        assert!(
+            v.first() == Some(&"zhege".to_string()),
+            "补字母 -> zhege 在首位，实际 {v:?}"
+        );
+        // 多打了 hi：shihikan -> shikan（删 1 个 h 即可）
+        let v = typo_variants("shihikan");
+        assert!(
+            v.contains(&"shikan".to_string()),
+            "删字母 -> shikan，实际 {v:?}"
+        );
+        // 合法切分不产生变体
         assert!(typo_variants("shikan").is_empty());
-        // 正常拼音不产生变体
         assert!(typo_variants("nihao").is_empty());
     }
 
