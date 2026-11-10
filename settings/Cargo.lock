@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "inklink-settings"
-version = "2.0.10"
+version = "2.0.11"
 dependencies = [
  "windows-sys",
 ]

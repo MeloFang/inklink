@@ -3035,8 +3035,8 @@ fn fully_syllabic(flat: &str) -> bool {
 ///   3. 删 1~3 字母 `shihikan` -> `shikan`（多打了 hi；hi 不是音节）
 ///
 /// 触发条件统一：`flat` 本身切不成音节（能切就正常查，不用猜）。
-/// 生成顺序即尝试顺序：换位最先（一个编辑搞定），补字母按 e/i/u/a 的常用序，
-/// 删按 1/2/3。`query_with_fallback` 逐个试，第一个查到候选的就收手（最多试 4 个，
+/// 生成后按"单字母音节少"排序（`nioha` 里 nihao 排在 nioha 前），截 6 个。
+/// `query_with_fallback` 逐个试，第一个查到候选的就收手（最多试 4 个，
 /// 同步路径 50ms 预算之内，见 ADR-0002）。
 ///
 /// "补音节"（`shikan` -> `shishikan`）在这一层做不了：合法切分走正常查询，
@@ -3053,7 +3053,7 @@ fn typo_variants(flat: &str) -> Vec<String> {
     let mut push = |cand: String, out: &mut Vec<String>| -> bool {
         if fully_syllabic(&cand) && !out.contains(&cand) {
             out.push(cand);
-            return out.len() >= 6;
+            return out.len() >= 12;
         }
         false
     };
@@ -3064,12 +3064,12 @@ fn typo_variants(flat: &str) -> Vec<String> {
         cand.swap(i, i + 1);
         let cand: String = cand.into_iter().collect();
         if push(cand, &mut out) {
-            return out;
+            break;
         }
     }
 
     // 2) 补 1 个字母（按常用韵母首字母排序）
-    if n <= 8 {
+    if n <= 8 && out.len() < 12 {
         'outer: for pos in 0..=n {
             for letter in LETTER_ORDER {
                 let mut cand = chars.clone();
@@ -3084,10 +3084,9 @@ fn typo_variants(flat: &str) -> Vec<String> {
 
     // 3) 删 1~3 个连续字母
     for del in 1..=3usize {
-        if del >= n {
+        if del >= n || out.len() >= 12 {
             break;
         }
-        let mut done = false;
         for start in 0..=n - del {
             let cand: String = chars
                 .iter()
@@ -3096,14 +3095,22 @@ fn typo_variants(flat: &str) -> Vec<String> {
                 .map(|(_, c)| c)
                 .collect();
             if push(cand, &mut out) {
-                done = true;
                 break;
             }
         }
-        if done {
-            return out;
-        }
     }
+
+    // 排序：**单字母音节少的在前**。`nihoa` 的换位有 nihao（ni|hao）和
+    // nioha（ni|o|ha）两个候选，o 这种单字母韵母拼不出正经词 —— 有它的排后面。
+    // 同分保持生成顺序（换位 > 补 > 删）。
+    let singles = |cand: &String| -> usize {
+        crate::pinyin::split_lengths(cand)
+            .iter()
+            .filter(|&&l| l == 1)
+            .count()
+    };
+    out.sort_by_key(|c| singles(c));
+    out.truncate(6);
     out
 }
 
@@ -3814,11 +3821,11 @@ mod tests {
 
     #[test]
     fn 容错_删换补() {
-        // 换位：nihoa -> nihao
+        // 换位：nihoa -> nihao（ni|hao）排在 nioha（ni|o|ha，有单字母音节）前面
         let v = typo_variants("nihoa");
         assert!(
-            v.contains(&"nihao".to_string()),
-            "换位 -> nihao，实际 {v:?}"
+            v.first() == Some(&"nihao".to_string()),
+            "换位 nihao 应排第一，实际 {v:?}"
         );
         // 少打一个字母：zhge -> zhege（这个）。zhe 是常用韵母，排第一
         let v = typo_variants("zhge");
