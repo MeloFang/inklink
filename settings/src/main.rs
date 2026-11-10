@@ -132,6 +132,14 @@ fn model_or_default(s: &str) -> String {
     }
 }
 
+/// 实体表的默认位置（%LOCALAPPDATA%\inklink\entities.tsv）。
+fn dirs_entities() -> std::path::PathBuf {
+    let base = std::env::var_os("LOCALAPPDATA")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    base.join("inklink").join("entities.tsv")
+}
+
 /// 语料表的默认位置（%LOCALAPPDATA%\inklink\corpus.tsv）。
 fn dirs_corpus() -> std::path::PathBuf {
     let base = std::env::var_os("LOCALAPPDATA")
@@ -540,12 +548,29 @@ fn on_import() {
         .ok()
         .and_then(|p| p.parent().map(|x| x.to_path_buf()))
         .unwrap_or_default();
-    let out = dirs_corpus();
-    let msg = match corpus::rebuild(std::path::Path::new(&notes), &out, &exe_dir) {
-        Ok(r) => format!("导入完成：{} 篇笔记 / {} 条语料。", r.files, r.entries),
-        Err(e) => format!("导入失败：{e}"),
-    };
+    let msg = import_all(&notes, &exe_dir);
     set_status(&msg);
+}
+
+/// 生成语料表 + 实体表，返回一句人话（状态行直接显示）。
+///
+/// 实体是 M3 的东西：抽不到不算失败（笔记里没有 `负责人：` 这类结构很正常），
+/// 只在有结果时附在后面。
+fn import_all(notes: &str, exe_dir: &std::path::Path) -> String {
+    let dir = std::path::Path::new(notes);
+    let corpus_out = dirs_corpus();
+    let mut msg = match corpus::rebuild(dir, &corpus_out, exe_dir) {
+        Ok(r) => format!("导入完成：{} 篇笔记 / {} 条语料", r.files, r.entries),
+        Err(e) => return format!("导入失败：{e}"),
+    };
+    let entities_out = dirs_entities();
+    if let Ok(r) = corpus::extract_entities(dir, &entities_out, exe_dir) {
+        if r.entries > 0 {
+            msg.push_str(&format!(" / {} 个实体", r.entries));
+        }
+    }
+    msg.push('。');
+    msg
 }
 
 fn set_status(msg: &str) {
@@ -563,19 +588,12 @@ fn on_save(hwnd: HWND) {
                         set_text(u.borrow().status, "已保存 —— 下一次按键生效。")
                     });
                 } else {
-                    // 顺手把笔记目录转成语料表：用户只要填目录，不用再跑脚本
+                    // 顺手把笔记目录转成语料表 + 实体表：用户只要填目录，不用再跑脚本
                     let exe_dir = std::env::current_exe()
                         .ok()
                         .and_then(|p| p.parent().map(|x| x.to_path_buf()))
                         .unwrap_or_default();
-                    let out = dirs_corpus();
-                    let report = corpus::rebuild(std::path::Path::new(&notes), &out, &exe_dir);
-                    let msg = match report {
-                        Ok(r) => {
-                            format!("已保存，并导入 {} 篇笔记 / {} 条语料。", r.files, r.entries)
-                        }
-                        Err(e) => format!("已保存，但导入失败：{e}"),
-                    };
+                    let msg = import_all(&notes, &exe_dir);
                     UI.with(|u| unsafe { set_text(u.borrow().status, &msg) });
                 }
             } else {
@@ -659,6 +677,26 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
 }
 
 fn main() {
+    // 命令行模式：`inklink-settings.exe --import <笔记目录>`
+    // 给自动化/排错用 —— 不开窗，直接跑一遍抽取并把结果打到 stdout。
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(i) = args.iter().position(|a| a == "--import") {
+        let Some(dir) = args.get(i + 1) else {
+            eprintln!("用法：inklink-settings.exe --import <笔记目录>");
+            std::process::exit(2);
+        };
+        let exe_dir = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|x| x.to_path_buf()))
+            .unwrap_or_default();
+        let msg = import_all(dir, &exe_dir);
+        println!("{msg}");
+        std::process::exit(if msg.starts_with("导入失败") {
+            1
+        } else {
+            0
+        });
+    }
     unsafe {
         let cls = wide("inklink-settings");
         let wc = WNDCLASSW {

@@ -1192,6 +1192,77 @@ static void load_corpus() {
     logf("corpus: %zu codes / %zu entries", g_corpus.size(), n);
 }
 
+// ───────────────────── AI 实体（M3）─────────────────────
+// 笔记里抽出来的实体（项目代号、人名、指标名）：`entities.tsv`，一行
+// `码 \t 实体 \t 类型 \t 权重`。排序优先级：用户选过 > 实体 > 语料 > 模型。
+// 类型只给后面的联想想用，这一层不关心。见 ADR-0010。
+static std::map<std::string, std::vector<std::pair<std::string, int>>> g_entities;
+static std::string g_entities_path;
+static const size_t ENTITY_MAX_PER_CODE = 6;
+
+static std::string entity_path() {
+    std::string custom = reg_string(HKEY_CURRENT_USER, "Software\\inklink\\Config", "EntityPath");
+    if (!custom.empty()) return custom;
+    std::string user = user_dict_path();
+    size_t slash = user.find_last_of("\\/");
+    std::string dir = (slash == std::string::npos) ? std::string() : user.substr(0, slash + 1);
+    return dir + "entities.tsv";
+}
+
+static void load_entities() {
+    g_entities_path = entity_path();
+    FILE* f = fopen(g_entities_path.c_str(), "rb");
+    if (!f) {
+        logf("entities: %s not found (optional)", g_entities_path.c_str());
+        return;
+    }
+    char line[1024];
+    size_t n = 0;
+    while (fgets(line, sizeof(line), f)) {
+        std::string t(line);
+        while (!t.empty() && (t.back() == '\n' || t.back() == '\r')) t.pop_back();
+        if (t.empty() || t[0] == '#') continue;
+        // 码 	 实体 	 类型 	 权重（类型可能为空；权重可省）
+        std::vector<std::string> f2;
+        size_t pos = 0;
+        while (true) {
+            size_t tab = t.find('\t', pos);
+            if (tab == std::string::npos) {
+                f2.push_back(t.substr(pos));
+                break;
+            }
+            f2.push_back(t.substr(pos, tab - pos));
+            pos = tab + 1;
+        }
+        if (f2.size() < 2) continue;
+        const std::string& code = f2[0];
+        const std::string& word = f2[1];
+        int weight = (f2.size() >= 4) ? atoi(f2[3].c_str()) : 100;
+        if (code.empty() || word.empty()) continue;
+        g_entities[corpus_key(code)].emplace_back(word, weight);
+        n++;
+    }
+    fclose(f);
+    for (auto& kv : g_entities) {
+        std::sort(kv.second.begin(), kv.second.end(),
+                  [](const std::pair<std::string, int>& x, const std::pair<std::string, int>& y) {
+                      if (x.second != y.second) return x.second > y.second;
+                      return x.first < y.first;
+                  });
+        if (kv.second.size() > ENTITY_MAX_PER_CODE) kv.second.resize(ENTITY_MAX_PER_CODE);
+    }
+    logf("entities: %zu codes / %zu entries", g_entities.size(), n);
+}
+
+/// 查询末尾：命中的实体顶到语料前面（用户学习词之后）。
+static void apply_entities(const std::string& code, std::vector<std::string>& out) {
+    if (g_entities.empty()) return;
+    auto it = g_entities.find(corpus_key(code));
+    if (it == g_entities.end()) return;
+    corpus_apply(out, it->second);
+    logf("entity hit %s -> %zu", code.c_str(), it->second.size());
+}
+
 /// 查询末尾：命中的语料词顶到最前（用户学习词之后、librime 之前）。
 static void apply_corpus(const std::string& code, std::vector<std::string>& out) {
     if (g_corpus.empty()) return;
@@ -1434,6 +1505,9 @@ static std::vector<std::string> query(const std::string& code, const std::string
     // 用户亲手选过的那一下是比"笔记里出现过"更强的信号；选错了还有退格撤回
     // （`unlearn`）兜底。
     apply_corpus(code, out);
+
+    // 实体再压一层（优先级：用户选过 > 实体 > 语料 > 语言模型，见 ADR-0010）
+    apply_entities(code, out);
 
     // 用户词库：这个拼音下用户选过的词提前（次数多的更前）。
     // 传**带边界**的原始码：`xi'an` 下学过的「西安」只在打 `xi'an` 时提前，
@@ -2274,6 +2348,7 @@ int main(int argc, char** argv) {
     load_en_words();
     load_pairs();
     load_corpus();
+    load_entities();
 
     // 词库巡检命令（不需要 librime、不连管道，可以在引擎运行时跑）
     for (int i = 1; i < argc; i++) {

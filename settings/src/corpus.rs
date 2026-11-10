@@ -113,17 +113,10 @@ pub struct Report {
     pub entries: usize,
 }
 
-/// 扫目录，生成 `out_path`。
-pub fn rebuild(notes: &Path, out_path: &Path, exe_dir: &Path) -> Result<Report, String> {
-    if !notes.is_dir() {
-        return Err(format!("目录不存在：{}", notes.display()));
-    }
-    let pinyin = load_pinyin(exe_dir);
-    if pinyin.is_empty() {
-        return Err("找不到 pinyin.tsv（拼音表），请重装".into());
-    }
-
-    let mut terms: HashMap<String, u32> = HashMap::new();
+/// 遍历笔记目录，把每个 md/txt 的正文交给回调；返回读了几篇。
+///
+/// 跳过规则和抽取脚本一致：隐藏目录、`_docx原件`、`_archive`、名字带「模板」的目录。
+pub(crate) fn walk_notes<F: FnMut(&Path, &str)>(notes: &Path, mut f: F) -> usize {
     let mut files = 0usize;
     let mut stack = vec![notes.to_path_buf()];
     while let Some(dir) = stack.pop() {
@@ -132,7 +125,6 @@ pub fn rebuild(notes: &Path, out_path: &Path, exe_dir: &Path) -> Result<Report, 
             let path = e.path();
             let name = e.file_name().to_string_lossy().to_lowercase();
             if path.is_dir() {
-                // 和脚本一致：这些目录不看
                 if !name.starts_with('.')
                     && name != "_docx原件"
                     && name != "_archive"
@@ -145,12 +137,40 @@ pub fn rebuild(notes: &Path, out_path: &Path, exe_dir: &Path) -> Result<Report, 
             if !(name.ends_with(".md") || name.ends_with(".txt")) {
                 continue;
             }
+            // 元文档不是"业务笔记"：下划线开头（_模板、_说明）、README/SKILL/使用说明、
+            // 技能目录里的说明。它们混进来会把"双链""加粗"这种词当成实体。
+            let stem = name.trim_end_matches(".md").trim_end_matches(".txt");
+            if stem.starts_with('_')
+                || stem.eq_ignore_ascii_case("readme")
+                || stem.eq_ignore_ascii_case("skill")
+                || path
+                    .to_string_lossy()
+                    .to_lowercase()
+                    .contains("skill-data-brief")
+            {
+                continue;
+            }
             if let Ok(text) = fs::read_to_string(&path) {
                 files += 1;
-                scan_text(&text, &mut terms);
+                f(&path, &text);
             }
         }
     }
+    files
+}
+
+/// 扫目录，生成 `out_path`。
+pub fn rebuild(notes: &Path, out_path: &Path, exe_dir: &Path) -> Result<Report, String> {
+    if !notes.is_dir() {
+        return Err(format!("目录不存在：{}", notes.display()));
+    }
+    let pinyin = load_pinyin(exe_dir);
+    if pinyin.is_empty() {
+        return Err("找不到 pinyin.tsv（拼音表），请重装".into());
+    }
+
+    let mut terms: HashMap<String, u32> = HashMap::new();
+    let files = walk_notes(notes, |_p, text| scan_text(text, &mut terms));
 
     // 只留 2~4 个汉字
     terms.retain(|t, _| {
@@ -238,6 +258,191 @@ pub fn rebuild(notes: &Path, out_path: &Path, exe_dir: &Path) -> Result<Report, 
         let _ = writeln!(f, "{l}");
     }
     Ok(Report {
+        files,
+        entries: lines.len(),
+    })
+}
+
+// ───────────────────── AI 实体（M3）─────────────────────
+
+/// 实体抽取结果。
+pub struct EntityReport {
+    pub files: usize,
+    pub entries: usize,
+}
+
+/// 键值对里哪些「键」后面的值算实体。
+///
+/// 只看结构，不做语义猜测：笔记里写 `负责人：张三` 才收，正文里顺口提到的词不收。
+/// 这是 ADR-0010「规则优先」的落地 —— 零依赖、零网络、不会乱认人。
+const ENTITY_KEYS: &[&str] = &[
+    "负责人",
+    "联系人",
+    "主管",
+    "经理",
+    "主任",
+    "对接人",
+    "项目经理",
+    "项目代号",
+    "代号",
+    "项目名",
+    "项目名称",
+    "名称",
+    "系统名",
+    "平台名",
+    "产品名",
+    "客户",
+    "单位",
+    "部门",
+];
+
+fn push_entity(map: &mut HashMap<String, (u32, String)>, word: &str, weight: u32, kind: &str) {
+    let w = word.trim();
+    let n = w.chars().count();
+    if !(2..=12).contains(&n) || !w.chars().all(is_cjk) {
+        return;
+    }
+    let e = map.entry(w.to_string()).or_insert((0, kind.to_string()));
+    e.0 += weight;
+    if kind == "键值" {
+        e.1 = kind.to_string();
+    }
+}
+
+/// 显式实体表 `实体.md`：一行一个 `词 = 类型`（类型可省），`#` 开头是注释。
+///
+/// 为什么要有这个：信息稿里很少写 `负责人：张三`，纯靠键值对可能一条都抽不到
+/// （本机实测 44 篇稿子 = 0 条）。给用户一个"我说了算"的入口，零噪声。
+/// 名字固定 `实体.md`，放在笔记目录根部。
+fn scan_entity_file(text: &str, out: &mut HashMap<String, (u32, String)>) {
+    for line in text.lines() {
+        let raw = line.trim();
+        // 标题行（# 实体表）和引用（> 说明）不是词条
+        if raw.starts_with('#') || raw.starts_with('>') {
+            continue;
+        }
+        let t = raw.trim_start_matches(['-', '*', ' ']);
+        if t.is_empty() || t.starts_with("//") {
+            continue;
+        }
+        let (word, kind) = match t.split_once('=') {
+            Some((w, k)) => (w.trim(), k.trim()),
+            None => (t, "实体"),
+        };
+        let kind = if kind.is_empty() { "实体" } else { kind };
+        push_entity(out, word, 800, kind);
+    }
+}
+
+/// 从一篇正文里抽实体。
+///
+/// **只认键值对**（`负责人：张三`、`项目代号：赤兔`）。引号和表格试过，噪声太大
+/// （`【注意】`、表格表头都会被当实体），宁可少抽也不要往候选里塞垃圾。
+/// 以后要扩，先加"置信度"，别直接放宽规则。
+fn scan_entities(text: &str, out: &mut HashMap<String, (u32, String)>) {
+    for line in text.lines() {
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        // `：` 是 3 字节，必须按 char 边界切（`find` 给的是字节下标）
+        let Some((idx, ch)) = t.char_indices().find(|(_, c)| *c == '：' || *c == ':') else {
+            continue;
+        };
+        let key = t[..idx].trim().trim_start_matches(['-', '*', ' ', '#']);
+        let val = t[idx + ch.len_utf8()..].trim();
+        // 值后面可能跟解释（`负责人：张三（主持工作）`），取第一个标点前的部分
+        let val = val
+            .split(['（', '(', '，', ',', '；', ';', '。'])
+            .next()
+            .unwrap_or(val)
+            .trim();
+        if ENTITY_KEYS.iter().any(|k| key == *k) {
+            push_entity(out, val, 500, "键值");
+        }
+    }
+}
+
+/// 扫笔记抽实体，写 `entities.tsv`（`码 \t 实体 \t 类型 \t 权重`）。
+pub fn extract_entities(
+    notes: &Path,
+    out_path: &Path,
+    exe_dir: &Path,
+) -> Result<EntityReport, String> {
+    if !notes.is_dir() {
+        return Err(format!("目录不存在：{}", notes.display()));
+    }
+    let pinyin = load_pinyin(exe_dir);
+    if pinyin.is_empty() {
+        return Err("找不到 pinyin.tsv（拼音表），请重装".into());
+    }
+
+    let mut ents: HashMap<String, (u32, String)> = HashMap::new();
+    let files = walk_notes(notes, |path, text| {
+        if path
+            .file_name()
+            .map(|n| n.to_string_lossy().contains("实体"))
+            .unwrap_or(false)
+        {
+            scan_entity_file(text, &mut ents);
+        }
+        scan_entities(text, &mut ents);
+    });
+
+    let mut rows: Vec<(String, u32, String)> = ents
+        .into_iter()
+        .map(|(w, (wt, kind))| (w, wt, kind))
+        .collect();
+    rows.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    rows.truncate(2000);
+
+    let mut lines: Vec<String> = Vec::new();
+    let mut seen: HashSet<(String, String)> = HashSet::new();
+    for (word, weight, kind) in &rows {
+        let mut choices: Vec<&Vec<String>> = Vec::new();
+        let mut ok = true;
+        for c in word.chars() {
+            match pinyin.get(&c) {
+                Some(v) => choices.push(v),
+                None => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if !ok {
+            continue;
+        }
+        let mut combos: Vec<Vec<String>> = vec![Vec::new()];
+        for v in &choices {
+            let mut next = Vec::new();
+            for base in &combos {
+                for py in v.iter().take(2) {
+                    let mut b = base.clone();
+                    b.push(py.clone());
+                    next.push(b);
+                }
+            }
+            combos = next;
+            if combos.len() > 4 {
+                combos.truncate(4);
+            }
+        }
+        for combo in combos {
+            let code = combo.join(" ");
+            if seen.insert((code.clone(), word.clone())) {
+                lines.push(format!("{code}\t{word}\t{kind}\t{weight}"));
+            }
+        }
+    }
+    if let Some(parent) = out_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let mut f = fs::File::create(out_path).map_err(|e| format!("写实体表失败：{e}"))?;
+    for l in &lines {
+        let _ = writeln!(f, "{l}");
+    }
+    Ok(EntityReport {
         files,
         entries: lines.len(),
     })
