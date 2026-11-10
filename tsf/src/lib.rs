@@ -1785,6 +1785,8 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                 match (vk, shift_held()) {
                     (VK_OEM_MINUS, true) => Some('_'),
                     (VK_OEM_MINUS, false) => Some('-'),
+                    // 撇号 = 分音节：`zhen'ge` 拆成 zhen + ge，而不是出中文引号
+                    (VK_OEM_7, false) => Some('\''),
                     _ => None,
                 }
             };
@@ -3020,6 +3022,47 @@ fn apply_pick(
     Some(EditAction::PickCompose(pick, buffer.clone()))
 }
 
+/// 轻量容错：拼音串切不成音节时（多打/打错几个字母），试着删掉一小段再切。
+///
+/// `shihikan` 里的 `hi` 不是音节 —— 删掉就变成 `shikan`，至少能从"是"变成"试看"。
+/// 只做"删"，不做"补"：补音节（`shikan` → `shishikan`「试试看」）靠 Rime 的
+/// corrector / 纠错表，见 PLAN.md 的「纠错」条目。
+///
+/// 返回最多 3 个候选串，按删除长度短的优先。
+fn typo_variants(flat: &str) -> Vec<String> {
+    let bytes: Vec<char> = flat.chars().collect();
+    let n = bytes.len();
+    if n < 3 {
+        return Vec::new();
+    }
+    let full = |s: &str| -> bool {
+        let lens = crate::pinyin::split_lengths(s);
+        lens.iter().sum::<usize>() == s.chars().count()
+    };
+    if full(flat) {
+        return Vec::new();
+    }
+    let mut out: Vec<String> = Vec::new();
+    for del in 2..=3usize {
+        for start in 0..n.saturating_sub(del) {
+            let mut cand: String = String::new();
+            for (i, c) in bytes.iter().enumerate() {
+                if i >= start && i < start + del {
+                    continue;
+                }
+                cand.push(*c);
+            }
+            if cand.len() == n - del && full(&cand) && !out.contains(&cand) {
+                out.push(cand);
+                if out.len() >= 3 {
+                    return out;
+                }
+            }
+        }
+    }
+    out
+}
+
 fn query_with_fallback(code: &str) -> (Vec<String>, usize) {
     // 带着边界发出去（`xi'an`）：引擎用它查 librime（还原成 `xian`），
     // 同时用它当用户词库的键 —— 这样"在 xi'an 下选过西安"不会污染 `xian`。
@@ -3027,6 +3070,17 @@ fn query_with_fallback(code: &str) -> (Vec<String>, usize) {
     if strip_separators(&code).is_empty() {
         return (Vec::new(), 0);
     }
+    // 先赌一把"多打/打错了几个字母"：切不成音节时删一小段再查
+    let flat0 = strip_separators(&code);
+    for cand in typo_variants(&flat0) {
+        let r = ipc::query(&cand);
+        if !r.is_empty() {
+            let len = cand.chars().count();
+            log_line(&format!("typo: {flat0} -> {cand} ({len})"));
+            return (r, len);
+        }
+    }
+
     let mut probe = code;
     loop {
         let flat_len = strip_separators(&probe).len();

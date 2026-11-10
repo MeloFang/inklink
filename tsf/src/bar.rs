@@ -125,6 +125,8 @@ static FONT: AtomicIsize = AtomicIsize::new(0);
 // 状态是全局的，别的程序里点了中/英或标点，这条浮条也得跟着变。
 static PAINTED_VALID: AtomicBool = AtomicBool::new(false);
 static PAINTED_CHINESE: AtomicBool = AtomicBool::new(true);
+/// 上一次绘制时的 Caps Lock 状态（大写时图标显示 A）
+static PAINTED_CAPS: AtomicBool = AtomicBool::new(false);
 static PAINTED_PUNCT: AtomicBool = AtomicBool::new(true);
 /// 上一次用的是不是暗色主题。`config::snapshot().dark` 变了也要重画。
 static PAINTED_DARK: AtomicBool = AtomicBool::new(false);
@@ -1644,6 +1646,7 @@ unsafe fn paint_bar(c: &mut Canvas, hover: i32, dark: bool) {
     // 每次现读：Shift 在别的动作里切了中英，这里立刻反映；不缓存。
     let (chinese, punct) = crate::state::snapshot();
     PAINTED_CHINESE.store(chinese, Ordering::Relaxed);
+    PAINTED_CAPS.store(crate::caps_on(), Ordering::Relaxed);
     PAINTED_PUNCT.store(punct, Ordering::Relaxed);
     PAINTED_VALID.store(true, Ordering::Relaxed);
 
@@ -2210,6 +2213,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     || chinese != PAINTED_CHINESE.load(Ordering::Relaxed)
                     || punct != PAINTED_PUNCT.load(Ordering::Relaxed)
                     || dark != PAINTED_DARK.load(Ordering::Relaxed)
+                    || crate::caps_on() != PAINTED_CAPS.load(Ordering::Relaxed)
                 {
                     redraw(hwnd);
                 }
