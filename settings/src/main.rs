@@ -568,6 +568,9 @@ fn import_all(notes: &str, exe_dir: &std::path::Path) -> String {
         if r.entries > 0 {
             msg.push_str(&format!(" / {} 个实体", r.entries));
         }
+        if r.next_edges > 0 {
+            msg.push_str(&format!(" / {} 条关联", r.next_edges));
+        }
     }
     msg.push('。');
     msg

@@ -269,6 +269,8 @@ pub fn rebuild(notes: &Path, out_path: &Path, exe_dir: &Path) -> Result<Report, 
 pub struct EntityReport {
     pub files: usize,
     pub entries: usize,
+    /// `A -> B` 关系条数（写进 entities-next.tsv）
+    pub next_edges: usize,
 }
 
 /// 键值对里哪些「键」后面的值算实体。
@@ -314,7 +316,11 @@ fn push_entity(map: &mut HashMap<String, (u32, String)>, word: &str, weight: u32
 /// 为什么要有这个：信息稿里很少写 `负责人：张三`，纯靠键值对可能一条都抽不到
 /// （本机实测 44 篇稿子 = 0 条）。给用户一个"我说了算"的入口，零噪声。
 /// 名字固定 `实体.md`，放在笔记目录根部。
-fn scan_entity_file(text: &str, out: &mut HashMap<String, (u32, String)>) {
+fn scan_entity_file(
+    text: &str,
+    out: &mut HashMap<String, (u32, String)>,
+    edges: &mut HashMap<String, Vec<(String, u32)>>,
+) {
     for line in text.lines() {
         let raw = line.trim();
         // 标题行（# 实体表）和引用（> 说明）不是词条
@@ -323,6 +329,19 @@ fn scan_entity_file(text: &str, out: &mut HashMap<String, (u32, String)>) {
         }
         let t = raw.trim_start_matches(['-', '*', ' ']);
         if t.is_empty() || t.starts_with("//") {
+            continue;
+        }
+        // 关系行：`赤兔 -> 张三` —— 上屏「赤兔」后联想条给「张三」
+        if let Some((left, right)) = t.split_once("->") {
+            let from = left.trim();
+            let to = right.trim();
+            let (n_from, n_to) = (from.chars().count(), to.chars().count());
+            if (2..=12).contains(&n_from) && (2..=12).contains(&n_to) {
+                let e = edges.entry(from.to_string()).or_default();
+                if !e.iter().any(|(w, _)| w == to) {
+                    e.push((to.to_string(), 900));
+                }
+            }
             continue;
         }
         let (word, kind) = match t.split_once('=') {
@@ -378,13 +397,14 @@ pub fn extract_entities(
     }
 
     let mut ents: HashMap<String, (u32, String)> = HashMap::new();
+    let mut edges: HashMap<String, Vec<(String, u32)>> = HashMap::new();
     let files = walk_notes(notes, |path, text| {
         if path
             .file_name()
             .map(|n| n.to_string_lossy().contains("实体"))
             .unwrap_or(false)
         {
-            scan_entity_file(text, &mut ents);
+            scan_entity_file(text, &mut ents, &mut edges);
         }
         scan_entities(text, &mut ents);
     });
@@ -442,8 +462,26 @@ pub fn extract_entities(
     for l in &lines {
         let _ = writeln!(f, "{l}");
     }
+    // 后接表：实体 	 后接词 	 权重
+    let next_path = out_path
+        .parent()
+        .map(|d| d.join("entities-next.tsv"))
+        .unwrap_or_else(|| std::path::PathBuf::from("entities-next.tsv"));
+    let mut next_lines: Vec<String> = Vec::new();
+    let mut ents_sorted: Vec<(&String, &Vec<(String, u32)>)> = edges.iter().collect();
+    ents_sorted.sort_by(|a, b| a.0.cmp(b.0));
+    for (ent, nexts) in ents_sorted {
+        for (next, wt) in nexts {
+            next_lines.push(format!("{ent}\t{next}\t{wt}"));
+        }
+    }
+    let mut f2 = fs::File::create(&next_path).map_err(|e| format!("写实体后接表失败：{e}"))?;
+    for l in &next_lines {
+        let _ = writeln!(f2, "{l}");
+    }
     Ok(EntityReport {
         files,
         entries: lines.len(),
+        next_edges: next_lines.len(),
     })
 }

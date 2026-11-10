@@ -1098,12 +1098,87 @@ static void learn_pair(const std::string& prev, const std::string& cur) {
 }
 
 /// 上屏 `word` 之后能接什么（最多 3 个）。
+/// 注册表读字符串（实现在 AI 段；实体后接表这里先用）。
+static std::string reg_string(HKEY root, const char* path, const char* name);
+
+// 实体的"后接词"：`entities-next.tsv`，一行 `实体 \t 后接词 \t 权重`。
+// 来源：实体.md 里写 `赤兔 = 项目，负责人：张三`，或引擎从键值对里记
+// （`负责人：张三` 会记成 张三 前面的实体 -> 张三 本身）。
+// 联想条用它：上屏「赤兔」之后，给出「张三」这类关联词。见 ADR-0010。
+static std::map<std::string, std::vector<std::pair<std::string, int>>> g_entity_next;
+static std::string g_entity_next_path;
+static const size_t ENTITY_NEXT_MAX_PER = 6;
+
+static std::string entity_next_path() {
+    std::string custom = reg_string(HKEY_CURRENT_USER, "Software\\inklink\\Config", "EntityNextPath");
+    if (!custom.empty()) return custom;
+    std::string user = user_dict_path();
+    size_t slash = user.find_last_of("\\/");
+    std::string dir = (slash == std::string::npos) ? std::string() : user.substr(0, slash + 1);
+    return dir + "entities-next.tsv";
+}
+
+static void load_entity_next() {
+    g_entity_next_path = entity_next_path();
+    FILE* f = fopen(g_entity_next_path.c_str(), "rb");
+    if (!f) {
+        logf("entity-next: %s not found (optional)", g_entity_next_path.c_str());
+        return;
+    }
+    char line[1024];
+    size_t n = 0;
+    while (fgets(line, sizeof(line), f)) {
+        std::string t(line);
+        while (!t.empty() && (t.back() == '\n' || t.back() == '\r')) t.pop_back();
+        if (t.empty() || t[0] == '#') continue;
+        size_t a = t.find('\t');
+        if (a == std::string::npos) continue;
+        size_t b = t.find('\t', a + 1);
+        std::string ent = t.substr(0, a);
+        std::string next = (b == std::string::npos) ? std::string() : t.substr(a + 1, b - a - 1);
+        int weight = (b == std::string::npos) ? 100 : atoi(t.c_str() + b + 1);
+        if (ent.empty() || next.empty()) continue;
+        g_entity_next[ent].emplace_back(next, weight);
+        n++;
+    }
+    fclose(f);
+    for (auto& kv : g_entity_next) {
+        std::sort(kv.second.begin(), kv.second.end(),
+                  [](const std::pair<std::string, int>& x, const std::pair<std::string, int>& y) {
+                      if (x.second != y.second) return x.second > y.second;
+                      return x.first < y.first;
+                  });
+        if (kv.second.size() > ENTITY_NEXT_MAX_PER) kv.second.resize(ENTITY_NEXT_MAX_PER);
+    }
+    logf("entity-next: %zu entities / %zu edges", g_entity_next.size(), n);
+}
+
 static std::vector<std::string> next_words(const std::string& word, size_t limit) {
     if (word.empty()) return {};
-    std::lock_guard<std::mutex> lock(g_pairs_mutex);
-    auto it = g_pairs.find(word);
-    if (it == g_pairs.end()) return {};
-    return top_next(it->second, limit);
+    {
+        std::lock_guard<std::mutex> lock(g_pairs_mutex);
+        auto it = g_pairs.find(word);
+        if (it != g_pairs.end()) {
+            auto v = top_next(it->second, limit);
+            if (!v.empty()) return v;
+        }
+    }
+    // 学习词对没有 -> 查实体的后接词（M3）：上屏「赤兔」给「张三」这类
+    if (!g_entity_next.empty()) {
+        auto it = g_entity_next.find(word);
+        if (it != g_entity_next.end()) {
+            std::vector<std::string> out;
+            for (const auto& kv : it->second) {
+                if (out.size() >= limit) break;
+                out.push_back(kv.first);
+            }
+            if (!out.empty()) {
+                logf("entity-next hit %s -> %zu", word.c_str(), out.size());
+                return out;
+            }
+        }
+    }
+    return {};
 }
 
 // ───────────────────────── 查询 ─────────────────────────
@@ -1119,9 +1194,6 @@ static std::map<std::string, std::vector<std::pair<std::string, int>>> g_corpus;
 static std::string g_corpus_path;
 /// 每个码最多带多少个语料词（再多也翻不到，白占候选位）
 static const size_t CORPUS_MAX_PER_CODE = 8;
-
-/// 注册表读字符串（实现在 AI 段；语料这里先声明）。
-static std::string reg_string(HKEY root, const char* path, const char* name);
 
 static std::string corpus_path() {
     // 设置窗里的「语料表」路径优先：别人用的时候可以指向自己的语料表
@@ -1253,6 +1325,7 @@ static void load_entities() {
     }
     logf("entities: %zu codes / %zu entries", g_entities.size(), n);
 }
+
 
 /// 查询末尾：命中的实体顶到语料前面（用户学习词之后）。
 static void apply_entities(const std::string& code, std::vector<std::string>& out) {
@@ -2349,6 +2422,7 @@ int main(int argc, char** argv) {
     load_pairs();
     load_corpus();
     load_entities();
+    load_entity_next();
 
     // 词库巡检命令（不需要 librime、不连管道，可以在引擎运行时跑）
     for (int i = 1; i < argc; i++) {
