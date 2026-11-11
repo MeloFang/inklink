@@ -1,4 +1,4 @@
-# 在虚拟机里卸载 inklink TSF 输入法
+﻿# 在虚拟机里卸载 inklink TSF 输入法
 # 用法（管理员 PowerShell）：powershell -ExecutionPolicy Bypass -File .\uninstall.ps1
 
 $ErrorActionPreference = 'Continue'

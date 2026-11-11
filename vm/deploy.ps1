@@ -1,4 +1,4 @@
-# inklink TSF 部署到测试机（Hyper-V VM 内，管理员 PowerShell 运行）
+﻿# inklink TSF 部署到测试机（Hyper-V VM 内，管理员 PowerShell 运行）
 #
 # 用法：先把编译产物推进 VM 的 C:\Users\Public\ 下，再跑本脚本：
 #   powershell -ExecutionPolicy Bypass -File .\deploy.ps1
