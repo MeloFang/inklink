@@ -1155,30 +1155,49 @@ static void load_entity_next() {
 
 static std::vector<std::string> next_words(const std::string& word, size_t limit) {
     if (word.empty()) return {};
+    // 学习词对与实体关系**合并按权重排序**（ADR-0010）：
+    //   词对权重 = 次数 * 100（上屏「赤兔」后随手打的一句，1 次就是 100）
+    //   实体权重 = 实体.md 里声明的（默认 900）
+    // 声明的「张三」(900) 压过一次性的「我重启过」(100)，
+    // 真正反复选的习惯（>=9 次）又能反超声明 —— 两边都不冤。
+    std::vector<std::pair<std::string, int>> merged;
     {
         std::lock_guard<std::mutex> lock(g_pairs_mutex);
         auto it = g_pairs.find(word);
         if (it != g_pairs.end()) {
-            auto v = top_next(it->second, limit);
-            if (!v.empty()) return v;
+            for (const auto& kv : it->second) {
+                merged.emplace_back(kv.first, kv.second * 100);
+            }
         }
     }
-    // 学习词对没有 -> 查实体的后接词（M3）：上屏「赤兔」给「张三」这类
     if (!g_entity_next.empty()) {
         auto it = g_entity_next.find(word);
         if (it != g_entity_next.end()) {
-            std::vector<std::string> out;
             for (const auto& kv : it->second) {
-                if (out.size() >= limit) break;
-                out.push_back(kv.first);
-            }
-            if (!out.empty()) {
-                logf("entity-next hit %s -> %zu", word.c_str(), out.size());
-                return out;
+                bool dup = false;
+                for (auto& m : merged) {
+                    if (m.first == kv.first) {
+                        dup = true;
+                        if (kv.second > m.second) m.second = kv.second;
+                        break;
+                    }
+                }
+                if (!dup) merged.emplace_back(kv.first, kv.second);
             }
         }
     }
-    return {};
+    std::sort(merged.begin(), merged.end(),
+              [](const std::pair<std::string, int>& a, const std::pair<std::string, int>& b) {
+                  if (a.second != b.second) return a.second > b.second;
+                  return a.first < b.first;
+              });
+    std::vector<std::string> out;
+    for (const auto& m : merged) {
+        if (out.size() >= limit) break;
+        out.push_back(m.first);
+    }
+    if (!out.empty()) logf("hint merge %s -> %zu", word.c_str(), out.size());
+    return out;
 }
 
 // ───────────────────────── 查询 ─────────────────────────
@@ -1334,6 +1353,50 @@ static void apply_entities(const std::string& code, std::vector<std::string>& ou
     if (it == g_entities.end()) return;
     corpus_apply(out, it->second);
     logf("entity hit %s -> %zu", code.c_str(), it->second.size());
+}
+
+/// 叠音补词：`shikan`（shi|kan）试 `shishikan`，用户词库里有就补进候选。
+///
+/// 场景：用户学过 `shishikan → 试试看`，但少打一个音节时拼音切不到它。
+/// 取首音节翻倍再查用户词库，学过就补到候选末尾（最多 3 个）—— 选一次后
+/// learn_key 会把它记在 `shikan` 下，下次直接 boost 到前面。纯查表 O(1)。
+static void apply_reduplication(const std::string& code, std::vector<std::string>& out) {
+    std::lock_guard<std::mutex> lock(g_user_mutex);
+    if (g_user.empty()) return;
+    std::string flat = strip_separators(normalize_boundaries(code));
+    if (flat.size() < 3 || flat.size() > 12) return;
+    std::vector<size_t> lens = split_lengths(flat);
+    if (lens.size() < 2 || lens.size() > 4) return;
+    size_t head = lens[0];
+    std::string code2 = flat.substr(0, head) + flat.substr(0, head) + flat.substr(head);
+    if (code2.size() > 18) return;
+    auto it = g_user.find(code2);
+    if (it == g_user.end() || it->second.empty()) return;
+    // 候选满了就截到 MAX_CANDS-3 腾位子；之前两个 bug：
+    //   a) 截成 size-3 仍 >= MAX_CANDS，追加循环第一轮就 break（一个都没加进去）
+    //   b) 追加在第 10 页末尾，用户根本翻不到
+    if (out.size() + 3 > (size_t)MAX_CANDS) {
+        out.resize((size_t)MAX_CANDS - 3);
+    }
+    std::vector<std::pair<std::string, int>> words;
+    for (const auto& kv : it->second) words.emplace_back(kv.first, kv.second.total);
+    std::sort(words.begin(), words.end(),
+              [](const std::pair<std::string, int>& a, const std::pair<std::string, int>& b) {
+                  if (a.second != b.second) return a.second > b.second;
+                  return a.first < b.first;
+              });
+    // 插在第 2 位：首屏可见，又不抢 librime 第一候选的位置
+    size_t at = out.size() > 1 ? 1 : 0;
+    int added = 0;
+    for (const auto& kv : words) {
+        if (added >= 3) break;
+        if (std::find(out.begin(), out.end(), kv.first) != out.end()) continue;
+        out.insert(out.begin() + (std::ptrdiff_t)at, kv.first);
+        ++at;
+        ++added;
+    }
+    if (out.size() > (size_t)MAX_CANDS) out.resize((size_t)MAX_CANDS);
+    if (added) logf("redup %s -> %s +%d", flat.c_str(), code2.c_str(), added);
 }
 
 /// 查询末尾：命中的语料词顶到最前（用户学习词之后、librime 之前）。
@@ -1581,6 +1644,9 @@ static std::vector<std::string> query(const std::string& code, const std::string
 
     // 实体再压一层（优先级：用户选过 > 实体 > 语料 > 语言模型，见 ADR-0010）
     apply_entities(code, out);
+
+    // 叠音补词：少打一个音节时，靠学过的"首音节翻倍"码把词捞回来
+    apply_reduplication(code, out);
 
     // 用户词库：这个拼音下用户选过的词提前（次数多的更前）。
     // 传**带边界**的原始码：`xi'an` 下学过的「西安」只在打 `xi'an` 时提前，
