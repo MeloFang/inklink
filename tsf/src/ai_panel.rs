@@ -597,6 +597,7 @@ enum Hit {
     Regenerate,
     Copy,
     Paste,
+    EditSource,
 }
 
 fn inside(r: &RECT, x: i32, y: i32) -> bool {
@@ -618,6 +619,9 @@ fn hit(x: i32, y: i32, w: i32, h: i32, phase: Phase) -> Hit {
     // 「粘贴」任何时候都能点（除了不可用/正忙）：读取失败、或者用户压根不想在文档里选字
     if accepts_paste(phase) && inside(&l.paste, x, y) {
         return Hit::Paste;
+    }
+    if accepts_paste(phase) && inside(&l.source_box, x, y) {
+        return Hit::EditSource;
     }
     if result_view(phase) {
         let done = phase == Phase::Done;
@@ -1972,8 +1976,12 @@ fn on_click(h: Hit) {
                 true
             });
         }
+        Hit::EditSource => crate::source_editor::open(&state_snapshot().1),
         Hit::Paste => {
             paste_source();
+            if actions_enabled(state_snapshot().0) {
+                crate::source_editor::open(&state_snapshot().1);
+            }
         }
         Hit::Drag | Hit::None => {}
     }
