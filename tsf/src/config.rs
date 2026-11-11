@@ -32,6 +32,8 @@ pub const VALUE_ROWS: &str = "Rows";
 pub const VALUE_UNDO_MS: &str = "UndoMs";
 /// 是否记词（1/缺失 = 记，0 = 只查询不学习）。
 pub const VALUE_LEARN: &str = "Learn";
+/// 联想条开关（`Hint`，DWORD）：缺失=开，写 0=关。
+pub const VALUE_HINT: &str = "Hint";
 
 /// 列数合法区间。小于 3 一行放不下「序号 + 词」，大于 9 一屏糊成一片。
 pub const COLS_RANGE: (usize, usize) = (3, 9);
@@ -47,6 +49,8 @@ pub struct Config {
     pub rows: usize,
     pub undo_ms: u64,
     pub learn: bool,
+    /// 联想条（上屏词后给后接词）开关
+    pub hint: bool,
 }
 
 impl Config {
@@ -58,6 +62,7 @@ impl Config {
         rows: 5,
         undo_ms: 2000,
         learn: true,
+        hint: true,
     };
 
     /// 收起时一页几个：一行。
@@ -95,6 +100,7 @@ pub fn from_raw(
     rows: Option<u32>,
     undo_ms: Option<u32>,
     learn: Option<u32>,
+    hint: Option<u32>,
 ) -> Config {
     Config {
         dark: matches!(dark, Some(v) if v != 0),
@@ -112,6 +118,7 @@ pub fn from_raw(
         ) as usize,
         undo_ms: clamp_u32(undo_ms, Config::DEFAULT.undo_ms, 0, UNDO_MS_MAX),
         learn: !matches!(learn, Some(0)),
+        hint: !matches!(hint, Some(0)),
     }
 }
 
@@ -127,6 +134,7 @@ pub fn snapshot() -> Config {
             state::query_dword(key, VALUE_ROWS),
             state::query_dword(key, VALUE_UNDO_MS),
             state::query_dword(key, VALUE_LEARN),
+            state::query_dword(key, VALUE_HINT),
         );
         RegCloseKey(key);
         cfg
@@ -165,7 +173,7 @@ mod tests {
 
     #[test]
     fn 什么都没写就是出厂默认() {
-        let cfg = from_raw(None, None, None, None, None);
+        let cfg = from_raw(None, None, None, None, None, None);
         assert_eq!(cfg, Config::DEFAULT);
         assert!(!cfg.dark, "默认浅色");
         assert!(cfg.learn, "默认记词");
@@ -176,7 +184,7 @@ mod tests {
 
     #[test]
     fn 每页候选数等于列乘行() {
-        let cfg = from_raw(Some(1), Some(4), Some(3), None, None);
+        let cfg = from_raw(Some(1), Some(4), Some(3), None, None, None);
         assert_eq!(cfg.collapsed(), 4, "收起时就是一行");
         assert_eq!(cfg.expanded(), 12);
     }
@@ -184,12 +192,12 @@ mod tests {
     #[test]
     fn 脏值被夹到合法区间() {
         // 太小
-        let cfg = from_raw(None, Some(1), Some(0), Some(0), None);
+        let cfg = from_raw(None, Some(1), Some(0), Some(0), None, None);
         assert_eq!(cfg.cols, COLS_RANGE.0);
         assert_eq!(cfg.rows, ROWS_RANGE.0);
         assert_eq!(cfg.undo_ms, 0, "0 是合法值：表示关掉撤回");
         // 太大
-        let cfg = from_raw(None, Some(99), Some(99), Some(999_999), None);
+        let cfg = from_raw(None, Some(99), Some(99), Some(999_999), None, None);
         assert_eq!(cfg.cols, COLS_RANGE.1);
         assert_eq!(cfg.rows, ROWS_RANGE.1);
         assert_eq!(cfg.undo_ms, UNDO_MS_MAX);
@@ -197,29 +205,29 @@ mod tests {
 
     #[test]
     fn 暗色只看非零() {
-        assert!(!from_raw(Some(0), None, None, None, None).dark);
-        assert!(from_raw(Some(1), None, None, None, None).dark);
+        assert!(!from_raw(Some(0), None, None, None, None, None).dark);
+        assert!(from_raw(Some(1), None, None, None, None, None).dark);
         assert!(
-            from_raw(Some(7), None, None, None, None).dark,
+            from_raw(Some(7), None, None, None, None, None).dark,
             "脏值按开处理"
         );
     }
 
     #[test]
     fn 学习开关只有明确写零才关() {
-        assert!(from_raw(None, None, None, None, None).learn);
-        assert!(from_raw(None, None, None, None, Some(3)).learn);
-        assert!(!from_raw(None, None, None, None, Some(0)).learn);
+        assert!(from_raw(None, None, None, None, None, None).learn);
+        assert!(from_raw(None, None, None, None, Some(3), None).learn);
+        assert!(!from_raw(None, None, None, None, Some(0), None).learn);
     }
 
     #[test]
     fn 撤回窗口零表示关掉() {
         assert_eq!(
-            from_raw(None, None, None, Some(0), None).undo_window(),
+            from_raw(None, None, None, Some(0), None, None).undo_window(),
             None
         );
         assert_eq!(
-            from_raw(None, None, None, Some(1500), None).undo_window(),
+            from_raw(None, None, None, Some(1500), None, None).undo_window(),
             Some(std::time::Duration::from_millis(1500))
         );
     }

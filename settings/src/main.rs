@@ -43,6 +43,7 @@ const ID_AI_ENABLE: usize = 106;
 const ID_AI_ENDPOINT: usize = 107;
 const ID_AI_MODEL: usize = 108;
 const ID_AI_PROVIDER: usize = 111;
+const ID_HINT: usize = 113;
 const ID_AI_KEY: usize = 112;
 
 /// 提供商：ollama（本机）| openai（任意 OpenAI 兼容 API：DeepSeek/智谱/月暗/官方）
@@ -87,6 +88,7 @@ struct Ui {
     ai_model: HWND,
     ai_provider: HWND,
     ai_key: HWND,
+    hint: HWND,
     corpus: HWND,
     status: HWND,
 }
@@ -111,6 +113,7 @@ fn read_form(ui: &Ui) -> Result<Config, String> {
             .map(|p| p.to_string())
             .unwrap_or_else(|| "ollama".to_string()),
         ai_key: text_of(ui.ai_key).trim().to_string(),
+        hint: checked(ui.hint),
         // 笔记目录可以留空（= 导入脚本用内置默认）
         corpus_path: text_of(ui.corpus).trim().to_string(),
     })
@@ -130,6 +133,8 @@ struct Config {
     ai_provider: String,
     /// openai 模式的 API key；ollama 忽略
     ai_key: String,
+    /// 联想条开关（缺失=开）
+    hint: bool,
     /// 笔记目录（Obsidian 库）；空 = 导入脚本用内置默认
     corpus_path: String,
 }
@@ -333,6 +338,7 @@ fn default_config() -> Config {
         ai_model: DEF_MODEL.to_string(),
         ai_provider: "ollama".to_string(),
         ai_key: String::new(),
+        hint: true,
         corpus_path: String::new(),
     }
 }
@@ -360,6 +366,7 @@ fn load_config() -> Config {
         let ai_model = read_sz(h, "AI_Model").unwrap_or_else(|| DEF_MODEL.to_string());
         let ai_provider = read_sz(h, "AI_Provider").unwrap_or_else(|| "ollama".to_string());
         let ai_key = read_sz(h, "AI_ApiKey").unwrap_or_default();
+        let hint = !matches!(read_dword(h, "Hint"), Some(0));
         let corpus_path = read_sz(h, "NotesDir").unwrap_or_default();
         RegCloseKey(h);
         Config {
@@ -373,6 +380,7 @@ fn load_config() -> Config {
             ai_model,
             ai_provider,
             ai_key,
+            hint,
             corpus_path,
         }
     }
@@ -393,6 +401,7 @@ fn save_config(c: Config) -> bool {
             && write_sz(h, "AI_Model", &c.ai_model)
             && write_sz(h, "AI_Provider", &c.ai_provider)
             && write_sz(h, "AI_ApiKey", &c.ai_key)
+            && write_dword(h, "Hint", if c.hint { 1 } else { 0 })
             && write_sz(h, "NotesDir", &c.corpus_path);
         RegCloseKey(h);
         ok
@@ -580,16 +589,27 @@ unsafe fn build_ui(hwnd: HWND) {
     label("API Key（ollama 不用填）", 16, 340, 300);
     let ai_key = edit_text(&c.ai_key, 16, 360, 380, ID_AI_KEY);
 
+    let hint = check(
+        "联想条（上屏一个词后给出后面常接的词）",
+        16,
+        390,
+        360,
+        ID_HINT,
+    );
+    if c.hint {
+        SendMessageW(hint, BM_SETCHECK as u32, 1, 0);
+    }
+
     // ── 个人语料（M2）─────────────────────────────────────
-    label("笔记目录（Obsidian 库；留空 = 不启用）", 16, 386, 380);
-    let corpus = edit_text(&c.corpus_path, 16, 408, 380, ID_CORPUS);
+    label("笔记目录（Obsidian 库；留空 = 不启用）", 16, 418, 380);
+    let corpus = edit_text(&c.corpus_path, 16, 440, 380, ID_CORPUS);
 
     let status = child(
         "STATIC",
         "改完点保存，下一次按键就生效，不用重启。",
         0,
         16,
-        436,
+        466,
         380,
         18,
         hwnd,
@@ -597,10 +617,10 @@ unsafe fn build_ui(hwnd: HWND) {
     );
     add(status);
 
-    button("保存", 16, 462, 76, ID_SAVE);
-    button("恢复默认", 100, 462, 90, ID_RESET);
-    button("关闭", 198, 462, 76, ID_CLOSE);
-    button("立即导入", 286, 462, 100, ID_IMPORT);
+    button("保存", 16, 492, 76, ID_SAVE);
+    button("恢复默认", 100, 492, 90, ID_RESET);
+    button("关闭", 198, 492, 76, ID_CLOSE);
+    button("立即导入", 286, 492, 100, ID_IMPORT);
 
     UI.with(|u| {
         let mut u = u.borrow_mut();
@@ -614,6 +634,7 @@ unsafe fn build_ui(hwnd: HWND) {
         u.ai_model = ai_model;
         u.ai_provider = ai_provider;
         u.ai_key = ai_key;
+        u.hint = hint;
         u.corpus = corpus;
         u.status = status;
     });
@@ -719,6 +740,7 @@ impl Ui {
             ai_model: self.ai_model,
             ai_provider: self.ai_provider,
             ai_key: self.ai_key,
+            hint: self.hint,
             corpus: self.corpus,
             status: self.status,
         }
@@ -746,6 +768,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     set_text(ui.ai_model, DEF_MODEL_OLLAMA);
                     SendMessageW(ui.ai_provider, CB_SETCURSEL as u32, 0, 0);
                     set_text(ui.ai_key, "");
+                    SendMessageW(ui.hint, BM_SETCHECK as u32, 1, 0);
                     set_text(ui.corpus, "");
                     set_text(ui.status, "已填回默认值 —— 还要点一次“保存”才写进去。");
                 }
@@ -816,7 +839,7 @@ fn main() {
             CW_USEDEFAULT,
             CW_USEDEFAULT,
             424,
-            520,
+            548,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
             std::ptr::null_mut(),

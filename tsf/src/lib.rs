@@ -862,6 +862,10 @@ impl TextService_Impl {
     /// 只有 2~8 个汉字的词才参与（标点、单个字母、英文词都会把"上一个词"清掉，
     /// 这样 `，` 和空格不会把两句不相干的话接成一条联想）。
     fn note_hint(&self, word: &str) {
+        // 设置里关掉联想条就完全不问引擎（省一次管道往返）
+        if !crate::config::snapshot().hint {
+            return;
+        }
         let chars = word.chars().count();
         let ascii = word.chars().all(|c| c.is_ascii());
         let usable = !ascii && (2..=8).contains(&chars);
