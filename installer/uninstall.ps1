@@ -45,7 +45,9 @@ foreach ($k in @(
     "HKLM:\SOFTWARE\Wow6432Node\Microsoft\CTF\TIP\$CLSID",
     "HKLM:\SOFTWARE\Classes\CLSID\$CLSID",
     "HKLM:\SOFTWARE\Classes\Wow6432Node\CLSID\$CLSID",
-    "HKLM:\SOFTWARE\inklink"
+    "HKLM:\SOFTWARE\inklink",
+    # 应用列表里那条「inklink 输入法」；不删的话卸完还显示着
+    "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\inklink"
 )) {
     Remove-Item $k -Recurse -Force -ErrorAction SilentlyContinue
 }
@@ -54,8 +56,22 @@ Remove-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name 
 
 # 4. 删文件
 Write-Host '[4/5] 删除文件...'
+# 先把还在占着 DLL 的进程点名，用户知道要重启哪些程序
+$loaded = Get-Process | Where-Object { $_.Modules -ne $null } | ForEach-Object {
+    $proc = $_
+    try { $m = $proc.Modules | Where-Object { $_.ModuleName -like 'inklink_tsf*.dll' } } catch { $m = $null }
+    if ($m) { $proc.ProcessName }
+} 2>$null | Sort-Object -Unique
+if ($loaded) {
+    Write-Host "  这些程序还加载着输入法 DLL（重启它们才会彻底释放）：$($loaded -join ', ')" -ForegroundColor Yellow
+}
 Remove-Item $PF  -Recurse -Force -ErrorAction SilentlyContinue
 Remove-Item $ENG -Recurse -Force -ErrorAction SilentlyContinue
+# 个人数据（学习词库、语料、实体表、配置）
+Remove-Item (Join-Path $env:LOCALAPPDATA 'inklink') -Recurse -Force -ErrorAction SilentlyContinue
+Remove-Item 'HKCU:\Software\inklink' -Recurse -Force -ErrorAction SilentlyContinue
+if (Test-Path $PF)  { Write-Host "  提示：$PF 还有文件被占用，重启后手动删除即可。" -ForegroundColor Yellow }
+if (Test-Path $ENG) { Write-Host "  提示：$ENG 还有文件被占用，重启后手动删除即可。" -ForegroundColor Yellow }
 
 # 5. 完成
 Write-Host '[5/5] 完成'

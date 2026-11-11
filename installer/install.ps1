@@ -70,6 +70,11 @@ if (Test-Path "$SRC\inklink.ico") { Install-File "$SRC\inklink.ico" "$PF\inklink
 if (Test-Path "$SRC\inklink-badge.ico") { Install-File "$SRC\inklink-badge.ico" "$PF\inklink-badge.ico" | Out-Null }
 Install-File "$SRC\rime-server.exe" "$ENG\rime-server.exe" | Out-Null
 Install-File "$SRC\rime.dll"        "$ENG\rime.dll"        | Out-Null
+# VC++ 运行库（x86）放在引擎同目录：干净的 Windows 没装可再发行组件时，
+# rime-server.exe 会因为缺 msvcp140.dll 直接起不来（候选永远为空）。
+foreach ($dll in @('msvcp140.dll', 'msvcp140_1.dll', 'msvcp140_2.dll', 'vcruntime140.dll', 'vcruntime140_1.dll', 'concrt140.dll')) {
+    if (Test-Path "$SRC\$dll") { Install-File "$SRC\$dll" "$ENG\$dll" | Out-Null }
+}
 # 英文补全词表（1.1.46）：引擎按 exe 同目录找它，漏了就是"打 gith 不补 github"
 if (Test-Path "$SRC\en-words.txt") { Install-File "$SRC\en-words.txt" "$ENG\en-words.txt" | Out-Null }
 # 设置窗（P2a/P4b）：浮条 ☰ 的「设置…」按 DLL 同目录找它。漏装的话菜单点了没反应。
@@ -90,8 +95,9 @@ if (Test-Path "$SRC\rime\user") {
     New-Item -ItemType Directory -Force "$ENG\rime\user" | Out-Null
     Copy-Item "$SRC\rime\user\*" "$ENG\rime\user" -Recurse -Force
 }
-if (Test-Path "$SRC\rime\data") { Copy-Item "$SRC\rime\data" "$ENG\rime\" -Recurse -Force }
-if (Test-Path "$SRC\rime\user") { Copy-Item "$SRC\rime\user" "$ENG\rime\" -Recurse -Force }
+# 注意：这里**不要**再 Copy-Item "$SRC\rime\data" "$ENG\rime\"。
+# 目标目录已存在时那会把内容再套一层，产出 rime\data\data —— 引擎读到空目录，
+# 表现就是"打什么都是零候选"（2026-11-11 同事机器）。
 Write-Host "    64 位 DLL : $dll64"
 Write-Host "    32 位 DLL : $dll32"
 
@@ -126,11 +132,37 @@ foreach ($root in @('HKLM:\SOFTWARE\Microsoft\CTF\TIP', 'HKLM:\SOFTWARE\Wow6432N
     Set-ItemProperty $lp -Name 'IconIndex'  -Value 0 -Type DWord
 }
 
-# ── 4. 引擎路径 ────────────────────────────────────────────────
+# ── 4. 引擎路径 + 卸载登记 ─────────────────────────────────────
 Write-Host ''
-Step 4 '配置引擎路径...'
+Step 4 '配置引擎路径、登记卸载入口...'
 New-Item -Path 'HKLM:\SOFTWARE\inklink' -Force | Out-Null
 Set-ItemProperty 'HKLM:\SOFTWARE\inklink' -Name 'EnginePath' -Value "$ENG\rime-server.exe"
+
+# 应用列表（设置 → 应用 → 已安装的应用）里要能看到、能卸载。
+# 之前没写这段，同事装完根本找不到卸载入口（2026-11-11 反馈）。
+$unKey = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\inklink'
+New-Item -Path $unKey -Force | Out-Null
+Set-ItemProperty $unKey -Name 'DisplayName'     -Value 'inklink 输入法'
+Set-ItemProperty $unKey -Name 'DisplayVersion'  -Value $Version
+Set-ItemProperty $unKey -Name 'Publisher'       -Value 'inklink (open source, GPL-3.0)'
+Set-ItemProperty $unKey -Name 'DisplayIcon'     -Value "$PF\inklink.ico"
+Set-ItemProperty $unKey -Name 'InstallLocation' -Value $PF
+Set-ItemProperty $unKey -Name 'UninstallString' -Value "powershell -NoProfile -ExecutionPolicy Bypass -File `"$PF\uninstall.ps1`""
+Set-ItemProperty $unKey -Name 'QuietUninstallString' -Value "powershell -NoProfile -ExecutionPolicy Bypass -File `"$PF\uninstall.ps1`" -Quiet"
+Set-ItemProperty $unKey -Name 'NoModify' -Value 1 -Type DWord
+Set-ItemProperty $unKey -Name 'NoRepair' -Value 1 -Type DWord
+$sizeKb = 0
+foreach ($d in @($PF, $ENG)) {
+    if (Test-Path $d) { $sizeKb += [int](((Get-ChildItem $d -Recurse -File -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum) / 1KB) }
+}
+Set-ItemProperty $unKey -Name 'EstimatedSize' -Value $sizeKb -Type DWord
+Write-Host "    已登记：inklink 输入法 $Version（应用列表可卸载）"
+
+# 把卸载器和诊断工具放到安装目录，装完也能随时自救
+foreach ($f in @('uninstall.ps1', 'uninstall.cmd', 'diagnose.ps1', 'diagnose.cmd', 'install.ps1', 'install.cmd', 'README.txt')) {
+    $src = Join-Path $PSScriptRoot $f
+    if (Test-Path $src) { Copy-Item $src (Join-Path $PF $f) -Force }
+}
 
 # ── 5. 不设开机自启（引擎由输入法按需拉起）────────────────────
 Write-Host ''
@@ -167,14 +199,40 @@ try {
 
 # ── 7. 启动引擎 ────────────────────────────────────────────────
 Write-Host ''
-Step 7 '启动引擎...'
-Start-Process "$ENG\rime-server.exe" -WorkingDirectory $ENG -WindowStyle Hidden
-Start-Sleep -Seconds 3
-$proc = Get-Process rime-server -ErrorAction SilentlyContinue
-if ($proc) {
-    Write-Host "    引擎已启动：pid $($proc[0].Id)" -ForegroundColor Green
-} else {
-    Write-Host '    警告：引擎没能启动（不影响安装，第一次打字时 DLL 会自己拉起它）' -ForegroundColor Yellow
+Step 7 '启动引擎并实测一次查询...'
+
+function Probe-Engine([string]$code) {
+    $c = New-Object System.IO.Pipes.NamedPipeClientStream('.', 'inklink-engine', [System.IO.Pipes.PipeDirection]::InOut)
+    try { $c.Connect(3000) } catch { return -1 }
+    try {
+        $bytes = [Text.Encoding]::UTF8.GetBytes($code)
+        $w = New-Object System.IO.BinaryWriter($c)
+        $w.Write([byte]1); $w.Write([uint32]$bytes.Length); $w.Write($bytes); $w.Write([uint16]0); $w.Flush()
+        $r = New-Object System.IO.BinaryReader($c)
+        return [int]$r.ReadUInt32()
+    } catch { return -1 } finally { $c.Dispose() }
+}
+
+$engineOk = $false
+for ($attempt = 1; $attempt -le 3; $attempt++) {
+    if (-not (Get-Process rime-server -ErrorAction SilentlyContinue)) {
+        Start-Process "$ENG\rime-server.exe" -WorkingDirectory $ENG -WindowStyle Hidden `
+            -RedirectStandardOutput "$ENG\rime-server.stdout.log" `
+            -RedirectStandardError  "$ENG\rime-server.stderr.log"
+        Start-Sleep -Seconds 4   # 首次启动要编译词库，约 4 秒
+    }
+    $n = Probe-Engine 'nihao'
+    if ($n -gt 0) {
+        Write-Host "    引擎实测通过：nihao -> $n 个候选" -ForegroundColor Green
+        $engineOk = $true
+        break
+    }
+    Write-Host "    第 $attempt 次探测没拿到候选（首次可能要编译词库），再等..." -ForegroundColor Yellow
+    Start-Sleep -Seconds 5
+}
+if (-not $engineOk) {
+    Write-Host '    警告：引擎在跑但查不到候选。安装目录里有 diagnose.cmd，跑一下把报告发回。' -ForegroundColor Red
+    Write-Host "    引擎日志：$ENG\rime-server.log" -ForegroundColor Yellow
 }
 
 # 浮条不再独立进程：切到 inklink 输入法时由 DLL 在宿主进程里画（搜狗那种）。
@@ -187,6 +245,7 @@ $checks = @(
     @{ Name = '32 位 DLL';  Ok = (Test-Path $dll32) },
     @{ Name = '引擎 exe';   Ok = (Test-Path "$ENG\rime-server.exe") },
     @{ Name = 'rime.dll';   Ok = (Test-Path "$ENG\rime.dll") },
+    @{ Name = 'VC 运行库（x86）'; Ok = (Test-Path "$ENG\vcruntime140.dll") },
     @{ Name = 'rime 数据'; Ok = (Test-Path "$ENG\rime\data\default.yaml") },
     @{ Name = '英文词表';  Ok = (Test-Path "$ENG\en-words.txt") },
     @{ Name = '随包字体';  Ok = (Test-Path "$PF\fonts\ZhuqueFangsong-Regular.ttf") },

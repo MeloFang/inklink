@@ -329,6 +329,12 @@ pub fn query(code: &str) -> Vec<String> {
     // SAFETY: 句柄在本函数内配对关闭；读操作全部带超时
     unsafe {
         let Some(pipe) = open_pipe(QUERY_TIMEOUT_MS) else {
+            // 管道打不开时一直"候选为空"——日志要能区分"连不上"和"连上了没词"，
+            // 否则远程排障只能猜（2026-11-11 同事机器实测）。
+            crate::log_line(&format!(
+                "query {code}: pipe unavailable (engine_alive={})",
+                engine_alive()
+            ));
             return Vec::new();
         };
 

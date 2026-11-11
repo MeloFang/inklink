@@ -70,6 +70,23 @@ if (Test-Path $fontsSrc) {
 Copy-Item "$ENG\rime-server.exe" $files -Force
 Copy-Item "$ENG\rime.dll"        $files -Force
 Copy-Item "$ENG\en-words.txt"    $files -Force
+# VC++ 运行库（x86，app-local）：rime-server.exe 是 /MD 编的，依赖 msvcp140 + vcruntime140。
+# 干净的 Windows 没装「VC++ 2015-2022 可再发行组件（x86）」时引擎直接起不来 ——
+# 表现为「浮条正常、打字只有拼音没有候选」，2026-11-11 同事机器实测。
+# 随包带 app-local 副本，Windows 会优先加载 exe 同目录的这份，不必让用户装运行库。
+$vcRuntime = @('msvcp140.dll', 'msvcp140_1.dll', 'msvcp140_2.dll', 'vcruntime140.dll', 'vcruntime140_1.dll', 'concrt140.dll')
+$copied = 0
+foreach ($dll in $vcRuntime) {
+    $src = Join-Path $env:WINDIR "SysWOW64\$dll"
+    # 有的系统没有 vcruntime140_1.dll（不是所有 VS 版本都发这个）；有就带，没有跳过
+    if (Test-Path $src) {
+        Copy-Item $src $files -Force
+        $copied++
+    } elseif ($dll -in @('msvcp140.dll', 'vcruntime140.dll')) {
+        throw "缺少 $src —— 本机没装 x86 VC++ 运行库，无法为安装包提供 app-local 副本"
+    }
+}
+Write-Host "  VC 运行库 $copied 个（x86，app-local）" -ForegroundColor DarkGray
 Copy-Item (Join-Path $root 'installer\pinyin.tsv') (Join-Path $files 'pinyin.tsv') -Force
 # 设置窗（P2a）：和 DLL 同目录，浮条菜单的「设置…」按同目录找它
 $settingsExe = Join-Path $root 'settings\target\release\inklink-settings.exe'
