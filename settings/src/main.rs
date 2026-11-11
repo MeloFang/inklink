@@ -23,7 +23,8 @@ use windows_sys::Win32::System::Registry::{
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, GetWindowTextW,
     IsDialogMessageW, MessageBoxW, PostQuitMessage, RegisterClassW, SendMessageW, SetWindowTextW,
-    ShowWindow, TranslateMessage, BM_GETCHECK, BM_SETCHECK, BS_AUTOCHECKBOX, CW_USEDEFAULT,
+    ShowWindow, TranslateMessage, BM_GETCHECK, BM_SETCHECK, BS_AUTOCHECKBOX, CBS_DROPDOWNLIST,
+    CB_ADDSTRING, CB_GETCURSEL, CB_GETLBTEXT, CB_GETLBTEXTLEN, CB_SETCURSEL, CW_USEDEFAULT,
     ES_AUTOHSCROLL, ES_NUMBER, MB_ICONERROR, MB_OK, MSG, SW_SHOW, WM_COMMAND, WM_CREATE,
     WM_DESTROY, WNDCLASSW, WS_BORDER, WS_CAPTION, WS_CHILD, WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP,
     WS_VISIBLE,
@@ -41,6 +42,15 @@ const ID_UNDO: usize = 105;
 const ID_AI_ENABLE: usize = 106;
 const ID_AI_ENDPOINT: usize = 107;
 const ID_AI_MODEL: usize = 108;
+const ID_AI_PROVIDER: usize = 111;
+const ID_AI_KEY: usize = 112;
+
+/// 提供商：ollama（本机）| openai（任意 OpenAI 兼容 API：DeepSeek/智谱/月暗/官方）
+const AI_PROVIDERS: &[&str] = &["ollama", "openai"];
+const DEF_ENDPOINT_OLLAMA: &str = "http://127.0.0.1:11434";
+const DEF_ENDPOINT_OPENAI: &str = "https://api.deepseek.com";
+const DEF_MODEL_OLLAMA: &str = "qwen2.5:7b";
+const DEF_MODEL_OPENAI: &str = "deepseek-chat";
 /// 语料表路径（笔记词汇进候选用的那张表）
 const ID_CORPUS: usize = 109;
 const ID_IMPORT: usize = 110;
@@ -75,6 +85,8 @@ struct Ui {
     ai_enable: HWND,
     ai_endpoint: HWND,
     ai_model: HWND,
+    ai_provider: HWND,
+    ai_key: HWND,
     corpus: HWND,
     status: HWND,
 }
@@ -93,6 +105,12 @@ fn read_form(ui: &Ui) -> Result<Config, String> {
         ai_enabled: checked(ui.ai_enable),
         ai_endpoint: endpoint_or_default(&text_of(ui.ai_endpoint)),
         ai_model: model_or_default(&text_of(ui.ai_model)),
+        ai_provider: AI_PROVIDERS
+            .iter()
+            .find(|p| **p == combo_sel(ui.ai_provider))
+            .map(|p| p.to_string())
+            .unwrap_or_else(|| "ollama".to_string()),
+        ai_key: text_of(ui.ai_key).trim().to_string(),
         // 笔记目录可以留空（= 导入脚本用内置默认）
         corpus_path: text_of(ui.corpus).trim().to_string(),
     })
@@ -108,6 +126,10 @@ struct Config {
     ai_enabled: bool,
     ai_endpoint: String,
     ai_model: String,
+    /// ollama | openai
+    ai_provider: String,
+    /// openai 模式的 API key；ollama 忽略
+    ai_key: String,
     /// 笔记目录（Obsidian 库）；空 = 导入脚本用内置默认
     corpus_path: String,
 }
@@ -146,6 +168,28 @@ fn dirs_corpus() -> std::path::PathBuf {
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::path::PathBuf::from("."));
     base.join("inklink").join("corpus.tsv")
+}
+
+/// 下拉框当前选中的文本（没有选中则空串）。
+fn combo_sel(h: HWND) -> String {
+    let idx = unsafe { SendMessageW(h, CB_GETCURSEL as u32, 0, 0) };
+    if idx < 0 {
+        return String::new();
+    }
+    let len = unsafe { SendMessageW(h, CB_GETLBTEXTLEN as u32, idx as usize, 0) } as usize;
+    if len == 0 || len > 64 {
+        return String::new();
+    }
+    let mut buf = vec![0u16; len + 1];
+    unsafe {
+        SendMessageW(
+            h,
+            CB_GETLBTEXT as u32,
+            idx as usize,
+            buf.as_mut_ptr() as isize,
+        )
+    };
+    String::from_utf16_lossy(&buf[..len])
 }
 
 fn checked(h: HWND) -> bool {
@@ -287,6 +331,8 @@ fn default_config() -> Config {
         ai_enabled: false,
         ai_endpoint: DEF_ENDPOINT.to_string(),
         ai_model: DEF_MODEL.to_string(),
+        ai_provider: "ollama".to_string(),
+        ai_key: String::new(),
         corpus_path: String::new(),
     }
 }
@@ -312,6 +358,8 @@ fn load_config() -> Config {
         let ai_enabled = matches!(read_dword(h, "AI_Enable"), Some(v) if v != 0);
         let ai_endpoint = read_sz(h, "AI_Endpoint").unwrap_or_else(|| DEF_ENDPOINT.to_string());
         let ai_model = read_sz(h, "AI_Model").unwrap_or_else(|| DEF_MODEL.to_string());
+        let ai_provider = read_sz(h, "AI_Provider").unwrap_or_else(|| "ollama".to_string());
+        let ai_key = read_sz(h, "AI_ApiKey").unwrap_or_default();
         let corpus_path = read_sz(h, "NotesDir").unwrap_or_default();
         RegCloseKey(h);
         Config {
@@ -323,6 +371,8 @@ fn load_config() -> Config {
             ai_enabled,
             ai_endpoint,
             ai_model,
+            ai_provider,
+            ai_key,
             corpus_path,
         }
     }
@@ -341,6 +391,8 @@ fn save_config(c: Config) -> bool {
             && write_dword(h, "AI_Enable", if c.ai_enabled { 1 } else { 0 })
             && write_sz(h, "AI_Endpoint", &c.ai_endpoint)
             && write_sz(h, "AI_Model", &c.ai_model)
+            && write_sz(h, "AI_Provider", &c.ai_provider)
+            && write_sz(h, "AI_ApiKey", &c.ai_key)
             && write_sz(h, "NotesDir", &c.corpus_path);
         RegCloseKey(h);
         ok
@@ -493,22 +545,51 @@ unsafe fn build_ui(hwnd: HWND) {
         SendMessageW(ai_enable, BM_SETCHECK as u32, 1, 0);
     }
 
-    label("接口地址（Ollama 兼容端点）", 16, 220, 300);
-    let ai_endpoint = edit_text(&c.ai_endpoint, 16, 240, 380, ID_AI_ENDPOINT);
+    label("提供商", 16, 216, 100);
+    let ai_provider = child(
+        "COMBOBOX",
+        "",
+        0x0003 | WS_TABSTOP, // CBS_DROPDOWNLIST
+        90,
+        212,
+        160,
+        200,
+        hwnd,
+        ID_AI_PROVIDER,
+    );
+    for p in AI_PROVIDERS {
+        SendMessageW(
+            ai_provider,
+            CB_ADDSTRING as u32,
+            0,
+            wide_static(p).as_ptr() as isize,
+        );
+    }
+    let sel = AI_PROVIDERS
+        .iter()
+        .position(|p| **p == c.ai_provider)
+        .unwrap_or(0);
+    SendMessageW(ai_provider, CB_SETCURSEL as u32, sel as usize, 0);
 
-    label("模型名", 16, 270, 100);
-    let ai_model = edit_text(&c.ai_model, 16, 290, 380, ID_AI_MODEL);
+    label("接口地址", 16, 248, 300);
+    let ai_endpoint = edit_text(&c.ai_endpoint, 16, 268, 380, ID_AI_ENDPOINT);
+
+    label("模型名", 16, 294, 100);
+    let ai_model = edit_text(&c.ai_model, 16, 314, 380, ID_AI_MODEL);
+
+    label("API Key（ollama 不用填）", 16, 340, 300);
+    let ai_key = edit_text(&c.ai_key, 16, 360, 380, ID_AI_KEY);
 
     // ── 个人语料（M2）─────────────────────────────────────
-    label("笔记目录（Obsidian 库；留空 = 不启用）", 16, 320, 380);
-    let corpus = edit_text(&c.corpus_path, 16, 342, 380, ID_CORPUS);
+    label("笔记目录（Obsidian 库；留空 = 不启用）", 16, 386, 380);
+    let corpus = edit_text(&c.corpus_path, 16, 408, 380, ID_CORPUS);
 
     let status = child(
         "STATIC",
         "改完点保存，下一次按键就生效，不用重启。",
         0,
         16,
-        386,
+        436,
         380,
         18,
         hwnd,
@@ -516,10 +597,10 @@ unsafe fn build_ui(hwnd: HWND) {
     );
     add(status);
 
-    button("保存", 16, 412, 76, ID_SAVE);
-    button("恢复默认", 100, 412, 90, ID_RESET);
-    button("关闭", 198, 412, 76, ID_CLOSE);
-    button("立即导入", 286, 412, 100, ID_IMPORT);
+    button("保存", 16, 462, 76, ID_SAVE);
+    button("恢复默认", 100, 462, 90, ID_RESET);
+    button("关闭", 198, 462, 76, ID_CLOSE);
+    button("立即导入", 286, 462, 100, ID_IMPORT);
 
     UI.with(|u| {
         let mut u = u.borrow_mut();
@@ -531,6 +612,8 @@ unsafe fn build_ui(hwnd: HWND) {
         u.ai_enable = ai_enable;
         u.ai_endpoint = ai_endpoint;
         u.ai_model = ai_model;
+        u.ai_provider = ai_provider;
+        u.ai_key = ai_key;
         u.corpus = corpus;
         u.status = status;
     });
@@ -634,6 +717,8 @@ impl Ui {
             ai_enable: self.ai_enable,
             ai_endpoint: self.ai_endpoint,
             ai_model: self.ai_model,
+            ai_provider: self.ai_provider,
+            ai_key: self.ai_key,
             corpus: self.corpus,
             status: self.status,
         }
@@ -658,7 +743,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     SendMessageW(ui.learn, BM_SETCHECK as u32, 1, 0);
                     SendMessageW(ui.ai_enable, BM_SETCHECK as u32, 0, 0);
                     set_text(ui.ai_endpoint, DEF_ENDPOINT);
-                    set_text(ui.ai_model, DEF_MODEL);
+                    set_text(ui.ai_model, DEF_MODEL_OLLAMA);
+                    SendMessageW(ui.ai_provider, CB_SETCURSEL as u32, 0, 0);
+                    set_text(ui.ai_key, "");
                     set_text(ui.corpus, "");
                     set_text(ui.status, "已填回默认值 —— 还要点一次“保存”才写进去。");
                 }
@@ -729,7 +816,7 @@ fn main() {
             CW_USEDEFAULT,
             CW_USEDEFAULT,
             424,
-            478,
+            520,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
             std::ptr::null_mut(),

@@ -1810,10 +1810,14 @@ static DWORD reg_dword(HKEY root, const char* path, const char* name, DWORD fall
     return v;
 }
 
+enum class AiProvider { Ollama, OpenAI };
+
 struct AiConfig {
     bool enabled = false;
+    AiProvider provider = AiProvider::Ollama;  // ollama（本地）/ openai（任意兼容 API）
     std::string endpoint;
     std::string model;
+    std::string api_key;   // openai 模式必填；ollama 忽略
 };
 
 static AiConfig ai_config() {
@@ -1821,8 +1825,17 @@ static AiConfig ai_config() {
     c.enabled = reg_dword(HKEY_CURRENT_USER, "Software\\inklink\\Config", "AI_Enable", 0) != 0;
     c.endpoint = reg_string(HKEY_CURRENT_USER, "Software\\inklink\\Config", "AI_Endpoint");
     c.model = reg_string(HKEY_CURRENT_USER, "Software\\inklink\\Config", "AI_Model");
-    if (c.endpoint.empty()) c.endpoint = "http://127.0.0.1:11434";
-    if (c.model.empty()) c.model = "qwen2.5:7b";
+    c.api_key = reg_string(HKEY_CURRENT_USER, "Software\\inklink\\Config", "AI_ApiKey");
+    std::string prov = reg_string(HKEY_CURRENT_USER, "Software\\inklink\\Config", "AI_Provider");
+    c.provider = (prov == "openai") ? AiProvider::OpenAI : AiProvider::Ollama;
+    if (c.endpoint.empty()) {
+        c.endpoint = (c.provider == AiProvider::OpenAI)
+                         ? "https://api.deepseek.com"
+                         : "http://127.0.0.1:11434";
+    }
+    if (c.model.empty()) {
+        c.model = (c.provider == AiProvider::OpenAI) ? "deepseek-chat" : "qwen2.5:7b";
+    }
     while (!c.endpoint.empty() && c.endpoint.back() == '/') c.endpoint.pop_back();
     return c;
 }
@@ -1939,6 +1952,17 @@ static std::string ai_request_body(const std::string& model, const std::string& 
     return b;
 }
 
+/// 拼 OpenAI 兼容端点 `/chat/completions` 的请求体。
+///
+/// DeepSeek / 智谱 / 月之暗面 / OpenAI 本家 / 各类聚合站都吃这一个格式：
+/// `{"model":..,"messages":[{"role":"user","content":..}],"stream":false}`。
+/// 温度压到 0.3：输入法要的是"改写/翻译"这种确定性输出，不要发散。
+static std::string openai_request_body(const std::string& model, const std::string& prompt) {
+    return "{\"model\":\"" + json_escape(model) +
+           "\",\"messages\":[{\"role\":\"user\",\"content\":\"" +
+           json_escape(prompt) + "\"}],\"stream\":false,\"temperature\":0.3}";
+}
+
 /// 去掉模型输出里的 `<think>…</think>` 段，再去掉开头的空白。
 ///
 /// 关了思考的模型一般不会输出它，但有的模板（老版本 Ollama、自制模型）还是会把推理
@@ -1991,18 +2015,25 @@ static std::string ai_error_text(DWORD win_err, DWORD http_status, const std::st
 ///
 /// 失败时 `out` 是响应体（可能为空），`http_status` / `win_err` 给调用方拼错误提示。
 static bool http_post_json(const std::string& url, const std::string& body, std::string* out,
-                           DWORD* http_status, DWORD* win_err) {
+                           DWORD* http_status, DWORD* win_err,
+                           const std::string& api_key = {}) {
     *http_status = 0;
     *win_err = 0;
     std::string rest = url;
-    const std::string scheme = "http://";
-    if (rest.rfind(scheme, 0) == 0) rest = rest.substr(scheme.size());
+    bool https = false;
+    if (rest.rfind("https://", 0) == 0) {
+        https = true;
+        rest = rest.substr(8);
+    } else if (rest.rfind("http://", 0) == 0) {
+        rest = rest.substr(7);
+    }
     size_t slash = rest.find('/');
     std::string hostport = slash == std::string::npos ? rest : rest.substr(0, slash);
     std::string path = slash == std::string::npos ? "/" : rest.substr(slash);
     size_t colon = hostport.find(':');
     std::string host = colon == std::string::npos ? hostport : hostport.substr(0, colon);
-    int port = colon == std::string::npos ? 80 : std::atoi(hostport.c_str() + colon + 1);
+    int port = colon == std::string::npos ? (https ? 443 : 80)
+                                          : std::atoi(hostport.c_str() + colon + 1);
     if (host.empty()) {
         *win_err = 12007;
         return false;
@@ -2010,13 +2041,18 @@ static bool http_post_json(const std::string& url, const std::string& body, std:
     std::wstring whost(host.begin(), host.end());
     std::wstring wpath(path.begin(), path.end());
 
-    HINTERNET session = WinHttpOpen(L"inklink/1.0", WINHTTP_ACCESS_TYPE_NO_PROXY,
-                                    WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    // Ollama 是本机服务：挂系统代理反而连不上 → NO_PROXY。
+    // OpenAI 兼容端点在公网：走系统代理（不少公司网必须代理出去）。
+    const DWORD proxy_mode = url.rfind("http://127.0.0.1", 0) == 0 ||
+                                     url.rfind("http://localhost", 0) == 0
+                                 ? WINHTTP_ACCESS_TYPE_NO_PROXY
+                                 : WINHTTP_ACCESS_TYPE_DEFAULT_PROXY;
+    HINTERNET session = WinHttpOpen(L"inklink/1.0", proxy_mode, WINHTTP_NO_PROXY_NAME,
+                                    WINHTTP_NO_PROXY_BYPASS, 0);
     if (!session) {
         *win_err = GetLastError();
         return false;
     }
-    // 不走系统代理：目标是本机 Ollama，挂上代理反而连不上。
     // 接收超时 120s（原来 30s）：9B 模型冷启动光加载就 7~15s，再改写一段 2000 字的
     // 文字，30s 经常不够，表现就是"点了没反应，过一会儿报失败"。这在引擎的后台线程里，
     // 不占任何同步路径。
@@ -2025,10 +2061,17 @@ static bool http_post_json(const std::string& url, const std::string& body, std:
     HINTERNET conn = WinHttpConnect(session, whost.c_str(), static_cast<INTERNET_PORT>(port), 0);
     if (!conn) *win_err = GetLastError();
     if (conn) {
-        HINTERNET req = WinHttpOpenRequest(conn, L"POST", wpath.c_str(), nullptr,
-                                           WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, 0);
+        // https 端点用 WINHTTP_FLAG_SECURE；API key 走标准 Authorization 头
+        HINTERNET req = WinHttpOpenRequest(
+            conn, L"POST", wpath.c_str(), nullptr, WINHTTP_NO_REFERER,
+            WINHTTP_DEFAULT_ACCEPT_TYPES, https ? WINHTTP_FLAG_SECURE : 0);
         if (req) {
-            const wchar_t* headers = L"Content-Type: application/json\r\n";
+            std::string headers_str = "Content-Type: application/json\r\n";
+            if (!api_key.empty()) {
+                headers_str += "Authorization: Bearer " + api_key + "\r\n";
+            }
+            std::wstring wheaders(headers_str.begin(), headers_str.end());
+            const wchar_t* headers = wheaders.c_str();
             if (WinHttpSendRequest(req, headers, static_cast<DWORD>(-1L),
                                    const_cast<char*>(body.data()),
                                    static_cast<DWORD>(body.size()),
@@ -2073,22 +2116,30 @@ static void ai_set(uint32_t seq, int state, const std::string& text) {
 
 static void ai_worker(uint32_t seq, uint32_t hwnd, int action, std::string text) {
     const AiConfig cfg = ai_config();
-    const std::string url = cfg.endpoint + "/api/generate";
     const std::string prompt = ai_prompt(action, text);
+    std::string url, body;
+    if (cfg.provider == AiProvider::OpenAI) {
+        url = cfg.endpoint + "/chat/completions";
+        body = openai_request_body(cfg.model, prompt);
+    } else {
+        url = cfg.endpoint + "/api/generate";
+        body = ai_request_body(cfg.model, prompt, true);
+    }
     std::string resp;
     DWORD status = 0, win_err = 0;
-    bool ok = http_post_json(url, ai_request_body(cfg.model, prompt, true), &resp, &status,
-                             &win_err);
-    // 老版本 Ollama 或不支持思考的模型可能对 "think" 报 400：去掉再试一次
-    if (!ok && win_err == 0 && status == 400 && resp.find("think") != std::string::npos) {
+    bool ok = http_post_json(url, body, &resp, &status, &win_err, cfg.api_key);
+    // Ollama 专属：老版本或不支持思考的模型可能对 "think" 报 400，去掉再试一次
+    if (cfg.provider == AiProvider::Ollama && !ok && win_err == 0 && status == 400 &&
+        resp.find("think") != std::string::npos) {
         logf("ai seq=%u: endpoint rejected think=false, retry without it", seq);
         ok = http_post_json(url, ai_request_body(cfg.model, prompt, false), &resp, &status,
-                            &win_err);
+                            &win_err, cfg.api_key);
     }
     std::string result;
     if (ok) {
+        // OpenAI 兼容：choices[0].message.content；Ollama：response
         result = strip_think(json_field(resp, "response"));
-        if (result.empty()) result = strip_think(json_field(resp, "content"));   // OpenAI 兼容端点
+        if (result.empty()) result = strip_think(json_field(resp, "content"));
         if (result.empty()) {
             ai_set(seq, 2, "模型没返回内容（换一个模型试试）");
         } else {
