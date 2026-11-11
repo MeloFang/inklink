@@ -161,6 +161,22 @@ if ($staleDlls) {
 }
 
 # ── 引擎 ───────────────────────────────────────────────────────
+# 把刚编出来的引擎同步过去。以前这里只"没在跑就启动"，编完的 exe 留在
+# 源码目录里从不下发 —— 表现为"改了引擎、重启引擎还是老行为"
+# （2026-11-11 实测：AI provider 改成 openai 后仍走 Ollama 协议）。
+$engSrc = Join-Path $root 'rime-server\rime-server.exe'
+if (Test-Path $engSrc) {
+    $engDst = Join-Path $ENG 'rime-server.exe'
+    if (-not (Test-Path $engDst) -or
+        (Get-Item $engSrc).LastWriteTime -gt (Get-Item $engDst).LastWriteTime) {
+        Get-Process rime-server -ErrorAction SilentlyContinue | Stop-Process -Force
+        Start-Sleep -Milliseconds 500
+        New-Item -ItemType Directory -Force $ENG | Out-Null
+        Copy-Item $engSrc $engDst -Force
+        Write-Host '  引擎已更新' -ForegroundColor Green
+    }
+}
+
 if (-not (Get-Process rime-server -ErrorAction SilentlyContinue)) {
     if (Test-Path (Join-Path $ENG 'rime-server.exe')) {
         # 输出重定向到文件：不重定向的话引擎会继承调用者的控制台/管道句柄，

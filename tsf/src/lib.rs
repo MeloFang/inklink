@@ -3051,9 +3051,11 @@ fn apply_pick(
 }
 
 /// 拼音串能不能被音节完整覆盖（每个字母都归到某个音节）。
+///
+/// 用回溯判断而不是贪心切分：`nani` 贪心会先吃 `nan` 剩个 `i`，
+/// 误判成坏码（详见 `pinyin::can_segment`）。
 fn fully_syllabic(flat: &str) -> bool {
-    let lens = crate::pinyin::split_lengths(flat);
-    lens.iter().sum::<usize>() == flat.chars().count()
+    crate::pinyin::can_segment(flat)
 }
 
 /// 容错变体：三类，全部只动 1 个字母（覆盖绝大多数手滑）：
@@ -3149,10 +3151,19 @@ fn query_with_fallback(code: &str) -> (Vec<String>, usize) {
     if strip_separators(&code).is_empty() {
         return (Vec::new(), 0);
     }
+    // 用户**自己打了分隔符**（`na'ni`、`xiang-mu`）就别纠错：边界是他的意图，
+    // 纠错会把它改写成别的切法（曾把 `na'ni` 纠成 `anni` → 按你）。
+    let has_user_sep = code.contains('\'') || code.contains('-') || code.contains('_');
+
     // 先赌一把"打错了"：切不成音节时生成变体（换位/补/删）逐个试。
     // 最多试 4 个：同步路径 50ms 预算（ADR-0002），一条管道往返 ~2ms。
     let flat0 = strip_separators(&code);
-    for cand in typo_variants(&flat0).into_iter().take(4) {
+    let variants: Vec<String> = if has_user_sep {
+        Vec::new()
+    } else {
+        typo_variants(&flat0)
+    };
+    for cand in variants.into_iter().take(4) {
         let r = ipc::query(&cand);
         if !r.is_empty() {
             let len = cand.chars().count();

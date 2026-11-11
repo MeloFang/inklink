@@ -77,6 +77,36 @@ pub fn split_lengths(code: &str) -> Vec<usize> {
     lens
 }
 
+/// 整串能不能切成合法音节（**回溯判断，不是贪心**）。
+///
+/// `split_lengths` 是贪心的：`nani` 会先吃 `nan`，剩下 `i` 切不动，
+/// 于是"看起来切不完"——但它其实是 `na`+`ni`，完全合法。
+/// 容错层拿它当"要不要纠错"的判据，曾把 `nani` 误判成坏码、纠成 `anni`
+/// （候选变成 按你/安妮，用户打 `na'ni` 想打「那你」）。
+///
+/// 这里用 DP 判断"存在某种切法覆盖整串"，只回答是/否，不返回切法。
+pub fn can_segment(code: &str) -> bool {
+    let bytes = code.as_bytes();
+    let n = bytes.len();
+    if n == 0 || !bytes.iter().all(|b| b.is_ascii_lowercase()) {
+        return false;
+    }
+    let mut ok = vec![false; n + 1];
+    ok[0] = true;
+    for i in 0..n {
+        if !ok[i] {
+            continue;
+        }
+        let max = (n - i).min(6);
+        for len in 1..=max {
+            if is_syllable(&code[i..i + len]) {
+                ok[i + len] = true;
+            }
+        }
+    }
+    ok[n]
+}
+
 /// 选掉 `chars` 个汉字，消耗掉拼音串里多少个字母。
 ///
 /// - 切不出音节（英文/乱码）→ 返回 0，调用方按「整串消耗」处理
@@ -255,5 +285,19 @@ mod tests {
         // 末尾：显示串是 `xi'an` 五个字符，光标在最后
         assert_eq!(compose_view("xi-an", 5), ("xi'an".to_string(), 5));
         assert_eq!(compose_view("xian", 2), ("xian".to_string(), 2));
+    }
+
+    #[test]
+    fn can_segment_accepts_ambiguous() {
+        // 贪心切不完、但其实合法的
+        assert!(can_segment("nani")); // na|ni
+        assert!(can_segment("xian")); // xian
+        assert!(can_segment("nihao"));
+        // 真的坏码
+        assert!(!can_segment("shihikan")); // hi 不是音节
+        assert!(!can_segment("nihoa")); // hoa 切不动
+        assert!(!can_segment("zhge")); // zh 不是音节
+        assert!(!can_segment(""));
+        assert!(!can_segment("abc1"));
     }
 }
