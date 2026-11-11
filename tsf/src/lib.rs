@@ -2505,6 +2505,25 @@ fn is_punct_key(vk: u32, shift: bool) -> bool {
 ///   Tab、CapsLock、Shift、Enter、空格、方向键、退格、符号 → 全部放行给应用
 ///
 /// `shift` / `caps` 显式传进来（而不是内部查键盘），这样纯逻辑可单测。
+/// 用户是不是**刚用鼠标拖完选区**（左键还按着，或 150ms 内松开过）。
+///
+/// 为什么不查 TSF 选区：`OnTestKeyDown` 阶段没有编辑会话，开同步 READ 会话
+/// 的开销和重入风险都不值。我们只需要拦"鼠标选中文字后误触字母"这一个场景
+/// （微信实测 2026-11-11：选中后想 Ctrl+C，c 却进了聊天框），鼠标状态足够。
+/// 拿不到键状态当 false —— 宁可多认领，不让打字失灵。
+fn selection_active() -> bool {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+    // SAFETY: 纯键状态查询，与 ctrl_alt_win_held 同款用法
+    unsafe {
+        const VK_LBUTTON: i32 = 0x01;
+        const STILL_PRESSED: i16 = i16::MIN; // 0x8000 按符号位解释
+        if GetAsyncKeyState(VK_LBUTTON) & STILL_PRESSED != 0 {
+            return true; // 还按着（正在拖选）
+        }
+        GetAsyncKeyState(VK_LBUTTON) & 1 != 0 // 刚松开过（本线程自上次查询以来）
+    }
+}
+
 fn should_claim(vk: u32, composing: bool, shift: bool, caps: bool, english: bool) -> bool {
     const VK_BACK: u32 = 0x08;
     const VK_RETURN: u32 = 0x0D;
@@ -2574,6 +2593,11 @@ fn should_claim(vk: u32, composing: bool, shift: bool, caps: bool, english: bool
     // 纯字母（无 Shift/CapsLock）→ 认领，开始拼写
     // 空闲：``纯字母``才闲始拼写。
     // Caps Lock 开着 = 临时英文直出（不认领、不弹候选窗），浮条显示「A」提示。
+    // 选中了文字（鼠标刚拖完）就不认领字母：用户的意图是 Ctrl+C / 覆盖 /
+    // 别的操作，不是往输入框打字。微信实测：选中后按 Ctrl+C，c 进了聊天框。
+    if selection_active() {
+        return false;
+    }
     if (VK_A..=VK_Z).contains(&vk) && !shift && !caps {
         return true;
     }
