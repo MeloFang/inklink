@@ -56,7 +56,10 @@ struct Entry {
 }
 
 fn wide(s: &str) -> Vec<u16> {
-    OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
+    OsStr::new(s)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect()
 }
 
 fn exe_path() -> PathBuf {
@@ -108,14 +111,18 @@ fn relaunch_elevated(exe: &Path) -> bool {
 
 fn read_payload(exe: &Path) -> Result<Vec<Entry>, String> {
     let mut f = fs::File::open(exe).map_err(|e| format!("打不开自身：{e}"))?;
-    let size = f.metadata().map_err(|e| format!("读不到自身大小：{e}"))?.len();
+    let size = f
+        .metadata()
+        .map_err(|e| format!("读不到自身大小：{e}"))?
+        .len();
     if size < TRAILER_LEN as u64 {
         return Err("这个文件里没有安装载荷（是不是直接跑了构建产物？）".into());
     }
     f.seek(SeekFrom::End(-(TRAILER_LEN as i64)))
         .map_err(|e| format!("定位失败：{e}"))?;
     let mut tail = [0u8; TRAILER_LEN];
-    f.read_exact(&mut tail).map_err(|e| format!("读尾部失败：{e}"))?;
+    f.read_exact(&mut tail)
+        .map_err(|e| format!("读尾部失败：{e}"))?;
     if &tail[20..28] != MAGIC {
         return Err("载荷标识不匹配（exe 末尾不是 inklink 的档案）".into());
     }
@@ -138,15 +145,21 @@ fn read_payload(exe: &Path) -> Result<Vec<Entry>, String> {
         return Err("载荷起始位置越界".into());
     }
     let compressed_len = (size - start - TRAILER_LEN as u64) as usize;
-    f.seek(SeekFrom::Start(start)).map_err(|e| format!("定位载荷失败：{e}"))?;
+    f.seek(SeekFrom::Start(start))
+        .map_err(|e| format!("定位载荷失败：{e}"))?;
     let mut compressed = vec![0u8; compressed_len];
-    f.read_exact(&mut compressed).map_err(|e| format!("读载荷失败：{e}"))?;
+    f.read_exact(&mut compressed)
+        .map_err(|e| format!("读载荷失败：{e}"))?;
 
     let mut raw = Vec::with_capacity(raw_len as usize);
     let mut dec = DeflateDecoder::new(&compressed[..]);
-    dec.read_to_end(&mut raw).map_err(|e| format!("解压失败：{e}"))?;
+    dec.read_to_end(&mut raw)
+        .map_err(|e| format!("解压失败：{e}"))?;
     if raw.len() as u64 != raw_len {
-        return Err(format!("解压后长度不符（期望 {raw_len}，实际 {}）", raw.len()));
+        return Err(format!(
+            "解压后长度不符（期望 {raw_len}，实际 {}）",
+            raw.len()
+        ));
     }
 
     // 解析条目
@@ -161,16 +174,15 @@ fn read_payload(exe: &Path) -> Result<Vec<Entry>, String> {
     };
     let mut entries = Vec::with_capacity(count);
     for i in 0..count {
-        let name_len = u32::from_le_bytes(
-            take(&mut pos, 4, &raw)?.try_into().unwrap_or([0, 0, 0, 0]),
-        ) as usize;
+        let name_len =
+            u32::from_le_bytes(take(&mut pos, 4, &raw)?.try_into().unwrap_or([0, 0, 0, 0]))
+                as usize;
         if name_len == 0 || name_len > 4096 {
             return Err(format!("条目 {i} 名字长度异常：{name_len}"));
         }
         let name = take(&mut pos, name_len, &raw)?;
-        let data_len = u64::from_le_bytes(
-            take(&mut pos, 8, &raw)?.try_into().unwrap_or([0; 8]),
-        ) as usize;
+        let data_len =
+            u64::from_le_bytes(take(&mut pos, 8, &raw)?.try_into().unwrap_or([0; 8])) as usize;
         let data = take(&mut pos, data_len, &raw)?;
         entries.push(Entry {
             name: String::from_utf8_lossy(&name).to_string(),
@@ -254,7 +266,8 @@ fn unpack(entries: &[Entry], pf: &Path, eng: &Path) -> Result<usize, String> {
         }
         let target = base.join(rel.replace('/', "\\"));
         if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent).map_err(|e| format!("建目录失败 {}：{e}", parent.display()))?;
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("建目录失败 {}：{e}", parent.display()))?;
         }
         fs::write(&target, &e.data).map_err(|e| format!("写文件失败 {}：{e}", target.display()))?;
         written += 1;
@@ -331,6 +344,11 @@ fn install() -> Result<(), String> {
     let n = unpack(&entries, &pf, &eng)?;
     println!("  写入 {n} 个文件");
 
+    // 把安装器本身留在安装目录，应用列表的卸载命令直接调用它的 --uninstall。
+    // 这样单文件 setup 不依赖外部 uninstall.ps1（旧版正是因此找不到卸载入口）。
+    let setup_copy = pf.join("inklink-setup.exe");
+    fs::copy(&exe, &setup_copy).map_err(|e| format!("保存卸载器失败：{e}"))?;
+
     let dll64 = pf.join("inklink_tsf.dll");
     let dll32 = pf.join("inklink_tsf32.dll");
     let engine_exe = eng.join("rime-server.exe");
@@ -340,13 +358,23 @@ fn install() -> Result<(), String> {
     let com32 = format!(r"SOFTWARE\Classes\Wow6432Node\CLSID\{CLSID}\InprocServer32");
     for (path, dll) in [(&com64, &dll64), (&com32, &dll32)] {
         if !reg_sz(HKEY_LOCAL_MACHINE, path, None, &dll.to_string_lossy()) {
-            return Err(format!("写 COM 注册失败：HKLM\\{path}（是不是没用管理员权限？）"));
+            return Err(format!(
+                "写 COM 注册失败：HKLM\\{path}（是不是没用管理员权限？）"
+            ));
         }
-        reg_sz(HKEY_LOCAL_MACHINE, path, Some("ThreadingModel"), "Apartment");
+        reg_sz(
+            HKEY_LOCAL_MACHINE,
+            path,
+            Some("ThreadingModel"),
+            "Apartment",
+        );
     }
 
     println!("注册 TSF 输入法…");
-    for root in [r"SOFTWARE\Microsoft\CTF\TIP", r"SOFTWARE\Wow6432Node\Microsoft\CTF\TIP"] {
+    for root in [
+        r"SOFTWARE\Microsoft\CTF\TIP",
+        r"SOFTWARE\Wow6432Node\Microsoft\CTF\TIP",
+    ] {
         let tip = format!(r"{root}\{CLSID}");
         let _ = reg_sz(
             HKEY_LOCAL_MACHINE,
@@ -366,7 +394,12 @@ fn install() -> Result<(), String> {
         // 指向单独的 .ico，不是 DLL：DLL 里没有编图标资源（build.rs 只写版本号），
         // 指过去语言列表会退回显示「简体」两个字；.ico 也不会因 DLL 换版本名而失效。
         let icon = pf.join("inklink.ico");
-        let _ = reg_sz(HKEY_LOCAL_MACHINE, &lp, Some("IconFile"), &icon.to_string_lossy());
+        let _ = reg_sz(
+            HKEY_LOCAL_MACHINE,
+            &lp,
+            Some("IconFile"),
+            &icon.to_string_lossy(),
+        );
         let _ = reg_dword(HKEY_LOCAL_MACHINE, &lp, "IconIndex", 0);
     }
 
@@ -378,6 +411,43 @@ fn install() -> Result<(), String> {
         &engine_exe.to_string_lossy(),
     ) {
         return Err("写 HKLM\\SOFTWARE\\inklink\\EnginePath 失败".into());
+    }
+
+    println!("登记应用列表卸载入口…");
+    let uninstall_key = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\inklink";
+    let setup_cmd = format!(r#""{}" --uninstall"#, setup_copy.display());
+    if !reg_sz(
+        HKEY_LOCAL_MACHINE,
+        uninstall_key,
+        Some("DisplayName"),
+        "inklink 输入法",
+    ) || !reg_sz(
+        HKEY_LOCAL_MACHINE,
+        uninstall_key,
+        Some("DisplayVersion"),
+        env!("CARGO_PKG_VERSION"),
+    ) || !reg_sz(
+        HKEY_LOCAL_MACHINE,
+        uninstall_key,
+        Some("Publisher"),
+        "inklink (open source, GPL-3.0)",
+    ) || !reg_sz(
+        HKEY_LOCAL_MACHINE,
+        uninstall_key,
+        Some("InstallLocation"),
+        PROGRAM_FILES,
+    ) || !reg_sz(
+        HKEY_LOCAL_MACHINE,
+        uninstall_key,
+        Some("UninstallString"),
+        &setup_cmd,
+    ) || !reg_sz(
+        HKEY_LOCAL_MACHINE,
+        uninstall_key,
+        Some("QuietUninstallString"),
+        &setup_cmd,
+    ) {
+        return Err("写应用列表卸载登记失败".into());
     }
 
     println!("设置开机自启…");
@@ -416,6 +486,7 @@ fn uninstall() -> Result<(), String> {
         format!(r"SOFTWARE\Microsoft\CTF\TIP\{CLSID}"),
         format!(r"SOFTWARE\Wow6432Node\Microsoft\CTF\TIP\{CLSID}"),
         r"SOFTWARE\inklink".to_string(),
+        r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\inklink".to_string(),
     ] {
         let sub = wide(&path);
         unsafe {
@@ -449,8 +520,19 @@ fn uninstall() -> Result<(), String> {
         if dir.exists() {
             match fs::remove_dir_all(&dir) {
                 Ok(()) => println!("  已删除 {}", dir.display()),
-                Err(e) => println!("  删不掉 {}（{}），可能被占用，重启后再删", dir.display(), e),
+                Err(e) => println!(
+                    "  删不掉 {}（{}），可能被占用，重启后再删",
+                    dir.display(),
+                    e
+                ),
             }
+        }
+    }
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        let data = PathBuf::from(local).join("inklink");
+        if data.exists() {
+            let _ = fs::remove_dir_all(&data);
+            println!("  已删除 {}", data.display());
         }
     }
     println!();
@@ -501,7 +583,11 @@ fn main() {
         return;
     }
 
-    let result = if uninstall_mode { uninstall() } else { install() };
+    let result = if uninstall_mode {
+        uninstall()
+    } else {
+        install()
+    };
     if let Err(msg) = result {
         eprintln!();
         eprintln!("出错了：{msg}");
