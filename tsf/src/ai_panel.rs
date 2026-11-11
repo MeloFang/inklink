@@ -1241,6 +1241,13 @@ fn draw_run(hdc: HDC, x: i32, y: i32, s: &str, font: HGDIOBJ) -> i32 {
 fn tokenize(s: &str) -> Vec<(String, bool)> {
     let mut out: Vec<(String, bool)> = Vec::new();
     for c in s.chars() {
+        if c == '\r' {
+            continue; // CRLF 只保留一个换行
+        }
+        if c == '\n' {
+            out.push(("\n".to_string(), false));
+            continue;
+        }
         if !is_latin_char(c) {
             // 中文每个字单独一个 token（可以随便断行）；只有西文才成串
             out.push((c.to_string(), false));
@@ -1259,6 +1266,24 @@ fn tokenize(s: &str) -> Vec<(String, bool)> {
 /// 为什么要自己排：GDI 的字体链接只在"缺字形"时才换字体，而仿宋/思源都自带西文字形，
 /// 所以 `SetText` 一个字体画不出"中文仿宋 + 西文 Times New Roman"的混排。
 fn text(hdc: HDC, r: &RECT, s: &str, fg: u32, cjk: HGDIOBJ, latin: HGDIOBJ, flags: u32) {
+    use windows_sys::Win32::Graphics::Gdi::{IntersectClipRect, RestoreDC, SaveDC};
+    if s.is_empty() || r.right <= r.left || r.bottom <= r.top {
+        return;
+    }
+    // 每个文本区域独立裁剪；draw_run 的测量矩形不能充当外层边界。
+    // 保存/恢复 DC，避免原文框的裁剪影响后续按钮、结果框等绘制。
+    unsafe {
+        let saved = SaveDC(hdc);
+        if saved == 0 {
+            return;
+        }
+        IntersectClipRect(hdc, r.left, r.top, r.right, r.bottom);
+        text_in_rect(hdc, r, s, fg, cjk, latin, flags);
+        RestoreDC(hdc, saved);
+    }
+}
+
+fn text_in_rect(hdc: HDC, r: &RECT, s: &str, fg: u32, cjk: HGDIOBJ, latin: HGDIOBJ, flags: u32) {
     if s.is_empty() {
         return;
     }
@@ -1310,6 +1335,19 @@ fn text(hdc: HDC, r: &RECT, s: &str, fg: u32, cjk: HGDIOBJ, latin: HGDIOBJ, flag
         *y += lh;
     };
     for (t, is_lat) in toks {
+        if y >= r.bottom {
+            break;
+        }
+        if t == "\n" {
+            if line.is_empty() {
+                y += lh;
+            } else {
+                let mut dummy = false;
+                flush(&mut line, &mut y, r.left, &mut dummy);
+            }
+            line_w = 0;
+            continue;
+        }
         let f = if is_lat { latin } else { cjk };
         let w = run_width(hdc, &t, f);
         if line_w + w > max_w && !line.is_empty() {
@@ -2280,6 +2318,69 @@ mod tests {
             .join("target")
             .join(name);
         std::fs::write(path, &out).expect("预览图写入失败");
+    }
+
+    #[test]
+    fn 长文本只画在指定矩形且恢复裁剪区() {
+        let mut canvas = unsafe { Canvas::new(320, 240) }.expect("画布");
+        let bg = 0x00FF_FFFF;
+        unsafe { canvas.pixels() }.fill(bg);
+        let fonts = Fonts::new();
+        let r = RECT {
+            left: 40,
+            top: 30,
+            right: 180,
+            bottom: 90,
+        };
+        let content = "粘贴长文 Mixed English text\r\n第二段文字\n".repeat(100);
+        text(
+            canvas.dc,
+            &r,
+            &content,
+            0,
+            fonts.body,
+            fonts.body,
+            DT_WORDBREAK,
+        );
+        let px = unsafe { canvas.pixels() };
+        assert!(
+            px.iter().enumerate().any(|(i, &p)| {
+                let (x, y) = ((i % 320) as i32, (i / 320) as i32);
+                x >= r.left && x < r.right && y >= r.top && y < r.bottom && p != bg
+            }),
+            "框内应有文字"
+        );
+        for (i, &p) in px.iter().enumerate() {
+            let (x, y) = ((i % 320) as i32, (i / 320) as i32);
+            if x < r.left || x >= r.right || y < r.top || y >= r.bottom {
+                assert_eq!(p, bg, "文本越界：({x},{y})");
+            }
+        }
+        let below = RECT {
+            left: 40,
+            top: 140,
+            right: 250,
+            bottom: 200,
+        };
+        text(
+            canvas.dc,
+            &below,
+            "保存按钮",
+            0,
+            fonts.body,
+            fonts.body,
+            DT_SINGLELINE,
+        );
+        assert!(
+            unsafe { canvas.pixels() }
+                .iter()
+                .enumerate()
+                .any(|(i, &p)| {
+                    let y = (i / 320) as i32;
+                    y >= below.top && y < below.bottom && p != bg
+                }),
+            "原文裁剪区不能泄漏到后续绘制"
+        );
     }
 
     /// 三个典型状态各渲一张：`tsf/target/ai-panel-ready.bmp` / `-done.bmp` / `-disabled.bmp`。
