@@ -246,10 +246,12 @@ fn reg_dword(root: HKEY, path: &str, name: &str, value: u32) -> bool {
 // ── 安装 ────────────────────────────────────────────────────────
 
 fn stop_engine() {
-    let _ = Command::new("taskkill")
-        .args(["/IM", "rime-server.exe", "/F"])
-        .creation_flags(CREATE_NO_WINDOW)
-        .status();
+    for name in ["rime-server.exe", "inklink-settings.exe", "inklink-ui.exe"] {
+        let _ = Command::new("taskkill")
+            .args(["/IM", name, "/F"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .status();
+    }
     std::thread::sleep(std::time::Duration::from_millis(600));
 }
 
@@ -487,6 +489,48 @@ fn run_powershell(script: &str) -> bool {
     }
 }
 
+/// 装完实测一次查询：引擎在跑 ≠ 能查出词。
+///
+/// 同事机器上踩过：DLL 装好了、浮条正常，但引擎根本连不上（`pipe unavailable`），
+/// 表现是"打拼音只有字母没有候选"。安装器如果只说"已拉起 rime-server.exe"，
+/// 用户会以为装好了。这里直接走一遍真实协议，把结论打到屏幕上。
+fn probe_engine(code: &str) -> i32 {
+    let path = r"\\.\pipe\inklink-engine";
+    let mut last_err = String::new();
+    for attempt in 0..3 {
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+        {
+            Ok(mut pipe) => {
+                use std::io::{Read, Write};
+                let bytes = code.as_bytes();
+                let mut req = Vec::with_capacity(7 + bytes.len());
+                req.push(1u8); // 类型 1 = 查询
+                req.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+                req.extend_from_slice(bytes);
+                req.extend_from_slice(&0u16.to_le_bytes()); // app 长度 0
+                if pipe.write_all(&req).is_err() {
+                    last_err = "写管道失败".into();
+                } else {
+                    let mut len = [0u8; 4];
+                    match pipe.read_exact(&mut len) {
+                        Ok(()) => return u32::from_le_bytes(len) as i32,
+                        Err(e) => last_err = format!("读管道失败：{e}"),
+                    }
+                }
+            }
+            Err(e) => last_err = e.to_string(),
+        }
+        if attempt < 2 {
+            std::thread::sleep(std::time::Duration::from_secs(3));
+        }
+    }
+    println!("  探测失败：{last_err}");
+    -1
+}
+
 fn install() -> Result<(), String> {
     let exe = exe_path();
     let entries = read_payload(&exe)?;
@@ -633,6 +677,17 @@ fn install() -> Result<(), String> {
         println!("  警告：引擎没起来（第一次打字时 DLL 会自己拉起它，不影响使用）");
     }
 
+    // 真跑一次查询：引擎在跑但查不到词，用户打字还是只有字母。
+    println!("实测一次查询（nihao）…");
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    let cands = probe_engine("nihao");
+    if cands > 0 {
+        println!("  引擎实测通过：nihao -> {cands} 个候选");
+    } else {
+        println!("  警告：引擎没有给出候选（可能是首次编译词库还没完成）。");
+        println!("  请等 10 秒后再打一次；仍然不行就跑安装目录里的 diagnose.cmd。");
+    }
+
     println!();
     println!("安装完成。");
     println!("  64 位 DLL : {}", dll64.display());
@@ -644,6 +699,7 @@ fn install() -> Result<(), String> {
     } else {
         println!("下一步：在「设置 → 时间和语言 → 语言和区域」里添加键盘 → inklink 输入法。");
     }
+    println!("重要：微信、WPS、浏览器等已经打开的程序，要重新打开才能用上新版输入法。");
     println!("卸载：设置 → 应用 → 已安装的应用 → inklink 输入法。");
     Ok(())
 }
