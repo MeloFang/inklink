@@ -253,6 +253,54 @@ fn stop_engine() {
     std::thread::sleep(std::time::Duration::from_millis(600));
 }
 
+/// 升级前清理旧版本留下的安装痕迹。
+///
+/// 旧版可能没有卸载登记，也可能留下带版本号的 DLL；新版 setup 必须自己接管升级，
+/// 用户不应该再单独运行 cleanup-old.cmd。只清理 inklink 自己的注册项和文件，
+/// 不碰用户词库/笔记（这些属于用户数据，升级应保留）。
+fn cleanup_legacy_install() {
+    println!("清理旧版安装痕迹…");
+    let uninstall = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\inklink";
+    unsafe {
+        let p = wide(uninstall);
+        RegDeleteTreeW(HKEY_LOCAL_MACHINE, p.as_ptr());
+    }
+    let run = wide(r"Software\Microsoft\Windows\CurrentVersion\Run");
+    unsafe {
+        let mut key: HKEY = std::ptr::null_mut();
+        let mut disp = 0u32;
+        if RegCreateKeyExW(
+            HKEY_CURRENT_USER,
+            run.as_ptr(),
+            0,
+            std::ptr::null(),
+            REG_OPTION_NON_VOLATILE,
+            KEY_WRITE,
+            std::ptr::null(),
+            &mut key,
+            &mut disp,
+        ) == 0
+        {
+            for name in ["inklink-engine", "inklink-ui"] {
+                let n = wide(name);
+                // 删除注册表值：用空 REG_SZ 写入会留下残值，必须 RegDeleteValueW。
+                windows_sys::Win32::System::Registry::RegDeleteValueW(key, n.as_ptr());
+            }
+            RegCloseKey(key);
+        }
+    }
+    let pf = Path::new(PROGRAM_FILES);
+    if let Ok(files) = fs::read_dir(pf) {
+        for entry in files.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with("inklink_tsf_") && name.ends_with(".dll") {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+    }
+    println!("  旧版清理完成，保留用户词库和设置");
+}
+
 /// 稳健地覆盖一个文件：先写同目录临时文件，再 `MoveFileExW` 原子替换。
 ///
 /// 为什么要这么绕：直接 `fs::write` 覆盖 Program Files 里的同名文件时，
@@ -449,6 +497,7 @@ fn install() -> Result<(), String> {
 
     println!("停止旧引擎…");
     stop_engine();
+    cleanup_legacy_install();
 
     println!("解包到 {} 与 {} …", pf.display(), eng.display());
     let n = unpack(&entries, &pf, &eng)?;
@@ -457,7 +506,8 @@ fn install() -> Result<(), String> {
     // 把安装器本身留在安装目录，应用列表的卸载命令直接调用它的 --uninstall。
     // 这样单文件 setup 不依赖外部 uninstall.ps1（旧版正是因此找不到卸载入口）。
     let setup_copy = pf.join("inklink-setup.exe");
-    fs::copy(&exe, &setup_copy).map_err(|e| format!("保存卸载器失败：{e}"))?;
+    let setup_bytes = fs::read(&exe).map_err(|e| format!("读取安装器自身失败：{e}"))?;
+    write_file_atomic(&setup_copy, &setup_bytes).map_err(|e| format!("保存卸载器失败：{e}"))?;
 
     let dll64 = pf.join("inklink_tsf.dll");
     let dll32 = pf.join("inklink_tsf32.dll");
