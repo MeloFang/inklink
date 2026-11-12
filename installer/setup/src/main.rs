@@ -30,6 +30,9 @@ use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
 use windows_sys::Win32::Security::{
     GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
 };
+use windows_sys::Win32::Storage::FileSystem::{
+    MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+};
 use windows_sys::Win32::System::LibraryLoader::GetModuleFileNameW;
 use windows_sys::Win32::System::Registry::{
     RegCloseKey, RegCreateKeyExW, RegDeleteTreeW, RegSetValueExW, HKEY, HKEY_CURRENT_USER,
@@ -250,6 +253,44 @@ fn stop_engine() {
     std::thread::sleep(std::time::Duration::from_millis(600));
 }
 
+/// 稳健地覆盖一个文件：先写同目录临时文件，再 `MoveFileExW` 原子替换。
+///
+/// 为什么要这么绕：直接 `fs::write` 覆盖 Program Files 里的同名文件时，
+/// 只要目标正好被杀软扫描、或被某个进程短暂占着，就会拿到
+/// `拒绝访问 (os error 5)` / `共享冲突`，整台机器的安装直接中断
+/// （2026-11-12 本机复现：34 个文件写到 concrt140.dll 时炸）。
+/// 临时文件 + 替换 + 重试既避开半截文件，也给了占用方松手的时间。
+fn write_file_atomic(target: &Path, data: &[u8]) -> std::io::Result<()> {
+    let name = target
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let tmp = target.with_file_name(format!("{name}.inklink-new"));
+    fs::write(&tmp, data)?;
+
+    let to = wide(&target.to_string_lossy());
+    let mut last = std::io::Error::from_raw_os_error(5);
+    for attempt in 0..6 {
+        let from = wide(&tmp.to_string_lossy());
+        let ok = unsafe {
+            MoveFileExW(
+                from.as_ptr(),
+                to.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        if ok != 0 {
+            return Ok(());
+        }
+        last = std::io::Error::last_os_error();
+        if attempt < 5 {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        }
+    }
+    let _ = fs::remove_file(&tmp);
+    Err(last)
+}
+
 fn unpack(entries: &[Entry], pf: &Path, eng: &Path) -> Result<usize, String> {
     let mut written = 0;
     for e in entries {
@@ -269,7 +310,8 @@ fn unpack(entries: &[Entry], pf: &Path, eng: &Path) -> Result<usize, String> {
             fs::create_dir_all(parent)
                 .map_err(|e| format!("建目录失败 {}：{e}", parent.display()))?;
         }
-        fs::write(&target, &e.data).map_err(|e| format!("写文件失败 {}：{e}", target.display()))?;
+        write_file_atomic(&target, &e.data)
+            .map_err(|e| format!("写文件失败 {}：{e}", target.display()))?;
         written += 1;
     }
     Ok(written)
@@ -327,6 +369,74 @@ fn start_engine(eng: &Path) -> bool {
         }
     }
     false
+}
+
+/// 把输入法挂进用户的 zh-Hans-CN 语言列表（`Win+Space` 才看得到它）。
+///
+/// 单文件安装器只能写注册表，但"语言列表里有这个键盘"是另一回事：
+/// 只有 `Set-WinUserLanguageList` 会改它。以前这里只打印一句"请去设置里添加键盘"，
+/// 结果同事装完按 Win+Space 找不到 inklink（2026-11-12 反馈截图）。
+/// 复用 PowerShell 是刻意的：这段逻辑和 installer\install.ps1 完全一致，
+/// 比在 Rust 里走 WinRT 的 Windows.Globalization 少一大堆样板。
+fn add_to_language_list() -> bool {
+    let script = format!("$c='{CLSID}';$p='{PROFILE}';$tip='0804:'+$c+$p;").to_string()
+        + "$l=Get-WinUserLanguageList;"
+        + "$z=$l|Where-Object{$_.LanguageTag -eq 'zh-Hans-CN'}|Select-Object -First 1;"
+        + "if(-not $z){$n=New-WinUserLanguageList 'zh-Hans-CN';$l.Add($n[0]);"
+        + "$z=$l|Where-Object{$_.LanguageTag -eq 'zh-Hans-CN'}|Select-Object -First 1};"
+        + "if($z.InputMethodTips -notcontains $tip){$z.InputMethodTips.Add($tip);"
+        + "Set-WinUserLanguageList $l -Force};exit 0";
+    run_powershell(&script)
+}
+
+/// 从语言列表里移除（卸载时用）。失败不影响卸载。
+fn remove_from_language_list() -> bool {
+    let script = format!("$c='{CLSID}';$p='{PROFILE}';$tip='0804:'+$c+$p;").to_string()
+        + "$l=Get-WinUserLanguageList;$ch=$false;"
+        + "foreach($z in $l){while($z.InputMethodTips -contains $tip){"
+        + "$z.InputMethodTips.Remove($tip);$ch=$true}};"
+        + "if($ch){Set-WinUserLanguageList $l -Force};exit 0";
+    run_powershell(&script)
+}
+
+/// 跑一段 PowerShell 并等它结束，返回是否退出码为 0。
+/// 全部用单引号拼脚本，避免命令行引号被转义坏。
+fn run_powershell(script: &str) -> bool {
+    use windows_sys::Win32::System::Threading::{
+        CreateProcessW, PROCESS_INFORMATION, STARTUPINFOW,
+    };
+    use windows_sys::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject};
+
+    let mut cmdline = wide(&format!(
+        "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"{script}\""
+    ));
+    let mut si = STARTUPINFOW::default();
+    si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
+    let mut pi = PROCESS_INFORMATION::default();
+    unsafe {
+        let ok = CreateProcessW(
+            std::ptr::null(),
+            cmdline.as_mut_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+            CREATE_NO_WINDOW,
+            std::ptr::null(),
+            std::ptr::null(),
+            &si,
+            &mut pi,
+        );
+        if ok == 0 {
+            return false;
+        }
+        // 最多等 20 秒：系统接口偶尔会卡，但不能把安装器吊死
+        WaitForSingleObject(pi.hProcess, 20_000);
+        let mut code: u32 = 1;
+        GetExitCodeProcess(pi.hProcess, &mut code);
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+        code == 0
+    }
 }
 
 fn install() -> Result<(), String> {
@@ -458,6 +568,14 @@ fn install() -> Result<(), String> {
         &format!("\"{}\"", engine_exe.display()),
     );
 
+    println!("加入输入法列表…");
+    let listed = add_to_language_list();
+    if listed {
+        println!("  已加入：按 Win+Space 就能切到 inklink 输入法");
+    } else {
+        println!("  警告：自动加入失败，请手动到「设置 → 时间和语言 → 语言和区域」添加键盘");
+    }
+
     println!("启动引擎…");
     if start_engine(&eng) {
         println!("  已拉起 rime-server.exe");
@@ -471,14 +589,22 @@ fn install() -> Result<(), String> {
     println!("  32 位 DLL : {}", dll32.display());
     println!("  引擎      : {}", engine_exe.display());
     println!();
-    println!("下一步：在「设置 → 时间和语言 → 语言和区域」里添加键盘 → inklink 输入法。");
-    println!("（注册表已经写好了，但把输入法挂进你的语言列表只有系统设置能做。）");
+    if listed {
+        println!("下一步：按 Win+Space 切到「inklink 输入法」，打 nihao 试试。");
+    } else {
+        println!("下一步：在「设置 → 时间和语言 → 语言和区域」里添加键盘 → inklink 输入法。");
+    }
+    println!("卸载：设置 → 应用 → 已安装的应用 → inklink 输入法。");
     Ok(())
 }
 
 fn uninstall() -> Result<(), String> {
     println!("卸载 inklink…");
     stop_engine();
+    // 先从语言列表里摘掉，再删注册表：反过来的话系统可能还留着一个指向不存在 DLL 的键盘项
+    if remove_from_language_list() {
+        println!("  已从输入法列表移除");
+    }
 
     for path in [
         format!(r"SOFTWARE\Classes\CLSID\{CLSID}"),
