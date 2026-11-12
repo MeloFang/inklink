@@ -188,7 +188,14 @@ $nEntry = 0
 foreach ($f in (Get-ChildItem $files -Recurse -File)) {
     $rel = $f.FullName.Substring($files.Length + 1).Replace('\', '/')
     # 装到哪：引擎那一坨（rime*）进 C:\inklink-engine，其余进 Program Files\inklink
-    $prefix = if ($rel -like 'rime/*' -or $rel -eq 'rime-server.exe' -or $rel -eq 'rime.dll' -or $rel -eq 'en-words.txt') { 'eng/' } else { 'pf/' }
+    # 装到哪：引擎那一坨（rime*、VC 运行库）进 C:\inklink-engine，其余进 Program Files\inklink。
+    # VC 运行库必须跟 rime-server.exe 同目录：app-local 的 DLL 只从 exe 所在目录找。
+    # 曾经漏了这一条，运行库被装进 Program Files\inklink，干净的 Windows 上引擎照样起不来，
+    # 表现就是「拼音只有字母、没有候选」（2026-11-12 同事机器实测）。
+    $isEngineFile = ($rel -like 'rime/*') -or
+                    ($rel -in @('rime-server.exe', 'rime.dll', 'en-words.txt')) -or
+                    ($vcRuntime -contains $rel)
+    $prefix = if ($isEngineFile) { 'eng/' } else { 'pf/' }
     $name = [System.Text.Encoding]::UTF8.GetBytes($prefix + $rel)
     $data = [System.IO.File]::ReadAllBytes($f.FullName)
     $bw.Write([uint32]$name.Length)

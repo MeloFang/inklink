@@ -1,6 +1,6 @@
 [package]
 name = "inklink-ui"
-version = "2.2.10"
+version = "2.2.11"
 edition = "2021"
 license = "GPL-3.0"
 description = "inklink 常驻 UI：浮条 + 托盘（只读写注册表状态，不碰输入路径）"

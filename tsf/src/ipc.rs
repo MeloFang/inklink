@@ -210,9 +210,28 @@ pub fn ensure_engine() {
     }
     let exe = engine_exe_path();
     if exe.is_empty() {
+        // 注册表和默认位置都没有：必须留痕，否则现象只有"候选永远为空"
+        crate::log_line("ensure_engine: 找不到 rime-server.exe（EnginePath 与默认路径都不存在）");
         return;
     }
     start_process(&exe);
+    // 启动是异步的，给引擎一点时间再确认；失败时把路径写进日志便于远程排障
+    let mut alive = false;
+    for _ in 0..10 {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        if engine_alive() {
+            alive = true;
+            break;
+        }
+    }
+    crate::log_line(&format!(
+        "ensure_engine: start {exe} -> {}",
+        if alive {
+            "ok"
+        } else {
+            "失败（进程没起来或立刻退出）"
+        }
+    ));
 }
 
 /// 引擎可执行文件路径：注册表 > 默认安装位置。
@@ -242,7 +261,7 @@ fn engine_exe_path() -> String {
         }
     }
     // 回退到默认安装位置
-    let fallback = r"C:\inklink-engine\inklink.exe";
+    let fallback = r"C:\inklink-engine\rime-server.exe";
     if std::path::Path::new(fallback).exists() {
         fallback.to_string()
     } else {
