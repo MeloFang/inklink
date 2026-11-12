@@ -31,7 +31,7 @@ use windows_sys::Win32::Security::{
     GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    MoveFileExW, MOVEFILE_DELAY_UNTIL_REBOOT, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleFileNameW;
 use windows_sys::Win32::System::Registry::{
@@ -725,6 +725,14 @@ fn uninstall() -> Result<(), String> {
             RegDeleteTreeW(HKEY_LOCAL_MACHINE, sub.as_ptr());
         }
     }
+    // 用户级设置（中英模式、外观、AI 配置、学习开关）
+    {
+        let sub = wide(r"SOFTWARE\inklink");
+        unsafe {
+            RegDeleteTreeW(HKEY_CURRENT_USER, sub.as_ptr());
+        }
+    }
+
     let run = wide(r"Software\Microsoft\Windows\CurrentVersion\Run");
     unsafe {
         // 只删值，不删整个 Run 键（别的程序也在里面）
@@ -748,15 +756,24 @@ fn uninstall() -> Result<(), String> {
         }
     }
 
+    // 文件删除：能删的立刻删；删不掉的登记成「重启后删除」。
+    // 这一步是正规安装器（搜狗/微软拼音）的做法：explorer、微信把 DLL 加载进内存后
+    // 谁都删不掉它，只能交给重启时的系统清理。以前直接 fs::remove_dir_all 失败就跳过，
+    // 结果目录一直留在 Program Files 里（2026-11-12 同事反馈根因）。
+    let mut deferred = 0usize;
     for dir in [PathBuf::from(PROGRAM_FILES), PathBuf::from(ENGINE_DIR)] {
-        if dir.exists() {
-            match fs::remove_dir_all(&dir) {
-                Ok(()) => println!("  已删除 {}", dir.display()),
-                Err(e) => println!(
-                    "  删不掉 {}（{}），可能被占用，重启后再删",
-                    dir.display(),
-                    e
-                ),
+        if !dir.exists() {
+            continue;
+        }
+        match fs::remove_dir_all(&dir) {
+            Ok(()) => println!("  已删除 {}", dir.display()),
+            Err(_) => {
+                let n = schedule_delete_tree(&dir);
+                deferred += n;
+                println!(
+                    "  {} 里的 {n} 个文件被占用，已登记为「重启后删除」",
+                    dir.display()
+                );
             }
         }
     }
@@ -768,8 +785,162 @@ fn uninstall() -> Result<(), String> {
         }
     }
     println!();
-    println!("卸载完成。请到系统设置里把 inklink 输入法移除（如果还列在那里）。");
+    println!("卸载完成。");
+    if deferred > 0 {
+        println!("还剩下 {deferred} 个文件正被程序占用，已安排在下一次开机时自动删除。");
+    }
+    println!("如果 Win+Space 里还能看到 inklink，注销或重启一次就会消失");
+    println!("（输入法 DLL 仍被 explorer 等进程加载着，这是正常的）。");
     Ok(())
+}
+
+/// 把整棵目录里的文件登记成「重启后删除」，并尽量把目录本身也登记掉。
+///
+/// Windows 的 `MOVEFILE_DELAY_UNTIL_REBOOT` 只能删**空目录**，
+/// 所以先逐个登记文件、再登记目录；顺序由系统在重启时保证（它按登记顺序处理，
+/// 文件在前、目录在后刚好能删干净）。返回登记成功的文件个数。
+fn schedule_delete_tree(dir: &Path) -> usize {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+
+    fn walk(d: &Path, files: &mut Vec<PathBuf>, dirs: &mut Vec<PathBuf>) {
+        if let Ok(entries) = fs::read_dir(d) {
+            for e in entries.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    walk(&p, files, dirs);
+                    dirs.push(p);
+                } else {
+                    files.push(p);
+                }
+            }
+        }
+    }
+
+    let mut files: Vec<PathBuf> = Vec::new();
+    walk(dir, &mut files, &mut dirs);
+    dirs.push(dir.to_path_buf());
+
+    let mut count = 0usize;
+    let mut fallback: Vec<String> = Vec::new();
+
+    for f in files.iter().chain(dirs.iter()) {
+        let w = wide(&f.to_string_lossy());
+        // 正确用法：源文件在前、目标给 NULL —— 表示「重启时删掉这个文件」。
+        let ok = unsafe { MoveFileExW(w.as_ptr(), std::ptr::null(), MOVEFILE_DELAY_UNTIL_REBOOT) };
+        if ok != 0 {
+            count += 1;
+        } else {
+            fallback.push(f.to_string_lossy().to_string());
+        }
+    }
+
+    // MoveFileEx 在某些环境（受策略/沙箱限制）会返回 ERROR_PATH_NOT_FOUND，
+    // 这时直接把条目写进系统自己的待删队列，效果一样：下次开机由 SMSS 删掉。
+    if !fallback.is_empty() {
+        let added = append_pending_renames(&fallback);
+        count += added;
+    }
+    count
+}
+
+/// 把路径追加到 `PendingFileRenameOperations`（系统重启时的删除队列）。
+///
+/// 格式是 REG_MULTI_SZ，每个「删除」占两个字符串：`\??\C:\path` 后面跟一个空串。
+/// 必须先读出旧内容再追加，否则会把别的程序的待删任务冲掉。
+fn append_pending_renames(paths: &[String]) -> usize {
+    use windows_sys::Win32::System::Registry::{
+        RegOpenKeyExW, RegQueryValueExW, KEY_READ, KEY_WRITE, REG_MULTI_SZ,
+    };
+
+    const SESSION_MANAGER: &str = r"SYSTEM\CurrentControlSet\Control\Session Manager";
+    const VALUE: &str = "PendingFileRenameOperations";
+
+    let key_path = wide(SESSION_MANAGER);
+    let mut key: HKEY = std::ptr::null_mut();
+    let rc = unsafe {
+        RegOpenKeyExW(
+            HKEY_LOCAL_MACHINE,
+            key_path.as_ptr(),
+            0,
+            KEY_READ | KEY_WRITE,
+            &mut key,
+        )
+    };
+    if rc != 0 {
+        return 0;
+    }
+
+    let name = wide(VALUE);
+    let mut existing: Vec<u16> = Vec::new();
+    let mut ty: u32 = 0;
+    let mut size: u32 = 0;
+    let rc = unsafe {
+        RegQueryValueExW(
+            key,
+            name.as_ptr(),
+            std::ptr::null_mut(),
+            &mut ty,
+            std::ptr::null_mut(),
+            &mut size,
+        )
+    };
+    if rc == 0 && size > 0 {
+        existing.resize((size / 2) as usize, 0);
+        let mut got = size;
+        let rc2 = unsafe {
+            RegQueryValueExW(
+                key,
+                name.as_ptr(),
+                std::ptr::null_mut(),
+                &mut ty,
+                existing.as_mut_ptr() as *mut u8,
+                &mut got,
+            )
+        };
+        if rc2 == 0 {
+            existing.truncate((got / 2) as usize);
+        } else {
+            existing.clear();
+        }
+    }
+    while existing.last() == Some(&0) {
+        existing.pop();
+    }
+
+    let mut out = existing;
+    let mut added = 0usize;
+    for p in paths {
+        let full = if p.starts_with(r"\\?\") || p.starts_with(r"\??\") {
+            p.clone()
+        } else {
+            format!(r"\??\{p}")
+        };
+        out.extend(full.encode_utf16());
+        out.push(0);
+        out.push(0); // 目标为空 = 删除
+        added += 1;
+    }
+    out.push(0); // MULTI_SZ 结尾
+
+    let bytes: Vec<u8> = out.iter().flat_map(|c| c.to_le_bytes()).collect();
+    let rc = unsafe {
+        RegSetValueExW(
+            key,
+            name.as_ptr(),
+            0,
+            REG_MULTI_SZ,
+            bytes.as_ptr(),
+            bytes.len() as u32,
+        )
+    };
+    unsafe {
+        RegCloseKey(key);
+    }
+    if rc == 0 {
+        added
+    } else {
+        0
+    }
 }
 
 fn pause() {
@@ -784,6 +955,21 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let elevated_flag = args.iter().any(|a| a == "--elevated");
     let uninstall_mode = args.iter().any(|a| a == "--uninstall");
+
+    // --schedule-test <目录>：内部自检。把整棵目录登记成「重启后删除」并打印条数。
+    // 这是给开发和排障用的：卸载时到底有没有把任务交给系统，光看代码不算验证过。
+    if let Some(i) = args.iter().position(|a| a == "--schedule-test") {
+        let dir = match args.get(i + 1) {
+            Some(d) => PathBuf::from(d),
+            None => {
+                println!("用法：inklink-setup.exe --schedule-test <目录>");
+                return;
+            }
+        };
+        let n = schedule_delete_tree(&dir);
+        println!("已登记 {n} 条重启删除任务（目录 {}）", dir.display());
+        return;
+    }
 
     // --extract <目录>：只解包，不写注册表、不碰 Program Files。
     // 用途：CI 里验证"这个 exe 的载荷没坏"，以及不想安装时翻包里的文件。
