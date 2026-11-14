@@ -1422,9 +1422,14 @@ impl ITfEditSession_Impl for TextService_Impl {
                 Ok(())
             }
             EditAction::InsertPunct(full, half) => {
-                // 数字后面要半角（`3.14` `10:30` `1,000`），其余照旧全角。
-                let digit = preceding_char_is_digit(&ctx, ec);
-                let text = if digit { half } else { full };
+                // 数字/算式环境要半角（`3.14` `6/2` `x^2`），其余照旧全角。
+                // 两路判断：按键层记的账（可靠）+ TSF 看文档（兜底）。
+                let numeric = numeric_context() || preceding_char_is_digit(&ctx, ec);
+                let chosen = pick_punct((&full, &half), numeric).to_string();
+                // 插入半角说明「这是一段算式」，后面的符号继续半角；全角则清掉。
+                set_numeric_context(numeric);
+                let text = chosen;
+                let digit = numeric;
                 let why = insert_at_caret(&ctx, ec, &text);
                 log_line(&format!(
                     "insert-punct '{text}' digit_before={digit} -> {why}"
@@ -1632,6 +1637,16 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                     || (undo && vk == VK_BACK)));
         // 大写锁定**不影响打字**（用户确认：照常走中文、弹候选窗）；
         // 浮条那边会把「中」显示成「A」，用来提示当前开了大写。
+        // 数字记账：只有**不被认领**的键才会真的进文档，所以只在这一类上更新。
+        // 被认领的键（字母、标点、空格）要么进组合串、要么由我们自己插字，
+        // 那条路径会单独维护这个状态（见 EditAction::InsertPunct / Commit）。
+        if !claim {
+            let digits = matches!(vk, VK_0..=VK_9) && !shift_held();
+            if digits != numeric_context() {
+                log_line(&format!("numeric-context -> {digits} (vk={vk})"));
+            }
+            set_numeric_context(digits);
+        }
         log_line(&format!("test vk={vk} claim={claim} composing={composing}"));
         Ok(BOOL(if claim { 1 } else { 0 }))
     }
@@ -1898,9 +1913,9 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                     } else {
                         // 数字后面要半角（`3.14`、`10:30`、`1,000`）：
                         // 光标前一个字符得在编辑会话里才看得到，这里只把两种写法都传下去。
-                        match digit_pair(vk, shift) {
+                        match punct_forms(vk, shift) {
                             Some((full, half)) => {
-                                log_line(&format!("punct vk={vk:#x} -> digit-aware"));
+                                log_line(&format!("punct vk={vk:#x} -> numeric-aware"));
                                 self.request_edit(EditAction::InsertPunct(
                                     full.to_string(),
                                     half.to_string(),
@@ -2498,7 +2513,7 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
 ///
 /// 只用来做放行判断，不关心转成什么 —— 所以 `-` `=`（永远是半角）不算在内。
 fn is_punct_key(vk: u32, shift: bool) -> bool {
-    cn_punct(vk, shift).is_some() || digit_pair(vk, shift).is_some()
+    cn_punct(vk, shift).is_some() || punct_forms(vk, shift).is_some()
 }
 
 /// 这个键该不该由输入法认领（TSF 按键状态机）。
@@ -2863,6 +2878,27 @@ fn insert_at_caret(ctx: &ITfContext, ec: u32, text: &str) -> &'static str {
 /// 探针只在**光标是塌缩状态**时做（有选区就直接答"不是"，反正接下来是替换）。
 /// NBSP 之类不影响：只认 `0-9`。
 /// 读完把光标放回原处，调用方拿到的还是同一个光标位置。
+/// 「刚打下的那个字符是数字/运算符吗」。
+///
+/// 为什么不只靠 TSF 探测：`preceding_char_is_digit` 需要应用给出 ACP 区间，
+/// 微信、Electron 这类宿主拿不到就永远返回 false，于是 `35.7` 被打成 `35。7`。
+/// 这里在按键层自己记账：只有**真的落进文档**的键才更新状态
+/// （被我们认领的键不会进文档，所以不更新）。
+static NUMERIC_CONTEXT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn numeric_context() -> bool {
+    NUMERIC_CONTEXT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn set_numeric_context(v: bool) {
+    NUMERIC_CONTEXT.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// 数字后面 / 算式中间，这个标点该用全角还是半角。
+fn pick_punct<'a>(pair: (&'a str, &'a str), numeric: bool) -> &'a str {
+    if numeric { pair.1 } else { pair.0 }
+}
+
 fn preceding_char_is_digit(ctx: &ITfContext, ec: u32) -> bool {
     // SAFETY: 标准 TSF 查询，处于编辑会话内
     unsafe {
@@ -2897,8 +2933,11 @@ fn preceding_char_is_digit(ctx: &ITfContext, ec: u32) -> bool {
         let mut buf = [0u16; 2];
         // pcch 是入参（缓冲区长度）也是出参（实际写入长度）
         let mut got = buf.len() as u32;
+        // 区间现在是 [光标前一个字符, 光标]，所以**第一个**字符才是要看的那个。
+        // 原来取 buf[got-1]：当光标后面还有文字时 got=2，读到的是光标后那个字符，
+        // 于是 `35.7` 被判成"前面不是数字"（2026-11-14 用户实测）。
         let digit = match range.GetText(ec, 0, &mut buf, &mut got) {
-            Ok(()) if got >= 1 => char::from_u32(buf[got as usize - 1] as u32)
+            Ok(()) if got >= 1 => char::from_u32(buf[0] as u32)
                 .map(|c| c.is_ascii_digit())
                 .unwrap_or(false),
             _ => false,
@@ -3258,13 +3297,25 @@ fn halfwidth_symbol(vk: u32, shift: bool) -> Option<&'static str> {
     })
 }
 
-/// 这几个标点在数字后面应该是半角：`3.14` / `1,000` / `10:30`。
-/// 返回 `(全角, 半角)`，由编辑会话看光标前一个字符决定用哪个。
-fn digit_pair(vk: u32, shift: bool) -> Option<(&'static str, &'static str)> {
+/// 这些标点在**数字或算式环境**里应该出半角，平时仍是中文标点。
+///
+/// 返回 `(全角, 半角)`，由编辑会话按上下文二选一。
+/// 覆盖 `3.14` `1,000` `10:30` 这类数字，也覆盖 `6/2` `a*b` `x^2` `3<5` `[1]` `(2)`。
+fn punct_forms(vk: u32, shift: bool) -> Option<(&'static str, &'static str)> {
     Some(match (vk, shift) {
         (VK_OEM_PERIOD, false) => ("。", "."),
         (VK_OEM_COMMA, false) => ("，", ","),
         (VK_OEM_1, true) => ("：", ":"),
+        (VK_OEM_2, false) => ("、", "/"),
+        (VK_OEM_4, false) => ("【", "["),
+        (VK_OEM_6, false) => ("】", "]"),
+        (VK_OEM_COMMA, true) => ("《", "<"),
+        (VK_OEM_PERIOD, true) => ("》", ">"),
+        (VK_5, true) => ("％", "%"),
+        (VK_6, true) => ("……", "^"),
+        (VK_8, true) => ("＊", "*"),
+        (VK_9, true) => ("（", "("),
+        (VK_0, true) => ("）", ")"),
         _ => return None,
     })
 }
@@ -3951,15 +4002,36 @@ mod tests {
     }
 
     #[test]
-    fn 数字后面的标点是半角() {
-        // `3.14`、`1,000`、`10:30` 里的符号
-        assert_eq!(digit_pair(VK_OEM_PERIOD, false), Some(("。", ".")));
-        assert_eq!(digit_pair(VK_OEM_COMMA, false), Some(("，", ",")));
-        assert_eq!(digit_pair(VK_OEM_1, true), Some(("：", ":")));
-        // 不是这几个键的一律走普通标点
-        assert_eq!(digit_pair(VK_OEM_1, false), None, "分号不受影响");
-        assert_eq!(digit_pair(VK_OEM_PERIOD, true), None, "Shift+. 是》");
-        assert_eq!(digit_pair(VK_OEM_2, false), None);
+    fn 数字和算式里的符号出半角() {
+        // 小数、千分位、时间
+        assert_eq!(punct_forms(VK_OEM_PERIOD, false), Some(("。", ".")));
+        assert_eq!(punct_forms(VK_OEM_COMMA, false), Some(("，", ",")));
+        assert_eq!(punct_forms(VK_OEM_1, true), Some(("：", ":")));
+        // 算式运算符：除号、乘号、乘方、大小比较、括号、方括号
+        assert_eq!(punct_forms(VK_OEM_2, false), Some(("、", "/")));
+        assert_eq!(punct_forms(VK_8, true), Some(("＊", "*")));
+        assert_eq!(punct_forms(VK_5, true), Some(("％", "%")));
+        assert_eq!(punct_forms(VK_6, true), Some(("……", "^")));
+        assert_eq!(punct_forms(VK_OEM_COMMA, true), Some(("《", "<")));
+        assert_eq!(punct_forms(VK_OEM_PERIOD, true), Some(("》", ">")));
+        assert_eq!(punct_forms(VK_9, true), Some(("（", "(")));
+        assert_eq!(punct_forms(VK_0, true), Some(("）", ")")));
+        assert_eq!(punct_forms(VK_OEM_4, false), Some(("【", "[")));
+        assert_eq!(punct_forms(VK_OEM_6, false), Some(("】", "]")));
+        // 与算式无关的键不受影响
+        assert_eq!(punct_forms(VK_OEM_1, false), None, "分号不该被改写");
+        assert_eq!(punct_forms(VK_OEM_3, false), None);
+    }
+
+    #[test]
+    fn 按上下文选全角或半角() {
+        // 用户实测：打 35.7 出来 35。7
+        assert_eq!(pick_punct(("。", "."), true), ".");
+        assert_eq!(pick_punct(("。", "."), false), "。");
+        // 算式中间继续半角，正常写句子仍是全角
+        assert_eq!(pick_punct(("、", "/"), true), "/");
+        assert_eq!(pick_punct(("、", "/"), false), "、");
+        assert_eq!(pick_punct(("＊", "*"), true), "*");
     }
 
     #[test]
