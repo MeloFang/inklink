@@ -1422,12 +1422,13 @@ impl ITfEditSession_Impl for TextService_Impl {
                 Ok(())
             }
             EditAction::InsertPunct(full, half) => {
-                // 数字/算式环境要半角（`3.14` `6/2` `x^2`），其余照旧全角。
-                // 两路判断：按键层记的账（可靠）+ TSF 看文档（兜底）。
+                // 只看光标前一个字符是不是数字：`3.14` 出半角，句子里的 `。` 仍是全角。
+                // 不能把「刚插过半角标点」当成理由延续下去 —— 那样 `3.14。` 后面的
+                // 句号也会变半角，默认全角的预期就破了（2026-11-15 用户实测）。
                 let numeric = numeric_context() || preceding_char_is_digit(&ctx, ec);
                 let chosen = pick_punct((&full, &half), numeric).to_string();
-                // 插入半角说明「这是一段算式」，后面的符号继续半角；全角则清掉。
-                set_numeric_context(numeric);
+                // 插完这一笔就不再算数字上下文：下一个符号仍按它前面的字符重新判断。
+                set_numeric_context(false);
                 let text = chosen;
                 let digit = numeric;
                 let why = insert_at_caret(&ctx, ec, &text);
@@ -1640,12 +1641,21 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
         // 数字记账：只有**不被认领**的键才会真的进文档，所以只在这一类上更新。
         // 被认领的键（字母、标点、空格）要么进组合串、要么由我们自己插字，
         // 那条路径会单独维护这个状态（见 EditAction::InsertPunct / Commit）。
+        // 维护「光标前是不是数字」这个状态：
+        // - 没被认领的键会真的进文档 → 数字置 true，其它一律 false
+        // - 被认领的非标点键（字母、空格、退格…）会改变文档 → 同样清 false
+        // - 被认领的标点键不清：它正是要靠这个状态决定全角/半角
+        let is_punct =
+            cn_punct(vk, shift_held()).is_some() || punct_forms(vk, shift_held()).is_some();
         if !claim {
             let digits = matches!(vk, VK_0..=VK_9) && !shift_held();
             if digits != numeric_context() {
                 log_line(&format!("numeric-context -> {digits} (vk={vk})"));
             }
             set_numeric_context(digits);
+        } else if !is_punct && numeric_context() {
+            log_line(&format!("numeric-context -> false (claimed vk={vk})"));
+            set_numeric_context(false);
         }
         log_line(&format!("test vk={vk} claim={claim} composing={composing}"));
         Ok(BOOL(if claim { 1 } else { 0 }))
