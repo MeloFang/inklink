@@ -338,7 +338,7 @@ fn default_config() -> Config {
         ai_model: DEF_MODEL.to_string(),
         ai_provider: "ollama".to_string(),
         ai_key: String::new(),
-        hint: true,
+        hint: false,
         corpus_path: String::new(),
     }
 }
@@ -366,7 +366,7 @@ fn load_config() -> Config {
         let ai_model = read_sz(h, "AI_Model").unwrap_or_else(|| DEF_MODEL.to_string());
         let ai_provider = read_sz(h, "AI_Provider").unwrap_or_else(|| "ollama".to_string());
         let ai_key = read_sz(h, "AI_ApiKey").unwrap_or_default();
-        let hint = !matches!(read_dword(h, "Hint"), Some(0));
+        let hint = matches!(read_dword(h, "Hint"), Some(v) if v != 0);
         let corpus_path = read_sz(h, "NotesDir").unwrap_or_default();
         RegCloseKey(h);
         Config {

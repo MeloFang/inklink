@@ -32,7 +32,10 @@ pub const VALUE_ROWS: &str = "Rows";
 pub const VALUE_UNDO_MS: &str = "UndoMs";
 /// 是否记词（1/缺失 = 记，0 = 只查询不学习）。
 pub const VALUE_LEARN: &str = "Learn";
-/// 联想条开关（`Hint`，DWORD）：缺失=开，写 0=关。
+/// 联想条开关（`Hint`，DWORD）：**缺失=关**，写 1=开。
+///
+/// 默认关是刻意的：上屏后自动弹一条联想条属于增强功能，会挡在光标下方。
+/// 只想当输入法用的人不该被它打扰（2026-11-17 用户要求，和 AI 一致）。
 pub const VALUE_HINT: &str = "Hint";
 
 /// 列数合法区间。小于 3 一行放不下「序号 + 词」，大于 9 一屏糊成一片。
@@ -62,7 +65,7 @@ impl Config {
         rows: 5,
         undo_ms: 2000,
         learn: true,
-        hint: true,
+        hint: false,
     };
 
     /// 收起时一页几个：一行。
@@ -118,7 +121,7 @@ pub fn from_raw(
         ) as usize,
         undo_ms: clamp_u32(undo_ms, Config::DEFAULT.undo_ms, 0, UNDO_MS_MAX),
         learn: !matches!(learn, Some(0)),
-        hint: !matches!(hint, Some(0)),
+        hint: matches!(hint, Some(v) if v != 0),
     }
 }
 
@@ -218,6 +221,17 @@ mod tests {
         assert!(from_raw(None, None, None, None, None, None).learn);
         assert!(from_raw(None, None, None, None, Some(3), None).learn);
         assert!(!from_raw(None, None, None, None, Some(0), None).learn);
+    }
+
+    #[test]
+    fn 联想条默认关闭要显式开() {
+        // 缺失 = 关：新装用户上屏后不会自动弹联想条
+        assert!(!Config::DEFAULT.hint);
+        assert!(!from_raw(None, None, None, None, None, None).hint);
+        // 只有明确写 1 才开
+        assert!(from_raw(None, None, None, None, None, Some(1)).hint);
+        assert!(from_raw(None, None, None, None, None, Some(9)).hint);
+        assert!(!from_raw(None, None, None, None, None, Some(0)).hint);
     }
 
     #[test]
