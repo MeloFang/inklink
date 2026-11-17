@@ -35,7 +35,7 @@ dependencies = [
 
 [[package]]
 name = "inklink-setup"
-version = "2.2.14"
+version = "2.2.15"
 dependencies = [
  "flate2",
  "windows-sys",

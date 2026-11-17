@@ -1693,7 +1693,16 @@ unsafe fn paint_bar(c: &mut Canvas, hover: i32, dark: bool) {
     draw_glyphs_aa(hdc, &cell, &punct_glyphs(&cell, punct, dpi_k()), punct_fg);
 
     // 第四格：AI（点开是浮动面板，三个动作在面板里）。
-    draw_text_centered(hdc, &rects[3], "AI", pal.accent, font);
+    // AI 没启用就画成灰色：大多数人只想要个输入法，亮着的 AI 会让
+    // 人以为还得配置点什么（2026-11-17 用户要求默认不打扰）。
+    let ai_on = crate::ai::enabled();
+    draw_text_centered(
+        hdc,
+        &rects[3],
+        "AI",
+        if ai_on { pal.accent } else { pal.dim },
+        font,
+    );
 
     // 第五格：菜单。
     draw_menu_glyph(hdc, &rects[4], pal.text);
@@ -2150,7 +2159,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     }
                     1 => toggle_mode(hwnd),
                     2 => toggle_punct(hwnd),
-                    3 => crate::ai::open_panel(),
+                    // AI 没启用时这一格不响应；想用的人去设置里勾上
+                    3 => {
+                        if crate::ai::enabled() {
+                            crate::ai::open_panel();
+                        } else {
+                            crate::log_line("bar: AI cell ignored (disabled)");
+                        }
+                    }
                     _ => {}
                 }
             }

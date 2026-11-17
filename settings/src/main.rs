@@ -622,6 +622,9 @@ unsafe fn build_ui(hwnd: HWND) {
     button("关闭", 198, 492, 76, ID_CLOSE);
     button("立即导入", 286, 492, 100, ID_IMPORT);
 
+    // 初始状态：没启用 AI 时那几项是灰的（出厂就是关的）
+    apply_ai_enabled(ai_enable, ai_provider, ai_endpoint, ai_model, ai_key);
+
     UI.with(|u| {
         let mut u = u.borrow_mut();
         u.cols = cols;
@@ -770,10 +773,28 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     set_text(ui.ai_key, "");
                     SendMessageW(ui.hint, BM_SETCHECK as u32, 1, 0);
                     set_text(ui.corpus, "");
+                    apply_ai_enabled(
+                        ui.ai_enable,
+                        ui.ai_provider,
+                        ui.ai_endpoint,
+                        ui.ai_model,
+                        ui.ai_key,
+                    );
                     set_text(ui.status, "已填回默认值 —— 还要点一次“保存”才写进去。");
                 }
                 ID_CLOSE => {
                     DestroyWindow(hwnd);
+                }
+                ID_AI_ENABLE => {
+                    // 勾上/取消都立刻反映到输入框的可用状态
+                    let ui = UI.with(|u| u.borrow().to_snapshot());
+                    apply_ai_enabled(
+                        ui.ai_enable,
+                        ui.ai_provider,
+                        ui.ai_endpoint,
+                        ui.ai_model,
+                        ui.ai_key,
+                    );
                 }
                 ID_IMPORT => on_import(),
                 _ => {}
@@ -786,6 +807,30 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             0
         }
         _ => DefWindowProcW(hwnd, msg, wp, lp),
+    }
+}
+
+// windows-sys 0.61 的 WindowsAndMessaging 里没有 EnableWindow（被裁掉了），
+// 自己声明一次：只是 user32 的一个普通导出，签名和 Win32 文档一致。
+#[link(name = "user32")]
+extern "system" {
+    fn EnableWindow(hwnd: HWND, enable: i32) -> i32;
+}
+
+fn enable_window(h: HWND, on: i32) {
+    unsafe {
+        EnableWindow(h, on);
+    }
+}
+
+/// 按「启用 AI」的勾选状态决定接口/模型/Key 能不能编辑。
+///
+/// 默认未勾选就全部灰掉：只想当输入法用的人看到的只是一行复选框，
+/// 不会以为「必须先填接口才能打字」。
+fn apply_ai_enabled(enable: HWND, provider: HWND, endpoint: HWND, model: HWND, key: HWND) {
+    let on = checked(enable);
+    for h in [provider, endpoint, model, key] {
+        unsafe { enable_window(h, if on { 1 } else { 0 }) };
     }
 }
 
