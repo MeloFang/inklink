@@ -45,6 +45,17 @@ pub const GUID_PROFILE: GUID = GUID::from_u128(0x1b2c3d4e_5f60_4718_9a2b_3c4d5e6
 
 const DLL_DESC: &str = "inklink 输入法";
 
+/// `GUID_TFCAT_TIPCAP_IMMERSIVESUPPORT`：声明"这个输入法能在沉浸式宿主里跑"。
+///
+/// 缺这一条，**Windows Terminal 和 UWP 应用根本不会加载我们**：它们走
+/// `Windows.UI.Core.TextInput` → `TextInputHost.exe` 这条 CoreText 栈，
+/// 只从带这个分类的 TIP 里挑输入法。
+/// 2026-11-22 实测：补上之后，PowerShell（Windows Terminal）里才第一次出现「inklink 输入法」，
+/// 之前同一个窗口里 0 个 inklink 模块、只有英文字母。
+/// 微软拼音、搜狗这批都有这个分类（`Category\Category\{13A016DF-…}\{CLSID}`）。
+const GUID_TFCAT_TIPCAP_IMMERSIVESUPPORT: GUID =
+    GUID::from_u128(0x13a016df_560b_46cd_947a_4c3af1e0e35d);
+
 /// 候选网格列数（P3 起可配置，默认 5）。
 ///
 /// 每次现读注册表：一个 `RegOpenKeyExW` + 几个 `RegQueryValueExW` 是微秒级的，
@@ -3602,7 +3613,7 @@ pub extern "system" fn DllMain(
 // ─────────────────────────── 注册表 ───────────────────────────
 
 mod registry {
-    use super::{CLSID_INKLINK_TSF, DLL_DESC, GUID_PROFILE};
+    use super::{CLSID_INKLINK_TSF, DLL_DESC, GUID_PROFILE, GUID_TFCAT_TIPCAP_IMMERSIVESUPPORT};
     use std::ffi::OsString;
     use std::os::windows::ffi::OsStrExt;
     use windows::Win32::Foundation::{ERROR_SUCCESS, WIN32_ERROR};
@@ -3705,11 +3716,32 @@ mod registry {
         set_sz(h, "", DLL_DESC)?;
         close(h);
 
-        // 3. 语言配置：**完全交给 AddLanguageProfile 写**。
+        // 3. 语言配置：主体**交给 AddLanguageProfile 写**。
         //    手动写会出错（IconIndex 类型、Description 位置），还会和 TSF 自己写的值打架。
         if let Err(e) = register_with_tsf(&path) {
             eprintln!("ITfInputProcessorProfiles 登记失败: {e:?}");
             return Err(windows::core::HRESULT::from_win32(0x8000_4005));
+        }
+
+        // 4. 补一个**具名** `Description`。
+        //    `AddLanguageProfile` 只写了默认值（"{description}" 那种无名值），可 Windows 校验
+        //    「这是不是一个合法输入法」读的是具名 `Description`（微软拼音、搜狗都有这个值）。
+        //    缺了它，`Set-WinUserLanguageList` 会把我们这条**静默丢掉**——不报错、不提示，
+        //    表现就是 Win+Space 里永远没有 inklink，Windows Terminal / UWP 里也用不了
+        //    （2026-11-22 查了两小时才定位到这一行）。
+        let lp = format!(
+            "SOFTWARE\\Microsoft\\CTF\\TIP\\{clsid}\\LanguageProfile\\0x00000804\\{{1B2C3D4E-5F60-4718-9A2B-3C4D5E6F7081}}"
+        );
+        match create(HKEY_LOCAL_MACHINE, &lp) {
+            Ok(h) => {
+                if let Err(rc) = set_sz(h, "Description", DLL_DESC) {
+                    eprintln!("写语言配置 Description 失败: {rc:?}（输入法列表里可能看不到 inklink）");
+                }
+                close(h);
+            }
+            Err(rc) => {
+                eprintln!("打开语言配置键失败: {rc:?}（输入法列表里可能看不到 inklink）");
+            }
         }
 
         Ok(())
@@ -3766,6 +3798,14 @@ mod registry {
                 crate::ignore_s_false(catmgr.RegisterCategory(
                     &CLSID_INKLINK_TSF,
                     &GUID_TFCAT_TIP_KEYBOARD,
+                    &CLSID_INKLINK_TSF,
+                ))?;
+
+                // 沉浸式支持：Windows Terminal / UWP 应用只认带这个分类的输入法。
+                // 少了它，那些宿主里连 Win+Space 的列表都看不到我们。
+                crate::ignore_s_false(catmgr.RegisterCategory(
+                    &CLSID_INKLINK_TSF,
+                    &GUID_TFCAT_TIPCAP_IMMERSIVESUPPORT,
                     &CLSID_INKLINK_TSF,
                 ))?;
 

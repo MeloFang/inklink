@@ -52,6 +52,9 @@ const ENGINE_DIR: &str = r"C:\inklink-engine";
 const CLSID: &str = "{8F2A6C1E-4B3D-4F7A-9A21-5C6D7E8F9A0B}";
 const PROFILE: &str = "{1B2C3D4E-5F60-4718-9A2B-3C4D5E6F7081}";
 const TIPCAT: &str = "{34745C63-B2F0-4784-8B67-5E12C8701A31}"; // GUID_TFCAT_TIP_KEYBOARD
+/// GUID_TFCAT_TIPCAP_IMMERSIVESUPPORT：Windows Terminal / UWP 应用只从带这个分类的
+/// TIP 里挑输入法；缺了它，那些宿主里连 Win+Space 的列表都看不到 inklink（2026-11-22 实测）。
+const TIPIMMERSIVE: &str = "{13A016DF-560B-46CD-947A-4C3AF1E0E35D}";
 
 struct Entry {
     name: String,
@@ -712,8 +715,24 @@ fn install() -> Result<(), String> {
             None,
             "",
         );
+        // 沉浸式支持（Windows Terminal / UWP）。Category 和 Item 两棵树都要写。
+        let _ = reg_sz(
+            HKEY_LOCAL_MACHINE,
+            &format!(r"{tip}\Category\Category\{TIPIMMERSIVE}\{CLSID}"),
+            None,
+            "",
+        );
+        let _ = reg_sz(
+            HKEY_LOCAL_MACHINE,
+            &format!(r"{tip}\Category\Item\{CLSID}\{TIPIMMERSIVE}"),
+            None,
+            "",
+        );
         let lp = format!(r"{tip}\LanguageProfile\0x00000804\{PROFILE}");
         let _ = reg_sz(HKEY_LOCAL_MACHINE, &lp, None, "inklink 输入法");
+        // 具名 Description：Windows 校验输入法读的是这个值，不是上面那个无名默认值。
+        // 缺了它，Set-WinUserLanguageList 会静默丢弃我们 → Win+Space 里永远看不到 inklink。
+        let _ = reg_sz(HKEY_LOCAL_MACHINE, &lp, Some("Description"), "inklink 输入法");
         let _ = reg_dword(HKEY_LOCAL_MACHINE, &lp, "Enable", 1);
         // 指向单独的 .ico，不是 DLL：DLL 里没有编图标资源（build.rs 只写版本号），
         // 指过去语言列表会退回显示「简体」两个字；.ico 也不会因 DLL 换版本名而失效。

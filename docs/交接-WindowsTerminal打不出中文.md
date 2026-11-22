@@ -1,18 +1,42 @@
-# 交接：Windows Terminal / PowerShell 里打不出中文（2026-11-22）
+# 交接：Windows Terminal / PowerShell 里打不出中文（2026-11-22，**已解决**）
 
-> 接手前请先读完「一句话结论」和「别做什么」两节，能省你两小时。
+> 这份文档现在有两个用途：
+> 1. 记录**根因和修法**（下面「根因」一节），改了 `tsf/src/lib.rs` 和 `installer/setup/src/main.rs`；
+> 2. 留一份排查过程，以后遇到"输入法某个宿主里完全不出现"这类问题可以照着走一遍。
 
-## 一句话结论
+## 根因（一句话）
 
-**能确定**：用户的"PowerShell"是 **Windows Terminal**，它走的是 CoreText 输入栈
+我们注册 TIP 时**漏了 `GUID_TFCAT_TIPCAP_IMMERSIVESUPPORT` 分类**，而且
+`LanguageProfile` 里**没有具名 `Description` 值**。Windows Terminal 走 CoreText
+（`Windows.UI.Core.TextInput` → `TextInputHost.exe`），只从带沉浸式分类的 TIP 里挑输入法；
+没有具名 `Description` 的那条又会被 `Set-WinUserLanguageList` **静默丢弃**，
+所以 Win+Space 里永远看不到 inklink —— 于是"PowerShell 里打不出中文"。
+
+补齐这两处（`Category\Category\{13A016DF-…}\{CLSID}` + `LanguageProfile\…\Description`）之后，
+WT 窗口关掉重开，Win+Space 里出现「inklink 输入法」，选中即可正常打中文（2026-11-22 用户确认）。
+
+**代码修复**：
+
+| 文件 | 改动 |
+|:---|:---|
+| `tsf/src/lib.rs` | 新增 `GUID_TFCAT_TIPCAP_IMMERSIVESUPPORT` 常量；`register_with_tsf()` 里多注册一个分类；`registry::register()` 增加第 4 步，补写具名 `Description` |
+| `installer/setup/src/main.rs` | 多写两棵沉浸式分类键（`Category\Category\…` 与 `Category\Item\…`）；`LanguageProfile` 补具名 `Description` |
+| `installer/install.ps1` | 第 6 步改成**回读校验**：`Set-WinUserLanguageList` 之后重新读一遍列表，没进去就告警，不再只打印"已加入" |
+
+## 排查过程（还会用到的方法）
+
+**能确定**：用户的"PowerShell"是 **Windows Terminal**，走 CoreText 输入栈
 （`Windows.UI.Core.TextInput.dll` + `NInput.dll` → `TextInputHost.exe`），
-而我们的 `inklink_tsf*.dll` **从来没有被加载进那条链**（WT 进程、TextInputHost 进程里都是 0 个 inklink 模块）。
+而 `inklink_tsf*.dll` **从来没被加载进那条链**（WT 进程、TextInputHost 进程里都是 0 个 inklink 模块）。
 
-**不能确定**：为什么 `Win+Space` 里看不到 inklink 输入法。我们已经把手改注册表做到
-「用户输入法列表里有、SortOrder 里有、HKLM Enable=1、Description 有」，用户仍报看不到、打不出。
+**关键对照法**：拿一个**同类但能用**的第三方输入法（这台机器上是搜狗）逐棵树 diff 注册表，
+最后 diff 出来只差「沉浸式分类」和「具名 Description」。这比读文档猜快得多。
 
 **没被影响**：同一台机器上微信、Chrome、Edge、DeepSeek Harness（Electron）、记事本里 inklink 都正常
-（日志里有组合串和选词）。所以**不是输入法核心坏了**，是控制台/终端这一类宿主不行。
+（日志里有组合串和选词）。所以不是输入法核心坏了，是那类宿主看不到我们。
+
+> 下面「试过什么、结果如何」和「下一步该做的」两节是排查过程留档，
+> 其中第 2、3 条（`EnableLanguageProfile`/`EnumProfiles`、`ThreadingModel=Both`）**已经不需要做了**。
 
 ## 症状
 

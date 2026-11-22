@@ -1,4 +1,4 @@
-﻿# inklink 输入法安装脚本（带日志）
+# inklink 输入法安装脚本（带日志）
 #
 # 用法：右键「以管理员身份运行」install.cmd
 # 日志：C:\Users\Public\inklink-install.log
@@ -191,7 +191,17 @@ try {
         $zh.InputMethodTips.Add($tipStr)
         Set-WinUserLanguageList -LanguageList $list -Force
     }
-    Write-Host "    已加入：$tipStr"
+    # 回读校验：Set-WinUserLanguageList 会把"校验不过"的 TIP **静默丢掉**，不报错。
+    # LanguageProfile 缺具名 Description 时就是这样（2026-11-22 查了两小时：
+    # 界面显示"已加入"，Win+Space 里却永远没有 inklink，Windows Terminal 里打不出中文）。
+    $ok = @(Get-WinUserLanguageList | Where-Object { $_.InputMethodTips -contains $tipStr }).Count -gt 0
+    if ($ok) {
+        Write-Host "    已加入：$tipStr"
+    } else {
+        Write-Host "    警告：系统拒绝了这条输入法，列表里没有它" -ForegroundColor Yellow
+        Write-Host "          检查 HKLM\SOFTWARE\Microsoft\CTF\TIP\$CLSID\LanguageProfile\0x00000804\$PROFILE" -ForegroundColor Yellow
+        Write-Host "          下是否有名为 Description 的值（没有就说明注册代码退化了）" -ForegroundColor Yellow
+    }
 } catch {
     Write-Host "    警告：自动加入输入法列表失败（$($_.Exception.Message)）" -ForegroundColor Yellow
     Write-Host "    不影响安装。请手动添加：设置 → 时间和语言 → 语言和区域 → 中文(简体) → 添加键盘 → inklink 输入法" -ForegroundColor Yellow
