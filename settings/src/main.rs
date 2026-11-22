@@ -1,8 +1,9 @@
-//! inklink 设置 —— 一页原生小窗，只改 `HKCU\Software\inklink\Config` 里那几个值。
+//! inklink 设置 —— 六页原生小窗（输入 / 外观 / 学习 / 词库 / AI / 关于），
+//! 只改 `HKCU\Software\inklink\Config` 里那几个值。
 //!
-//! 为什么是这么小一个程序：现在可配的就八项（暗色、列数、行数、撤回窗口、学习开关，
-//! 加上 P4b 的 AI 三项），为八项做六页设置台是过度设计。等 P6 把配置撑到几十项、
-//! 需要分组和长列表时，再考虑换 webview 那套（见 PLAN.md 的 P2b）。
+//! 为什么分页：配置涨到十几项、还带着 AI 和笔记导入，挤在一页里普通用户分不清
+//! 哪些该动、改完什么时候生效。每页底部都写着「生效时机」。页签只管可见性，
+//! 读写注册表的数据流（`read_form` / `load_config` / `save_config`）没有变。
 //!
 //! 为什么用系统控件而不是自绘：浮条和候选窗自绘是因为它们要跟着主题变、还要在
 //! 宿主进程里跑（不能引 UI 框架）；设置窗是独立进程、一天用一次，系统控件够用。
@@ -14,19 +15,20 @@
 
 use std::cell::RefCell;
 
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{GetStockObject, DEFAULT_GUI_FONT, HGDIOBJ};
 use windows_sys::Win32::System::Registry::{
     RegCloseKey, RegCreateKeyExW, RegQueryValueExW, RegSetValueExW, HKEY, HKEY_CURRENT_USER,
     KEY_READ, KEY_WRITE, REG_DWORD, REG_EXPAND_SZ, REG_OPTION_NON_VOLATILE, REG_SZ,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, GetWindowTextW,
-    IsDialogMessageW, MessageBoxW, PostQuitMessage, RegisterClassW, SendMessageW, SetWindowTextW,
-    ShowWindow, TranslateMessage, BM_GETCHECK, BM_SETCHECK, BS_AUTOCHECKBOX, CBS_DROPDOWNLIST,
-    CB_ADDSTRING, CB_GETCURSEL, CB_GETLBTEXT, CB_GETLBTEXTLEN, CB_SETCURSEL, CW_USEDEFAULT,
-    ES_AUTOHSCROLL, ES_NUMBER, MB_ICONERROR, MB_OK, MSG, SW_SHOW, WM_COMMAND, WM_CREATE,
-    WM_DESTROY, WNDCLASSW, WS_BORDER, WS_CAPTION, WS_CHILD, WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP,
+    AdjustWindowRect, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
+    GetMessageW, GetWindowTextW, IsDialogMessageW, MessageBoxW, PostQuitMessage, RegisterClassW,
+    SendMessageW, SetWindowTextW, ShowWindow, TranslateMessage, BM_GETCHECK, BM_SETCHECK,
+    BS_AUTOCHECKBOX, BS_AUTORADIOBUTTON, BS_PUSHLIKE, CBS_DROPDOWNLIST, CB_ADDSTRING, CB_GETCURSEL,
+    CB_GETLBTEXT, CB_GETLBTEXTLEN, CB_SETCURSEL, CW_USEDEFAULT, ES_AUTOHSCROLL, ES_NUMBER,
+    ES_READONLY, MB_ICONERROR, MB_OK, MSG, SW_HIDE, SW_SHOW, WM_COMMAND, WM_CREATE, WM_DESTROY,
+    WNDCLASSW, WS_BORDER, WS_CAPTION, WS_CHILD, WS_GROUP, WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP,
     WS_VISIBLE,
 };
 
@@ -50,7 +52,6 @@ const ID_AI_KEY: usize = 112;
 const AI_PROVIDERS: &[&str] = &["ollama", "openai"];
 const DEF_ENDPOINT_OLLAMA: &str = "http://127.0.0.1:11434";
 const DEF_ENDPOINT_OPENAI: &str = "https://api.deepseek.com";
-const DEF_MODEL_OLLAMA: &str = "qwen2.5:7b";
 const DEF_MODEL_OPENAI: &str = "deepseek-chat";
 /// 语料表路径（笔记词汇进候选用的那张表）
 const ID_CORPUS: usize = 109;
@@ -76,7 +77,35 @@ thread_local! {
     static UI: RefCell<Ui> = RefCell::new(Ui::default());
 }
 
-#[derive(Default)]
+/// 页签按钮的 ID：2001..2006，顺序就是页序。
+const ID_TAB_FIRST: usize = 2001;
+/// 六页的标题。改顺序要连带改 `build_ui` 里每个控件挂在哪一页。
+const PAGE_TITLES: [&str; 6] = ["输入", "外观", "学习", "词库", "AI", "关于"];
+const PAGE_COUNT: usize = PAGE_TITLES.len();
+const PAGE_INPUT: usize = 0;
+const PAGE_LOOK: usize = 1;
+const PAGE_LEARN: usize = 2;
+const PAGE_CORPUS: usize = 3;
+const PAGE_AI: usize = 4;
+const PAGE_ABOUT: usize = 5;
+
+/// 客户区大小：按控件最多的 AI 页定，切页不改窗口大小。
+const CLIENT_W: i32 = 600;
+const CLIENT_H: i32 = 480;
+/// 页内容的左边距和宽度；每页「生效时机」都在同一个高度，切页时好对照。
+const X0: i32 = 24;
+const PAGE_W: i32 = CLIENT_W - 2 * X0;
+const Y_WHEN: i32 = 352;
+
+const PROJECT_URL: &str = "https://github.com/MeloFang/inklink";
+const DIAGNOSE_PATH: &str = r"C:\Program Files\inklink\diagnose.cmd";
+
+/// 页签按钮 ID → 页序；不是页签就 `None`。
+fn page_of_tab(id: usize) -> Option<usize> {
+    id.checked_sub(ID_TAB_FIRST).filter(|p| *p < PAGE_COUNT)
+}
+
+#[derive(Default, Clone)]
 struct Ui {
     cols: HWND,
     rows: HWND,
@@ -91,7 +120,14 @@ struct Ui {
     hint: HWND,
     corpus: HWND,
     status: HWND,
+    /// 顶部六个页签（下标 = 页序）
+    tabs: Vec<HWND>,
+    /// 每页的控件（下标 = 页序）。建窗时一次全建好，切页只改可见性，
+    /// 所以 `read_form` 不管当前停在哪一页，都能读到六页的全部值。
+    pages: [Vec<HWND>; PAGE_COUNT],
 }
+/// 词库页的生效时机（任务 C 之后会改成「立即」）。
+const CORPUS_WHEN: &str = "生效时机：导入后需要重启输入引擎才生效。";
 
 /// 把界面上填的值收成配置。返回 `Err` 就弹提示、不写注册表。
 fn read_form(ui: &Ui) -> Result<Config, String> {
@@ -447,202 +483,329 @@ unsafe fn set_text(h: HWND, s: &str) {
     SetWindowTextW(h, wide_static(s).as_ptr());
 }
 
+unsafe fn set_check(h: HWND, on: bool) {
+    SendMessageW(h, BM_SETCHECK, on as usize, 0);
+}
+
+/// 把一份配置填进六页的控件。建窗（读注册表）和「恢复默认」（出厂值）共用这一个，
+/// 这样两条路不会漏掉某一页；末尾同步 AI 四项的可用状态。
+unsafe fn fill_form(ui: &Ui, c: &Config) {
+    set_text(ui.cols, &c.cols.to_string());
+    set_text(ui.rows, &c.rows.to_string());
+    set_check(ui.hint, c.hint);
+    set_check(ui.dark, c.dark);
+    set_check(ui.learn, c.learn);
+    set_text(ui.undo, &c.undo_ms.to_string());
+    set_text(ui.corpus, &c.corpus_path);
+    set_check(ui.ai_enable, c.ai_enabled);
+    let sel = AI_PROVIDERS
+        .iter()
+        .position(|p| *p == c.ai_provider)
+        .unwrap_or(0);
+    SendMessageW(ui.ai_provider, CB_SETCURSEL, sel, 0);
+    set_text(ui.ai_endpoint, &c.ai_endpoint);
+    set_text(ui.ai_model, &c.ai_model);
+    set_text(ui.ai_key, &c.ai_key);
+    apply_ai_enabled(
+        ui.ai_enable,
+        ui.ai_provider,
+        ui.ai_endpoint,
+        ui.ai_model,
+        ui.ai_key,
+    );
+}
+
+/// 只显示第 `page` 页的控件，其余页全部隐藏；页签按下的状态跟着走。
+/// 隐藏的控件拿不到焦点，Tab 顺序自然只在当前页里转。
+unsafe fn show_page(ui: &Ui, page: usize) {
+    for (i, group) in ui.pages.iter().enumerate() {
+        let cmd = if i == page { SW_SHOW } else { SW_HIDE };
+        for h in group {
+            ShowWindow(*h, cmd);
+        }
+    }
+    for (i, t) in ui.tabs.iter().enumerate() {
+        set_check(*t, i == page);
+    }
+}
+
 unsafe fn build_ui(hwnd: HWND) {
     let font = GetStockObject(DEFAULT_GUI_FONT) as HGDIOBJ;
-    let add = |h: HWND| {
-        SendMessageW(
-            h,
-            0x0030, // WM_SETFONT
-            font as usize,
-            1,
-        );
+    // 每个控件建好就记进它所属的页；页签、分隔线、状态行、底部按钮不属于任何页（None）
+    let pages: RefCell<[Vec<HWND>; PAGE_COUNT]> = RefCell::new(Default::default());
+    let make = |page: Option<usize>,
+                class: &str,
+                text: &str,
+                style: u32,
+                (x, y, w, h): (i32, i32, i32, i32),
+                id: usize|
+     -> HWND {
+        let c = child(class, text, style, x, y, w, h, hwnd, id);
+        SendMessageW(c, 0x0030 /* WM_SETFONT */, font as usize, 1);
+        if let Some(p) = page {
+            pages.borrow_mut()[p].push(c);
+        }
+        c
+    };
+    let label =
+        |p: usize, t: &str, x: i32, y: i32, w: i32| make(Some(p), "STATIC", t, 0, (x, y, w, 18), 0);
+    // 两行高的说明（STATIC 默认自动折行）
+    let para = |p: usize, t: &str, y: i32| make(Some(p), "STATIC", t, 0, (X0, y, PAGE_W, 36), 0);
+    let when = |p: usize, t: &str| para(p, t, Y_WHEN);
+    let num = |p: usize, x: i32, y: i32, w: i32, id: usize| {
+        let style = WS_BORDER | WS_TABSTOP | ES_NUMBER as u32;
+        make(Some(p), "EDIT", "", style, (x, y, w, 22), id)
+    };
+    // 文本输入框：地址、模型名、目录是字符串，不能带 ES_NUMBER，长内容要能横向滚动
+    let text = |p: usize, x: i32, y: i32, w: i32, id: usize| {
+        let style = WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL as u32;
+        make(Some(p), "EDIT", "", style, (x, y, w, 22), id)
+    };
+    let check = |p: usize, t: &str, y: i32, id: usize| {
+        let style = WS_TABSTOP | BS_AUTOCHECKBOX as u32;
+        make(Some(p), "BUTTON", t, style, (X0, y, PAGE_W, 20), id)
+    };
+    // 只读、无边框的输入框：看着像一行字，但能选中复制（路径、网址）
+    let copyable = |p: usize, t: &str, y: i32| {
+        let style = (ES_READONLY | ES_AUTOHSCROLL) as u32;
+        make(Some(p), "EDIT", t, style, (X0 + 18, y, PAGE_W - 18, 20), 0)
+    };
+    let button = |page: Option<usize>, t: &str, x: i32, y: i32, w: i32, id: usize| {
+        make(page, "BUTTON", t, WS_TABSTOP, (x, y, w, 26), id)
     };
 
-    let label = |t: &str, x: i32, y: i32, w: i32| {
-        let h = child("STATIC", t, 0, x, y, w, 18, hwnd, 0);
-        add(h);
-        h
-    };
-    let edit = |t: &str, x: i32, y: i32, w: i32, id: usize| {
-        let h = child(
-            "EDIT",
-            t,
-            WS_BORDER | WS_TABSTOP | ES_NUMBER as u32,
-            x,
-            y,
-            w,
-            22,
-            hwnd,
-            id,
-        );
-        SendMessageW(h, 0x0030, font as usize, 1);
-        h
-    };
-    // 文本输入框：地址和模型名是字符串，不能带 ES_NUMBER，长地址要能横向滚动
-    let edit_text = |t: &str, x: i32, y: i32, w: i32, id: usize| {
-        let h = child(
-            "EDIT",
-            t,
-            WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL as u32,
-            x,
-            y,
-            w,
-            22,
-            hwnd,
-            id,
-        );
-        SendMessageW(h, 0x0030, font as usize, 1);
-        h
-    };
-    let check = |t: &str, x: i32, y: i32, w: i32, id: usize| {
-        let h = child(
+    // ── 页签 ──────────────────────────────────────────────
+    // 不用 comctl32 的 TabCtrl（要 InitCommonControlsEx + manifest）：一排
+    // BS_PUSHLIKE 的单选按钮就是页签，按下去的那个是当前页。
+    let mut tabs = Vec::with_capacity(PAGE_COUNT);
+    for (i, t) in PAGE_TITLES.iter().enumerate() {
+        // 第一个带 WS_GROUP + WS_TABSTOP：Tab 键进到页签这一组，方向键在组内切页
+        let first = if i == 0 { WS_GROUP | WS_TABSTOP } else { 0 };
+        let style = first | (BS_AUTORADIOBUTTON | BS_PUSHLIKE) as u32;
+        let x = 12 + i as i32 * 96;
+        tabs.push(make(
+            None,
             "BUTTON",
             t,
-            WS_TABSTOP | BS_AUTOCHECKBOX as u32,
-            x,
-            y,
-            w,
-            20,
-            hwnd,
-            id,
-        );
-        add(h);
-        h
-    };
-    let button = |t: &str, x: i32, y: i32, w: i32, id: usize| {
-        let h = child("BUTTON", t, WS_TABSTOP, x, y, w, 26, hwnd, id);
-        add(h);
-        h
-    };
-
-    let c = load_config();
-
-    label("每页候选", 16, 18, 80);
-    let cols = edit(&c.cols.to_string(), 100, 14, 44, ID_COLS);
-    label("列 ×", 152, 18, 34);
-    let rows = edit(&c.rows.to_string(), 186, 14, 44, ID_ROWS);
-    label("行", 238, 18, 24);
-
-    let dark = check("暗色主题（候选窗、浮条、菜单一起变）", 16, 50, 320, ID_DARK);
-    if c.dark {
-        SendMessageW(dark, BM_SETCHECK as u32, 1, 0);
+            style,
+            (x, 12, 90, 28),
+            ID_TAB_FIRST + i,
+        ));
     }
-
-    let learn = check("从我的输入里学词（关掉就完全不记）", 16, 78, 320, ID_LEARN);
-    if c.learn {
-        SendMessageW(learn, BM_SETCHECK as u32, 1, 0);
-    }
-
-    label("撤回窗口（毫秒，0 = 关掉撤回）", 16, 112, 240);
-    let undo = edit(&c.undo_ms.to_string(), 16, 134, 80, ID_UNDO);
-
-    // ── AI（P4b）────────────────────────────────────────────
+    // 分隔线（SS_ETCHEDHORZ = 0x10）。带 WS_GROUP：页签那一组到这里为止
+    make(
+        None,
+        "STATIC",
+        "",
+        WS_GROUP | 0x10,
+        (12, 50, CLIENT_W - 24, 2),
+        0,
+    );
+    // ── 1 输入 ────────────────────────────────────────────
+    let p = PAGE_INPUT;
+    label(p, "每页候选", X0, 72, 70);
+    let cols = num(p, X0 + 76, 68, 44, ID_COLS);
+    label(p, "列 ×", X0 + 128, 72, 34);
+    let rows = num(p, X0 + 166, 68, 44, ID_ROWS);
+    label(p, "行", X0 + 218, 72, 24);
     label(
-        "AI —— 选中一段文字，再点浮条 ☰ 里的「翻译/改写/续写」",
-        16,
-        168,
-        380,
+        p,
+        "列数 3–9，行数 1–9。收起时只显示 1 行，展开后显示这里设的行数。",
+        X0,
+        100,
+        PAGE_W,
     );
-    let ai_enable = check(
-        "启用 AI（会连到你填的接口地址）",
-        16,
-        190,
-        360,
-        ID_AI_ENABLE,
+    let hint = check(
+        p,
+        "联想条（上屏一个词后，在下方给出后面常接的词）",
+        136,
+        ID_HINT,
     );
-    if c.ai_enabled {
-        SendMessageW(ai_enable, BM_SETCHECK as u32, 1, 0);
-    }
+    label(
+        p,
+        "默认关：联想条会挡在光标下方，只想安静打字就不用开。",
+        X0 + 18,
+        160,
+        PAGE_W - 18,
+    );
+    when(
+        p,
+        "生效时机：立即。点「保存」后，下一次按键、下一次上屏就按新设置来，不用重启。",
+    );
 
-    label("提供商", 16, 216, 100);
-    let ai_provider = child(
+    // ── 2 外观 ────────────────────────────────────────────
+    let p = PAGE_LOOK;
+    let dark = check(p, "暗色主题（候选窗、浮条、☰ 菜单一起变）", 70, ID_DARK);
+    label(
+        p,
+        "这个设置窗口本身用的是系统控件，不跟着变暗。",
+        X0 + 18,
+        94,
+        PAGE_W - 18,
+    );
+    when(
+        p,
+        "生效时机：立即。点「保存」后，候选窗、浮条、菜单下一次重绘时换成新主题。",
+    );
+
+    // ── 3 学习 ────────────────────────────────────────────
+    let p = PAGE_LEARN;
+    let learn = check(
+        p,
+        "从我的输入里学词（关掉就完全不记，只查不学）",
+        70,
+        ID_LEARN,
+    );
+    label(
+        p,
+        "误选撤回窗口（毫秒；0 = 关掉撤回，最大 10000）",
+        X0,
+        112,
+        PAGE_W,
+    );
+    let undo = num(p, X0, 134, 80, ID_UNDO);
+    para(
+        p,
+        "上屏之后在这段时间内用退格把刚打出来的字删光，输入法就当作选错了，这次的选择不会被记住。",
+        166,
+    );
+    when(
+        p,
+        "生效时机：立即。点「保存」后，下一次选词、下一次退格就按新设置来。",
+    );
+
+    // ── 4 词库 ────────────────────────────────────────────
+    let p = PAGE_CORPUS;
+    label(p, "笔记目录（Obsidian 库；留空 = 不启用）", X0, 72, PAGE_W);
+    let corpus = text(p, X0, 94, PAGE_W - 116, ID_CORPUS);
+    button(Some(p), "立即导入", X0 + PAGE_W - 104, 92, 104, ID_IMPORT);
+    para(
+        p,
+        "导入会把笔记里的词汇整理成语料表（%LOCALAPPDATA%\\inklink\\corpus.tsv，只存在本机），让这些词能出现在候选里。",
+        130,
+    );
+    label(
+        p,
+        "点「保存」时如果填了目录，也会顺手导入一次。导入结果显示在窗口下方。",
+        X0,
+        172,
+        PAGE_W,
+    );
+    when(p, CORPUS_WHEN);
+
+    // ── 5 AI ──────────────────────────────────────────────
+    let p = PAGE_AI;
+    label(
+        p,
+        "选中一段文字，再点浮条 ☰ 里的「翻译 / 改写 / 续写」。",
+        X0,
+        70,
+        PAGE_W,
+    );
+    let ai_enable = check(p, "启用 AI（会连到你填的接口地址）", 94, ID_AI_ENABLE);
+    label(p, "提供商", X0, 130, 66);
+    let ai_provider = make(
+        Some(p),
         "COMBOBOX",
         "",
         0x0003 | WS_TABSTOP, // CBS_DROPDOWNLIST
-        90,
-        212,
-        160,
-        200,
-        hwnd,
+        (X0 + 70, 126, 160, 200),
         ID_AI_PROVIDER,
     );
-    for p in AI_PROVIDERS {
+    for pr in AI_PROVIDERS {
         SendMessageW(
             ai_provider,
-            CB_ADDSTRING as u32,
+            CB_ADDSTRING,
             0,
-            wide_static(p).as_ptr() as isize,
+            wide_static(pr).as_ptr() as isize,
         );
     }
-    let sel = AI_PROVIDERS
-        .iter()
-        .position(|p| **p == c.ai_provider)
-        .unwrap_or(0);
-    SendMessageW(ai_provider, CB_SETCURSEL as u32, sel as usize, 0);
-
-    label("接口地址", 16, 248, 300);
-    let ai_endpoint = edit_text(&c.ai_endpoint, 16, 268, 380, ID_AI_ENDPOINT);
-
-    label("模型名", 16, 294, 100);
-    let ai_model = edit_text(&c.ai_model, 16, 314, 380, ID_AI_MODEL);
-
-    label("API Key（ollama 不用填）", 16, 340, 300);
-    let ai_key = edit_text(&c.ai_key, 16, 360, 380, ID_AI_KEY);
-
-    let hint = check(
-        "联想条（上屏一个词后给出后面常接的词）",
-        16,
-        390,
-        360,
-        ID_HINT,
+    label(
+        p,
+        "ollama = 本机的 Ollama；openai = 任意 OpenAI 兼容接口（DeepSeek、智谱、月之暗面、OpenAI 官方）",
+        X0,
+        158,
+        PAGE_W,
     );
-    if c.hint {
-        SendMessageW(hint, BM_SETCHECK as u32, 1, 0);
-    }
+    label(p, "接口地址", X0, 192, 66);
+    let ai_endpoint = text(p, X0 + 70, 188, PAGE_W - 70, ID_AI_ENDPOINT);
+    label(p, "模型名", X0, 224, 66);
+    let ai_model = text(p, X0 + 70, 220, PAGE_W - 70, ID_AI_MODEL);
+    label(p, "API Key", X0, 256, 66);
+    let ai_key = text(p, X0 + 70, 252, PAGE_W - 70, ID_AI_KEY);
+    label(
+        p,
+        "ollama 不用填。Key 保存在本机注册表（HKCU）里。",
+        X0 + 70,
+        280,
+        PAGE_W - 70,
+    );
+    when(
+        p,
+        "生效时机：下一次 AI 请求。点「保存」后，下次在浮条里点翻译 / 改写 / 续写就用新设置。",
+    );
 
-    // ── 个人语料（M2）─────────────────────────────────────
-    label("笔记目录（Obsidian 库；留空 = 不启用）", 16, 418, 380);
-    let corpus = edit_text(&c.corpus_path, 16, 440, 380, ID_CORPUS);
+    // ── 6 关于 ────────────────────────────────────────────
+    let p = PAGE_ABOUT;
+    label(
+        p,
+        &format!("inklink {}", env!("CARGO_PKG_VERSION")),
+        X0,
+        72,
+        PAGE_W,
+    );
+    label(p, "Windows 上的开源中文输入法。", X0, 96, PAGE_W);
+    label(
+        p,
+        "许可证：GPL-3.0（基础词库衍生自 rime-ice，同为 GPL-3.0）",
+        X0,
+        130,
+        PAGE_W,
+    );
+    para(
+        p,
+        "诊断工具：出问题时双击它，会在桌面生成 inklink-诊断-<时间>.txt，把这个文件发给开发者。",
+        164,
+    );
+    copyable(p, DIAGNOSE_PATH, 202);
+    label(p, "项目主页", X0, 236, PAGE_W);
+    copyable(p, PROJECT_URL, 258);
 
-    let status = child(
+    // ── 底部：所有页共用 ──────────────────────────────────
+    make(None, "STATIC", "", 0x10, (12, 398, CLIENT_W - 24, 2), 0);
+    let status = make(
+        None,
         "STATIC",
-        "改完点保存，下一次按键就生效，不用重启。",
+        "改完点「保存」。每页底部写着改完什么时候生效。",
         0,
-        16,
-        466,
-        380,
-        18,
-        hwnd,
+        (X0, 408, PAGE_W, 18),
         0,
     );
-    add(status);
+    button(None, "保存", X0, 438, 84, ID_SAVE);
+    button(None, "恢复默认", X0 + 92, 438, 96, ID_RESET);
+    button(None, "关闭", X0 + PAGE_W - 84, 438, 84, ID_CLOSE);
 
-    button("保存", 16, 492, 76, ID_SAVE);
-    button("恢复默认", 100, 492, 90, ID_RESET);
-    button("关闭", 198, 492, 76, ID_CLOSE);
-    button("立即导入", 286, 492, 100, ID_IMPORT);
-
-    // 初始状态：没启用 AI 时那几项是灰的（出厂就是关的）
-    apply_ai_enabled(ai_enable, ai_provider, ai_endpoint, ai_model, ai_key);
-
-    UI.with(|u| {
-        let mut u = u.borrow_mut();
-        u.cols = cols;
-        u.rows = rows;
-        u.dark = dark;
-        u.learn = learn;
-        u.undo = undo;
-        u.ai_enable = ai_enable;
-        u.ai_endpoint = ai_endpoint;
-        u.ai_model = ai_model;
-        u.ai_provider = ai_provider;
-        u.ai_key = ai_key;
-        u.hint = hint;
-        u.corpus = corpus;
-        u.status = status;
-    });
+    let ui = Ui {
+        cols,
+        rows,
+        dark,
+        learn,
+        undo,
+        ai_enable,
+        ai_endpoint,
+        ai_model,
+        ai_provider,
+        ai_key,
+        hint,
+        corpus,
+        status,
+        tabs,
+        pages: pages.into_inner(),
+    };
+    fill_form(&ui, &load_config());
+    show_page(&ui, PAGE_INPUT);
+    UI.with(|u| *u.borrow_mut() = ui);
 }
-
 /// 只导入、不保存设置：给用户一个"我现在就想生成"的按钮。
 fn on_import() {
     let ui = UI.with(|u| u.borrow().to_snapshot());
@@ -732,21 +895,7 @@ fn on_save(hwnd: HWND) {
 
 impl Ui {
     fn to_snapshot(&self) -> Ui {
-        Ui {
-            cols: self.cols,
-            rows: self.rows,
-            dark: self.dark,
-            learn: self.learn,
-            undo: self.undo,
-            ai_enable: self.ai_enable,
-            ai_endpoint: self.ai_endpoint,
-            ai_model: self.ai_model,
-            ai_provider: self.ai_provider,
-            ai_key: self.ai_key,
-            hint: self.hint,
-            corpus: self.corpus,
-            status: self.status,
-        }
+        self.clone()
     }
 }
 
@@ -760,26 +909,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             match (wp & 0xFFFF) as usize {
                 ID_SAVE => on_save(hwnd),
                 ID_RESET => {
+                    // 出厂值用 default_config()，和首次安装同一个来源：六页一起还原，
+                    // AI 四项跟着回到禁用态（fill_form 末尾会刷 apply_ai_enabled）
                     let ui = UI.with(|u| u.borrow().to_snapshot());
-                    set_text(ui.cols, &DEF_COLS.to_string());
-                    set_text(ui.rows, &DEF_ROWS.to_string());
-                    set_text(ui.undo, &DEF_UNDO.to_string());
-                    SendMessageW(ui.dark, BM_SETCHECK as u32, 0, 0);
-                    SendMessageW(ui.learn, BM_SETCHECK as u32, 1, 0);
-                    SendMessageW(ui.ai_enable, BM_SETCHECK as u32, 0, 0);
-                    set_text(ui.ai_endpoint, DEF_ENDPOINT);
-                    set_text(ui.ai_model, DEF_MODEL_OLLAMA);
-                    SendMessageW(ui.ai_provider, CB_SETCURSEL as u32, 0, 0);
-                    set_text(ui.ai_key, "");
-                    SendMessageW(ui.hint, BM_SETCHECK as u32, 1, 0);
-                    set_text(ui.corpus, "");
-                    apply_ai_enabled(
-                        ui.ai_enable,
-                        ui.ai_provider,
-                        ui.ai_endpoint,
-                        ui.ai_model,
-                        ui.ai_key,
-                    );
+                    fill_form(&ui, &default_config());
                     set_text(ui.status, "已填回默认值 —— 还要点一次“保存”才写进去。");
                 }
                 ID_CLOSE => {
@@ -797,8 +930,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     );
                 }
                 ID_IMPORT => on_import(),
-                _ => {}
-                _ => {}
+                id => {
+                    if let Some(page) = page_of_tab(id) {
+                        let ui = UI.with(|u| u.borrow().to_snapshot());
+                        show_page(&ui, page);
+                    }
+                }
             }
             0
         }
@@ -876,15 +1013,24 @@ fn main() {
         if RegisterClassW(&wc) == 0 {
             return;
         }
+        // 客户区固定 CLIENT_W × CLIENT_H，外框按标题栏/边框的实际尺寸反推
+        let style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU;
+        let mut rc = RECT {
+            left: 0,
+            top: 0,
+            right: CLIENT_W,
+            bottom: CLIENT_H,
+        };
+        AdjustWindowRect(&mut rc, style, 0);
         let hwnd = CreateWindowExW(
             0,
             cls.as_ptr(),
             wide_static("inklink 设置").as_ptr(),
-            WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
+            style,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
-            424,
-            548,
+            rc.right - rc.left,
+            rc.bottom - rc.top,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
             std::ptr::null_mut(),
@@ -947,5 +1093,15 @@ mod tests {
         assert_eq!(model_or_default(""), DEF_MODEL);
         assert_eq!(model_or_default("  "), DEF_MODEL);
         assert_eq!(model_or_default(" qwen3:8b "), "qwen3:8b");
+    }
+
+    #[test]
+    fn 页签_id_对应六页_别的_id_不算() {
+        assert_eq!(page_of_tab(2001), Some(0));
+        assert_eq!(page_of_tab(2006), Some(5));
+        assert_eq!(page_of_tab(2007), None);
+        assert_eq!(page_of_tab(2000), None);
+        assert_eq!(page_of_tab(ID_SAVE), None);
+        assert_eq!(PAGE_TITLES[PAGE_ABOUT], "关于");
     }
 }
