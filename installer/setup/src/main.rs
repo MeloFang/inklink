@@ -291,15 +291,8 @@ fn cleanup_legacy_install() {
             RegCloseKey(key);
         }
     }
-    let pf = Path::new(PROGRAM_FILES);
-    if let Ok(files) = fs::read_dir(pf) {
-        for entry in files.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with("inklink_tsf_") && name.ends_with(".dll") {
-                let _ = fs::remove_file(entry.path());
-            }
-        }
-    }
+    // 旧 DLL 不在这里删：要等注册表指向新版本之后再清（见 retire_old_dlls），
+    // 否则中途失败会留下一个指向不存在文件的 COM 注册，输入法整个用不了。
     println!("  旧版清理完成，保留用户词库和设置");
 }
 
@@ -341,8 +334,101 @@ fn write_file_atomic(target: &Path, data: &[u8]) -> std::io::Result<()> {
     Err(last)
 }
 
-fn unpack(entries: &[Entry], pf: &Path, eng: &Path) -> Result<usize, String> {
+/// 载荷里两个固定名字的 DLL → 装进 Program Files 时用的版本化文件名。
+///
+/// 为什么要带版本号：explorer、微信、WPS 会把 `inklink_tsf.dll` 映射进自己的进程，
+/// **被映射的文件谁都覆盖不了**（管理员也不行）。旧版安装器写固定名字，升级时重试
+/// 6 次全失败、安装中断（"装新版装不上 / 装完还是旧版"）。换成新文件名 + 注册表指过去：
+/// 正在跑的进程继续用已映射的旧文件，新启动的进程加载新 DLL，旧文件重启后删掉。
+/// `tools\deploy-local.ps1` 一直是这么做的，安装器跟上它。
+fn versioned_dll_name(rel: &str, ver: &str) -> Option<String> {
+    match rel {
+        "inklink_tsf.dll" => Some(format!("inklink_tsf_{ver}.dll")),
+        "inklink_tsf32.dll" => Some(format!("inklink_tsf32_{ver}.dll")),
+        _ => None,
+    }
+}
+
+/// Program Files 根目录里的这个文件是不是该退休的旧 DLL：`inklink_tsf*.dll`，
+/// 而且不是这次刚装的（`keep`，按文件名、不分大小写）。
+fn is_retired_dll(name: &str, keep: &[String]) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.starts_with("inklink_tsf")
+        && lower.ends_with(".dll")
+        && !keep.iter().any(|k| k.eq_ignore_ascii_case(name))
+}
+
+/// 写一个版本化 DLL，返回实际写到的路径。
+///
+/// - 同名文件已经在、内容也一样（连装两次同一版本）：不动它。它多半正被 explorer 映射着，
+///   硬覆盖必失败，而内容一样本来就不用写。
+/// - 内容不同又被占用（同版本号重新打了包）：换一个带时间戳的名字写，注册表指过去，
+///   被占用的那份留给 `retire_old_dlls` 登记重启删除。
+fn install_dll(target: &Path, data: &[u8]) -> std::io::Result<PathBuf> {
+    if fs::read(target).map(|old| old == data).unwrap_or(false) {
+        return Ok(target.to_path_buf());
+    }
+    match write_file_atomic(target, data) {
+        Ok(()) => Ok(target.to_path_buf()),
+        Err(first) => {
+            let stem = target
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| "inklink_tsf".into());
+            let secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let alt = target.with_file_name(format!("{stem}-{secs}.dll"));
+            match write_file_atomic(&alt, data) {
+                Ok(()) => Ok(alt),
+                Err(_) => Err(first),
+            }
+        }
+    }
+}
+
+/// 解包结果：写了几个文件、两个 DLL 实际落在哪（按版本化名字装时才有）。
+struct Unpacked {
+    written: usize,
+    dll64: Option<PathBuf>,
+    dll32: Option<PathBuf>,
+}
+
+/// 删掉 Program Files 根目录里所有旧 DLL（不含 `keep`）；删不掉（被占用）的登记成重启后删除。
+/// 返回 `(立刻删掉的, 登记重启删除的)`。**必须在注册表已经指向新 DLL 之后调**。
+fn retire_old_dlls(pf: &Path, keep: &[String]) -> (usize, usize) {
+    let mut removed = 0usize;
+    let mut locked: Vec<PathBuf> = Vec::new();
+    if let Ok(files) = fs::read_dir(pf) {
+        for entry in files.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !is_retired_dll(&name, keep) {
+                continue;
+            }
+            match fs::remove_file(&path) {
+                Ok(()) => removed += 1,
+                Err(_) => locked.push(path),
+            }
+        }
+    }
+    (removed, schedule_delete_paths(&locked))
+}
+/// 把载荷写到磁盘。`dll_ver` 给了就把两个 DLL 装成版本化名字（安装用）；
+/// `None` = 原样解包（`--extract` 用，CI 按原名核对载荷）。
+fn unpack(
+    entries: &[Entry],
+    pf: &Path,
+    eng: &Path,
+    dll_ver: Option<&str>,
+) -> Result<Unpacked, String> {
     let mut written = 0;
+    let mut dll64 = None;
+    let mut dll32 = None;
     for e in entries {
         let (base, rel) = if let Some(rest) = e.name.strip_prefix("pf/") {
             (pf, rest)
@@ -355,16 +441,38 @@ fn unpack(entries: &[Entry], pf: &Path, eng: &Path) -> Result<usize, String> {
         if rel.contains("..") {
             return Err(format!("条目名不合法：{}", e.name));
         }
-        let target = base.join(rel.replace('/', "\\"));
+        let versioned = if base == pf {
+            dll_ver.and_then(|v| versioned_dll_name(rel, v))
+        } else {
+            None
+        };
+        let target = match &versioned {
+            Some(name) => base.join(name),
+            None => base.join(rel.replace('/', "\\")),
+        };
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent)
                 .map_err(|e| format!("建目录失败 {}：{e}", parent.display()))?;
         }
-        write_file_atomic(&target, &e.data)
-            .map_err(|e| format!("写文件失败 {}：{e}", target.display()))?;
+        if versioned.is_some() {
+            let got = install_dll(&target, &e.data)
+                .map_err(|e| format!("写文件失败 {}：{e}", target.display()))?;
+            if rel == "inklink_tsf.dll" {
+                dll64 = Some(got);
+            } else {
+                dll32 = Some(got);
+            }
+        } else {
+            write_file_atomic(&target, &e.data)
+                .map_err(|e| format!("写文件失败 {}：{e}", target.display()))?;
+        }
         written += 1;
     }
-    Ok(written)
+    Ok(Unpacked {
+        written,
+        dll64,
+        dll32,
+    })
 }
 
 /// 拉起引擎。这里故意不用 `std::process::Command`——它没法关掉句柄继承，
@@ -544,8 +652,11 @@ fn install() -> Result<(), String> {
     cleanup_legacy_install();
 
     println!("解包到 {} 与 {} …", pf.display(), eng.display());
-    let n = unpack(&entries, &pf, &eng)?;
-    println!("  写入 {n} 个文件");
+    let up = unpack(&entries, &pf, &eng, Some(env!("CARGO_PKG_VERSION")))?;
+    println!("  写入 {} 个文件", up.written);
+    let (Some(dll64), Some(dll32)) = (up.dll64, up.dll32) else {
+        return Err("安装包缺少 inklink_tsf.dll / inklink_tsf32.dll".into());
+    };
 
     // 把安装器本身留在安装目录，应用列表的卸载命令直接调用它的 --uninstall。
     // 这样单文件 setup 不依赖外部 uninstall.ps1（旧版正是因此找不到卸载入口）。
@@ -553,8 +664,6 @@ fn install() -> Result<(), String> {
     let setup_bytes = fs::read(&exe).map_err(|e| format!("读取安装器自身失败：{e}"))?;
     write_file_atomic(&setup_copy, &setup_bytes).map_err(|e| format!("保存卸载器失败：{e}"))?;
 
-    let dll64 = pf.join("inklink_tsf.dll");
-    let dll32 = pf.join("inklink_tsf32.dll");
     let engine_exe = eng.join("rime-server.exe");
 
     println!("注册 COM 组件…");
@@ -572,6 +681,17 @@ fn install() -> Result<(), String> {
             Some("ThreadingModel"),
             "Apartment",
         );
+    }
+
+    // 注册表已经指向新 DLL：旧的可以退休了。正被 explorer/微信映射着的删不掉，
+    // 登记成重启后删除；那些进程继续用旧文件不会崩，重新打开就加载新的。
+    let keep: Vec<String> = [&dll64, &dll32]
+        .iter()
+        .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+        .collect();
+    let (removed, deferred) = retire_old_dlls(&pf, &keep);
+    if removed + deferred > 0 {
+        println!("  旧版 DLL：删掉 {removed} 个，{deferred} 个正被程序占用、已登记重启后删除");
     }
 
     println!("注册 TSF 输入法…");
@@ -819,11 +939,16 @@ fn schedule_delete_tree(dir: &Path) -> usize {
     let mut files: Vec<PathBuf> = Vec::new();
     walk(dir, &mut files, &mut dirs);
     dirs.push(dir.to_path_buf());
+    files.extend(dirs);
+    schedule_delete_paths(&files)
+}
 
+/// 把这些路径（文件在前、目录在后）登记成重启后删除。返回登记成功的条数。
+fn schedule_delete_paths(paths: &[PathBuf]) -> usize {
     let mut count = 0usize;
     let mut fallback: Vec<String> = Vec::new();
 
-    for f in files.iter().chain(dirs.iter()) {
+    for f in paths {
         let w = wide(&f.to_string_lossy());
         // 正确用法：源文件在前、目标给 NULL —— 表示「重启时删掉这个文件」。
         let ok = unsafe { MoveFileExW(w.as_ptr(), std::ptr::null(), MOVEFILE_DELAY_UNTIL_REBOOT) };
@@ -982,8 +1107,21 @@ fn main() {
             }
         };
         match read_payload(&exe_path()) {
-            Ok(entries) => match unpack(&entries, &dir, &dir) {
-                Ok(n) => println!("已解包 {n} 个文件到 {}", dir.display()),
+            Ok(entries) => match unpack(
+                &entries,
+                &dir,
+                &dir,
+                // --versioned：按安装时的名字解（DLL 带版本号），用来核对安装器的改名逻辑
+                args.iter()
+                    .any(|a| a == "--versioned")
+                    .then_some(env!("CARGO_PKG_VERSION")),
+            ) {
+                Ok(up) => {
+                    println!("已解包 {} 个文件到 {}", up.written, dir.display());
+                    for p in [up.dll64, up.dll32].into_iter().flatten() {
+                        println!("  DLL: {}", p.display());
+                    }
+                }
                 Err(e) => eprintln!("解包失败：{e}"),
             },
             Err(e) => eprintln!("读载荷失败：{e}"),
@@ -1013,4 +1151,121 @@ fn main() {
         eprintln!("日志看这里：事件查看器 / 或者把这段错误发到 issue。");
     }
     pause();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn 两个_dll_装成版本化名字_其他文件不改名() {
+        assert_eq!(
+            versioned_dll_name("inklink_tsf.dll", "2.2.17").as_deref(),
+            Some("inklink_tsf_2.2.17.dll")
+        );
+        assert_eq!(
+            versioned_dll_name("inklink_tsf32.dll", "2.2.17").as_deref(),
+            Some("inklink_tsf32_2.2.17.dll")
+        );
+        assert_eq!(versioned_dll_name("inklink-settings.exe", "2.2.17"), None);
+        assert_eq!(
+            versioned_dll_name("fonts/inklink_tsf.dll", "2.2.17"),
+            None,
+            "只管根目录"
+        );
+    }
+
+    #[test]
+    fn 旧_dll_都退休_刚装的留着() {
+        let keep = vec![
+            "inklink_tsf_2.2.17.dll".to_string(),
+            "inklink_tsf32_2.2.17.dll".to_string(),
+        ];
+        for old in [
+            "inklink_tsf.dll", // 2.2.16 及更早的安装器写的固定名字
+            "inklink_tsf32.dll",
+            "inklink_tsf_2.2.16.dll", // deploy-local 留下的
+            "inklink_tsf32_1.1.43.dll",
+            "inklink_tsf_2.2.17-1731000000.dll", // 同版本被占用时换的名字
+            "INKLINK_TSF_1.0.0.DLL",
+        ] {
+            assert!(is_retired_dll(old, &keep), "{old} 应该退休");
+        }
+        for stay in [
+            "inklink_tsf_2.2.17.dll",
+            "Inklink_TSF32_2.2.17.dll",
+            "inklink-settings.exe",
+            "inklink.ico",
+            "inklink-setup.exe",
+            "inklink_tsf.dll.inklink-new",
+        ] {
+            assert!(!is_retired_dll(stay, &keep), "{stay} 不该动");
+        }
+    }
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        // 放在 crate 的 target 下：受限会话里测试 exe 往 %TEMP% 建目录会被拒（os error 5）
+        let d = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("test-tmp-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).expect("建临时目录");
+        d
+    }
+
+    #[test]
+    fn 同版本重装_内容一样就不写() {
+        let d = temp_dir("same");
+        let target = d.join("inklink_tsf_9.9.9.dll");
+        fs::write(&target, b"same bytes").expect("写");
+        // 只允许别人读地打开，模拟 explorer 映射着：真去写/替换一定失败
+        use std::os::windows::fs::OpenOptionsExt;
+        let _lock = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1) // FILE_SHARE_READ：像被映射的 DLL 一样，能读不能写/替换
+            .open(&target)
+            .expect("独占打开");
+        let got = install_dll(&target, b"same bytes").expect("内容一样应当直接成功");
+        assert_eq!(got, target);
+        drop(_lock);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn 同版本被占用且内容不同_换名字写() {
+        let d = temp_dir("busy");
+        let target = d.join("inklink_tsf_9.9.9.dll");
+        fs::write(&target, b"old build").expect("写");
+        use std::os::windows::fs::OpenOptionsExt;
+        let lock = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1) // FILE_SHARE_READ：像被映射的 DLL 一样，能读不能写/替换
+            .open(&target)
+            .expect("独占打开");
+        let got = install_dll(&target, b"new build").expect("应当换名字写成功");
+        assert_ne!(got, target, "被占用时不能还说写在原名字上");
+        assert!(got
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("inklink_tsf_9.9.9-"));
+        assert_eq!(fs::read(&got).expect("读"), b"new build");
+        drop(lock);
+        assert_eq!(
+            fs::read(&target).expect("读"),
+            b"old build",
+            "原文件没被半截覆盖"
+        );
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn 首次安装_直接写原名字() {
+        let d = temp_dir("fresh");
+        let target = d.join("inklink_tsf_9.9.9.dll");
+        let got = install_dll(&target, b"bytes").expect("写");
+        assert_eq!(got, target);
+        assert_eq!(fs::read(&target).expect("读"), b"bytes");
+        let _ = fs::remove_dir_all(&d);
+    }
 }

@@ -31,7 +31,7 @@ Say ''
 
 Say '-- 2. 程序文件 --'
 foreach ($f in @(
-    "$PF\inklink_tsf.dll", "$PF\inklink_tsf32.dll", "$PF\inklink-settings.exe",
+    "$PF\inklink-settings.exe",
     "$PF\inklink.ico", "$PF\fonts\ZhuqueFangsong-Regular.ttf",
     "$ENG\rime-server.exe", "$ENG\rime.dll", "$ENG\en-words.txt",
     "$ENG\rime\data\default.yaml", "$ENG\rime\data\base.dict.yaml", "$ENG\rime\data\8105.dict.yaml"

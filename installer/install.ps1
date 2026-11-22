@@ -63,8 +63,8 @@ Start-Sleep -Seconds 1
 
 New-Item -ItemType Directory -Force $PF  | Out-Null
 New-Item -ItemType Directory -Force $ENG | Out-Null
-$dll64 = Install-File "$SRC\inklink_tsf.dll"   "$PF\inklink_tsf.dll"
-$dll32 = Install-File "$SRC\inklink_tsf32.dll" "$PF\inklink_tsf32.dll"
+$dll64 = Install-File "$SRC\inklink_tsf.dll"   "$PF\inklink_tsf_$Version.dll"
+$dll32 = Install-File "$SRC\inklink_tsf32.dll" "$PF\inklink_tsf32_$Version.dll"
 # 语言列表里那一行的图标：DllRegisterServer 按 DLL 同目录的 inklink.ico 找它
 if (Test-Path "$SRC\inklink.ico") { Install-File "$SRC\inklink.ico" "$PF\inklink.ico" | Out-Null }
 if (Test-Path "$SRC\inklink-badge.ico") { Install-File "$SRC\inklink-badge.ico" "$PF\inklink-badge.ico" | Out-Null }

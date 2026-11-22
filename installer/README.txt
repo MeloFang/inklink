@@ -157,8 +157,8 @@ inklink 输入法 __INKLINK_VERSION__  测试版
 --------
 
   C:\Program Files\inklink\
-      inklink_tsf.dll      64 位输入法组件（记事本/VSCode/浏览器等）
-      inklink_tsf32.dll    32 位输入法组件（WPS 等 32 位软件）
+      inklink_tsf_<版本>.dll    64 位输入法组件（记事本/VSCode/浏览器等）
+      inklink_tsf32_<版本>.dll  32 位输入法组件（WPS 等 32 位软件）
 
   C:\inklink-engine\
       rime-server.exe      引擎（用 librime）
