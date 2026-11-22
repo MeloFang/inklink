@@ -863,3 +863,22 @@ M2 之后是 M3（AI 实体）。
 **还欠一次手测**：P4b 的改写/续写只在单测里覆盖，真机只点过翻译（当时前台被 WPS 占着，
 自动化没法安全抢焦点）。下次打开记事本顺手点一下两个新菜单项即可。
 
+
+## 十二、2.2.18：Ctrl+C 被吃成拼音（2026-11-22）
+
+**症状**：从 Excel/WPS 复制、粘到微信时，聊天框里会多出一个 `c`（有时变成汉字「尝」）。
+
+**证据**（`C:\Users\Public\inklink-tsf-26388.log`，微信进程）：`test vk=17`（Ctrl 按下）之后
+紧跟的 `test vk=67`（c）仍是 `claim=true`，于是 `compose buffer=c`，一提交就落进聊天框。
+同一份日志里 Ctrl+A / Ctrl+X / Ctrl+V 都是 `claim=false`，只有 Ctrl+C 翻车 20 次 ——
+说明 TSF 把"Ctrl 按下了"送到我们手上了，可字母按下那一瞬间键状态 API 已经查不到修饰键。
+
+**改法**（`tsf/src/lib.rs`）：`OnTestKeyDown` / `OnKeyDown` 见到 Ctrl/Alt/Win 的 key-down 就记一笔
+（`MOD_KEY_DOWN_AT`），`ctrl_alt_win_held()` 变成三路取并集：线程快照 `GetKeyState` +
+全局实时 `GetAsyncKeyState` + 300ms 内的"刚按下"兜底；键码补上左右分身
+（`VK_LCONTROL` / `VK_RCONTROL` / `VK_LMENU` / `VK_RMENU`）。方向选在安全的一边：最多漏认领一个字母，
+绝不把 Ctrl+C 吃成拼音。`test` 日志行多一个 `hotkey=` 字段，下次再遇到一眼能分清是
+"没识别到修饰键"还是"识别到了但别处认领了"。
+
+**验证**：单测 165 项通过（新增 3 项：并集、兜底窗口、键码覆盖）；真机验证要等微信重启后
+加载 2.2.18 再复现一次（GUI 抢焦点在 DSH 会话里做不到，没自动化）。

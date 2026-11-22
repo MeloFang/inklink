@@ -8,7 +8,7 @@
 //! 当前阶段：T4 —— 组合串显示（拼音直接显示在文档光标处）。
 
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use windows::Win32::Foundation::{
     CLASS_E_NOAGGREGATION, E_NOINTERFACE, HINSTANCE, LPARAM, RECT, S_FALSE, S_OK, WPARAM,
@@ -1597,6 +1597,11 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
         _lparam: LPARAM,
     ) -> windows::core::Result<BOOL> {
         let vk = wparam.0 as u32;
+        // 记下"修饰键刚刚按下"：有的宿主会先送 Ctrl 的 key-down，
+        // 等字母的 key-down 到我们手上时键状态 API 已经看不到 Ctrl 了（见 MOD_KEY_DOWN_AT）。
+        if is_mod_key(vk) {
+            mark_mod_key_down();
+        }
         const VK_BACK: u32 = 0x08;
         const VK_SPACE: u32 = 0x20;
         const VK_LEFT: u32 = 0x25;
@@ -1631,6 +1636,9 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
         // 词表还没清干净的那一下会把数字吃掉（或者反过来把词插进文档）。
         let hint_digit = !composing && hint::is_visible() && hint_pick_index(vk).is_some();
         // 左右键在联想条里翻；空格只在用户已经用左右键进去之后才认领（否则会吃掉正常空格）
+        // 日志里带上 hotkey：以后谁再遇到"快捷键被吃成拼音"，
+        // 一眼就能看出是"没识别到修饰键"还是"识别到了但别处认领了"。
+        let hotkey = ctrl_alt_win_held();
         let claim = self.can_compose(pic.as_ref())
             && (hint_digit
                 || ((should_claim(vk, composing, shift_held(), caps_on(), !chinese_mode)
@@ -1657,7 +1665,9 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
             log_line(&format!("numeric-context -> false (claimed vk={vk})"));
             set_numeric_context(false);
         }
-        log_line(&format!("test vk={vk} claim={claim} composing={composing}"));
+        log_line(&format!(
+            "test vk={vk} claim={claim} composing={composing} hotkey={hotkey}"
+        ));
         Ok(BOOL(if claim { 1 } else { 0 }))
     }
 
@@ -1692,6 +1702,12 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
         const VK_NEXT: u32 = 0x22;
 
         let vk = wparam.0 as u32;
+
+        // 同 OnTestKeyDown：有的宿主（Chromium 系）跳过 OnTestKeyDown 直接调 OnKeyDown，
+        // 修饰键的按下也得在这里记一笔，否则下面的 Ctrl 放行判断没有兜底。
+        if is_mod_key(vk) {
+            mark_mod_key_down();
+        }
 
         // 光标不在可编辑区域时一个键都不认领，否则会在没有光标的地方冒出候选窗
         let composable = self.can_compose(pic.as_ref());
@@ -3244,19 +3260,80 @@ fn query_with_fallback(code: &str) -> (Vec<String>, usize) {
     (Vec::new(), 0)
 }
 
+/// Ctrl / Alt / Win 的键码（含左右分身）。
+///
+/// 分身键码也要查：`VK_CONTROL` 是"左右任一个"的复合码，个别机器上
+/// `GetAsyncKeyState(VK_CONTROL)` 对右 Ctrl 返回 0。
+const MOD_VKS: [i32; 8] = [
+    0x11, // VK_CONTROL
+    0xA2, // VK_LCONTROL
+    0xA3, // VK_RCONTROL
+    0x12, // VK_MENU
+    0xA4, // VK_LMENU
+    0xA5, // VK_RMENU
+    0x5B, // VK_LWIN
+    0x5C, // VK_RWIN
+];
+
+/// 这个键码是不是 Ctrl / Alt / Win（不含 Shift —— Shift 有自己的语义）。
+fn is_mod_key(vk: u32) -> bool {
+    MOD_VKS.contains(&(vk as i32))
+}
+
+/// 修饰键最近一次"按下"的时刻（毫秒，墙钟）。
+///
+/// 为什么光看键状态不够：2026-11-22 微信实测的日志里，
+/// `test vk=17`（Ctrl 按下）之后紧跟的 `test vk=67`（c）还是 `claim=true`，
+/// 于是 `compose buffer=c`，一提交就变成汉字进了聊天框 ——
+/// 用户报的"从 Excel 复制到微信会多出个 c"。
+/// 同一份日志里 Ctrl+A / Ctrl+X / Ctrl+V 都是 `claim=false`，只有 Ctrl+C 翻车，
+/// 典型的"修饰键按下与字母按下之间，键状态 API 已经查不到修饰键"。
+/// 既然 TSF 都把"Ctrl 按下了"告诉我们了，就自己记一笔，给紧随其后的按键兜底。
+static MOD_KEY_DOWN_AT: AtomicU64 = AtomicU64::new(0);
+
+/// 兜底窗口：修饰键按下后这么久以内的按键，一律当快捷键放行。
+///
+/// 太短盖不住"手比键快"的 Ctrl+C（松 Ctrl 早于按 c），
+/// 太长会让"复制完立刻打中文"丢掉第一个字母。
+const MOD_LATCH_MS: u64 = 300;
+
+fn mark_mod_key_down() {
+    MOD_KEY_DOWN_AT.store(now_ms(), Ordering::SeqCst);
+}
+
+/// 墙钟毫秒，只用来算时间差。
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// 纯逻辑：`down_at` 那一刻按下的修饰键，到 `now` 还算不算"按着"。
+/// 时钟倒退（`now < down_at`）不算 —— 宁可放行一个字母，不能一直放行。
+fn mod_latched(down_at: u64, now: u64) -> bool {
+    down_at != 0 && now >= down_at && now - down_at < MOD_LATCH_MS
+}
+
 /// Ctrl / Alt / Win 是否按下（快捷键，应交给应用）。
+///
+/// 三路取并集：键状态的两条来源（`GetKeyState` 的线程快照 + `GetAsyncKeyState`
+/// 的全局实时）任一说按下，或刚刚（`MOD_LATCH_MS` 内）见到过修饰键按下。
+/// 方向是安全的那一边 —— 最多漏认领一个字母，绝不能把 Ctrl+C 吃成拼音。
 fn ctrl_alt_win_held() -> bool {
-    use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
-    const VK_CONTROL: i32 = 0x11;
-    const VK_MENU: i32 = 0x12;
-    const VK_LWIN: i32 = 0x5B;
-    const VK_RWIN: i32 = 0x5C;
-    // SAFETY: 纯查询
-    unsafe {
-        [VK_CONTROL, VK_MENU, VK_LWIN, VK_RWIN]
-            .iter()
-            .any(|vk| (GetAsyncKeyState(*vk) as u16 & 0x8000) != 0)
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, GetKeyState};
+    if mod_latched(MOD_KEY_DOWN_AT.load(Ordering::SeqCst), now_ms()) {
+        return true;
     }
+    // SAFETY: 纯查询
+    unsafe { mods_held(|k| GetKeyState(k), |k| GetAsyncKeyState(k)) }
+}
+
+/// 纯逻辑：两条键状态来源取并集。只有 0x8000（正按着）算，低位"按过一次"不算。
+fn mods_held(gk: impl Fn(i32) -> i16, ak: impl Fn(i32) -> i16) -> bool {
+    MOD_VKS
+        .iter()
+        .any(|&k| (gk(k) as u16 & 0x8000) != 0 || (ak(k) as u16 & 0x8000) != 0)
 }
 
 /// Shift 按下 或 CapsLock 开着（用户想打英文大写，应交给应用）。
@@ -3918,6 +3995,41 @@ mod tests {
             !should_claim(VK_A_KEY, false, false, true, false),
             "CapsLock 开着应放行"
         );
+    }
+
+    #[test]
+    fn 修饰键两条键状态来源取并集() {
+        let none = |_k: i32| 0i16;
+        let ctrl = |k: i32| if k == 0x11 { i16::MIN } else { 0 };
+        let rctrl = |k: i32| if k == 0xA3 { i16::MIN } else { 0 };
+        assert!(!mods_held(none, none), "都没按");
+        assert!(mods_held(ctrl, none), "线程快照说按着也算");
+        assert!(mods_held(none, ctrl), "全局实时说按着也算");
+        assert!(mods_held(none, rctrl), "右 Ctrl 的分身键码也要认");
+        // 低位是"按过一次"，不是"正按着"：拿它当按住会让快捷键判断永远成立
+        assert!(!mods_held(|_| 1i16, |_| 1i16), "只有低位不算按着");
+    }
+
+    #[test]
+    fn 修饰键刚按下也要当按着() {
+        // 微信 Ctrl+C：Ctrl 的 key-down 在 1_000ms，c 的 key-down 在 1_080ms。
+        // 这一下键状态 API 可能已经看不到 Ctrl 了，必须靠兜底窗口放行。
+        assert!(mod_latched(1_000, 1_080), "80ms 内要放行");
+        assert!(mod_latched(1_000, 1_299), "窗口内最后一毫秒仍放行");
+        assert!(!mod_latched(1_000, 1_300), "过了窗口就不兜底");
+        assert!(!mod_latched(0, 100), "没按过修饰键");
+        assert!(!mod_latched(2_000, 1_000), "时钟倒退不能当成按着");
+    }
+
+    #[test]
+    fn 修饰键键码覆盖左右分身() {
+        for vk in [0x11, 0xA2, 0xA3, 0x12, 0xA4, 0xA5, 0x5B, 0x5C] {
+            assert!(is_mod_key(vk), "vk={vk} 应算修饰键");
+        }
+        // Shift 不算：它有自己的"单击切换中英文"语义
+        for vk in [0x10, 0x41, 0x43, 0x20] {
+            assert!(!is_mod_key(vk), "vk={vk} 不该算修饰键");
+        }
     }
 
     #[test]
