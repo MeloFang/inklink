@@ -3735,7 +3735,9 @@ mod registry {
         match create(HKEY_LOCAL_MACHINE, &lp) {
             Ok(h) => {
                 if let Err(rc) = set_sz(h, "Description", DLL_DESC) {
-                    eprintln!("写语言配置 Description 失败: {rc:?}（输入法列表里可能看不到 inklink）");
+                    eprintln!(
+                        "写语言配置 Description 失败: {rc:?}（输入法列表里可能看不到 inklink）"
+                    );
                 }
                 close(h);
             }

@@ -732,7 +732,12 @@ fn install() -> Result<(), String> {
         let _ = reg_sz(HKEY_LOCAL_MACHINE, &lp, None, "inklink 输入法");
         // 具名 Description：Windows 校验输入法读的是这个值，不是上面那个无名默认值。
         // 缺了它，Set-WinUserLanguageList 会静默丢弃我们 → Win+Space 里永远看不到 inklink。
-        let _ = reg_sz(HKEY_LOCAL_MACHINE, &lp, Some("Description"), "inklink 输入法");
+        let _ = reg_sz(
+            HKEY_LOCAL_MACHINE,
+            &lp,
+            Some("Description"),
+            "inklink 输入法",
+        );
         let _ = reg_dword(HKEY_LOCAL_MACHINE, &lp, "Enable", 1);
         // 指向单独的 .ico，不是 DLL：DLL 里没有编图标资源（build.rs 只写版本号），
         // 指过去语言列表会退回显示「简体」两个字；.ico 也不会因 DLL 换版本名而失效。
