@@ -15,11 +15,15 @@
 
 use std::cell::RefCell;
 
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
-use windows_sys::Win32::Graphics::Gdi::{GetStockObject, DEFAULT_GUI_FONT, HGDIOBJ};
+use windows_sys::Win32::Foundation::{
+    GetLastError, ERROR_FILE_NOT_FOUND, HWND, LPARAM, LRESULT, RECT, WPARAM,
+};
+use windows_sys::Win32::Graphics::Gdi::{GetStockObject, UpdateWindow, DEFAULT_GUI_FONT, HGDIOBJ};
+use windows_sys::Win32::System::Pipes::WaitNamedPipeW;
 use windows_sys::Win32::System::Registry::{
-    RegCloseKey, RegCreateKeyExW, RegQueryValueExW, RegSetValueExW, HKEY, HKEY_CURRENT_USER,
-    KEY_READ, KEY_WRITE, REG_DWORD, REG_EXPAND_SZ, REG_OPTION_NON_VOLATILE, REG_SZ,
+    RegCloseKey, RegCreateKeyExW, RegGetValueW, RegQueryValueExW, RegSetValueExW, HKEY,
+    HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, KEY_WRITE, REG_DWORD, REG_EXPAND_SZ,
+    REG_OPTION_NON_VOLATILE, REG_SZ, RRF_RT_REG_SZ,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRect, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
@@ -126,8 +130,9 @@ struct Ui {
     /// 所以 `read_form` 不管当前停在哪一页，都能读到六页的全部值。
     pages: [Vec<HWND>; PAGE_COUNT],
 }
-/// 词库页的生效时机（任务 C 之后会改成「立即」）。
-const CORPUS_WHEN: &str = "生效时机：导入后需要重启输入引擎才生效。";
+/// 词库页的生效时机：导入成功后设置窗会自己重启引擎（见 `import_and_reload`）。
+const CORPUS_WHEN: &str =
+    "生效时机：立即。导入成功后会自动重启输入引擎（几秒），之后打字就能出现笔记里的词；那一下正在打的拼音会被打断。";
 
 /// 把界面上填的值收成配置。返回 `Err` 就弹提示、不写注册表。
 fn read_form(ui: &Ui) -> Result<Config, String> {
@@ -778,12 +783,12 @@ unsafe fn build_ui(hwnd: HWND) {
         "STATIC",
         "改完点「保存」。每页底部写着改完什么时候生效。",
         0,
-        (X0, 408, PAGE_W, 18),
+        (X0, 404, PAGE_W, 32),
         0,
     );
-    button(None, "保存", X0, 438, 84, ID_SAVE);
-    button(None, "恢复默认", X0 + 92, 438, 96, ID_RESET);
-    button(None, "关闭", X0 + PAGE_W - 84, 438, 84, ID_CLOSE);
+    button(None, "保存", X0, 440, 84, ID_SAVE);
+    button(None, "恢复默认", X0 + 92, 440, 96, ID_RESET);
+    button(None, "关闭", X0 + PAGE_W - 84, 440, 84, ID_CLOSE);
 
     let ui = Ui {
         cols,
@@ -806,6 +811,147 @@ unsafe fn build_ui(hwnd: HWND) {
     show_page(&ui, PAGE_INPUT);
     UI.with(|u| *u.borrow_mut() = ui);
 }
+// ── 导入后重启引擎（任务 C，方案 1）────────────────────────────
+//
+// 引擎只在启动时读 corpus.tsv / entities.tsv，导入完不重启就等于没导。
+// 这里结束旧引擎后**立刻自己拉起新的**，不留给 DLL 的 ensure_engine：那条路是在
+// 宿主应用的 UI 线程里拉引擎，最多要等 2 秒，会让用户打下一个字时卡一下。
+
+/// 引擎管道名，和 `tsf/src/ipc.rs` 的 `PIPE_NAME` 一致。
+const ENGINE_PIPE: &str = r"\\.\pipe\inklink-engine";
+/// 和 `tsf/src/ipc.rs` 的 `engine_exe_path()` 同一个回退位置。
+const ENGINE_FALLBACK: &str = r"C:\inklink-engine\rime-server.exe";
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// 引擎可执行文件：`HKLM\SOFTWARE\inklink\EnginePath` > 默认安装位置（与 DLL 同一规则）。
+fn engine_exe_path() -> Option<std::path::PathBuf> {
+    let key = wide(r"SOFTWARE\inklink");
+    let value = wide("EnginePath");
+    let mut buf = [0u16; 512];
+    let mut size = (buf.len() * 2) as u32;
+    // SAFETY: 标准注册表读取，缓冲区大小按字节给出
+    let rc = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            key.as_ptr(),
+            value.as_ptr(),
+            RRF_RT_REG_SZ,
+            std::ptr::null_mut(),
+            buf.as_mut_ptr() as *mut core::ffi::c_void,
+            &mut size,
+        )
+    };
+    if rc == 0 {
+        let len = (size as usize / 2).saturating_sub(1).min(buf.len());
+        let s = String::from_utf16_lossy(&buf[..len]);
+        if !s.trim().is_empty() {
+            return Some(std::path::PathBuf::from(s.trim()));
+        }
+    }
+    let p = std::path::Path::new(ENGINE_FALLBACK);
+    p.exists().then(|| p.to_path_buf())
+}
+
+/// 管道还在不在（有实例就算在，哪怕实例都忙）。
+fn engine_pipe_exists() -> bool {
+    let name = wide(ENGINE_PIPE);
+    // SAFETY: 纯查询；1ms 是为了不落到 0 = "用管道的默认超时"
+    unsafe { WaitNamedPipeW(name.as_ptr(), 1) != 0 || GetLastError() != ERROR_FILE_NOT_FOUND }
+}
+
+fn wait_until(limit: std::time::Duration, cond: impl Fn() -> bool) -> bool {
+    let start = std::time::Instant::now();
+    loop {
+        if cond() {
+            return true;
+        }
+        if start.elapsed() >= limit {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+/// 结束旧引擎、拉起新引擎，返回给状态行的一句话。
+fn restart_engine() -> String {
+    use std::os::windows::process::CommandExt;
+    use std::process::{Command, Stdio};
+    let Some(exe) = engine_exe_path() else {
+        return "没找到输入引擎（rime-server.exe），新词要等引擎下次启动才生效。".into();
+    };
+    // /F：引擎没有"请退出"的报文。它写词库都是先写临时文件再换名，强杀不会留下半个文件
+    let _ = Command::new("taskkill")
+        .args(["/IM", "rime-server.exe", "/F"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
+        .status();
+    // 等旧进程的管道消失（单例互斥量随进程一起释放），否则新进程会以为"已有实例"直接退出
+    if !wait_until(std::time::Duration::from_secs(3), || !engine_pipe_exists()) {
+        return "旧的输入引擎没能结束（可能是权限不够），新词要等重启电脑后生效。".into();
+    }
+    // 两次机会：旧进程刚死、互斥量还没完全释放时，新进程会自己退出，再拉一次就好
+    for _ in 0..2 {
+        let child = Command::new(&exe)
+            .arg("--serve")
+            .current_dir(exe.parent().unwrap_or(std::path::Path::new(".")))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn();
+        let mut child = match child {
+            Ok(c) => c,
+            Err(e) => return format!("输入引擎没能重启（{e}），下一次按键会自动再拉起。"),
+        };
+        let up = wait_until(std::time::Duration::from_secs(5), engine_pipe_exists);
+        if up {
+            return "输入引擎已重启，现在打字就能打出笔记里的词。".into();
+        }
+        if !matches!(child.try_wait(), Ok(Some(_))) {
+            // 进程还活着，只是 librime 初始化慢（首次部署会多花几秒）
+            return "输入引擎正在重启，过几秒再打字就能打出笔记里的词。".into();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    }
+    "输入引擎没能重启，下一次按键会自动再拉起。".into()
+}
+
+/// 语料相关的三个文件此刻的内容（读不到算空）。用来判断导入有没有真的改变什么。
+fn corpus_snapshot() -> Vec<Vec<u8>> {
+    let ent = dirs_entities();
+    let next = ent.with_file_name("entities-next.tsv");
+    [dirs_corpus(), ent, next]
+        .iter()
+        .map(|p| std::fs::read(p).unwrap_or_default())
+        .collect()
+}
+
+/// 导入，导入成功且语料确实变了就重启引擎，让新词立刻生效。
+///
+/// 语料没变（比如只改了列数又点了保存）就不重启：重启会打断正在打的拼音，没必要。
+fn import_and_reload(notes: &str, exe_dir: &std::path::Path) -> String {
+    let before = corpus_snapshot();
+    let msg = import_all(notes, exe_dir);
+    if msg.starts_with("导入失败") {
+        return msg;
+    }
+    if corpus_snapshot() == before {
+        return format!("{msg}语料没有变化，不用重启引擎。");
+    }
+    set_status_now(&format!("{msg}正在重启输入引擎…"));
+    format!("{msg}{}", restart_engine())
+}
+
+/// 改状态行并立刻重绘：导入和重启引擎期间消息循环是停着的，不手动刷就看不到进度。
+fn set_status_now(msg: &str) {
+    UI.with(|u| unsafe {
+        let h = u.borrow().status;
+        set_text(h, msg);
+        UpdateWindow(h);
+    });
+}
 /// 只导入、不保存设置：给用户一个"我现在就想生成"的按钮。
 fn on_import() {
     let ui = UI.with(|u| u.borrow().to_snapshot());
@@ -818,7 +964,8 @@ fn on_import() {
         .ok()
         .and_then(|p| p.parent().map(|x| x.to_path_buf()))
         .unwrap_or_default();
-    let msg = import_all(&notes, &exe_dir);
+    set_status_now("正在导入笔记…");
+    let msg = import_and_reload(&notes, &exe_dir);
     set_status(&msg);
 }
 
@@ -866,7 +1013,8 @@ fn on_save(hwnd: HWND) {
                         .ok()
                         .and_then(|p| p.parent().map(|x| x.to_path_buf()))
                         .unwrap_or_default();
-                    let msg = import_all(&notes, &exe_dir);
+                    set_status_now("正在导入笔记…");
+                    let msg = import_and_reload(&notes, &exe_dir);
                     UI.with(|u| unsafe { set_text(u.borrow().status, &msg) });
                 }
             } else {
