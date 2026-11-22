@@ -7,13 +7,23 @@
 ## 根因（一句话）
 
 我们注册 TIP 时**漏了 `GUID_TFCAT_TIPCAP_IMMERSIVESUPPORT` 分类**，而且
-`LanguageProfile` 里**没有具名 `Description` 值**。Windows Terminal 走 CoreText
-（`Windows.UI.Core.TextInput` → `TextInputHost.exe`），只从带沉浸式分类的 TIP 里挑输入法；
-没有具名 `Description` 的那条又会被 `Set-WinUserLanguageList` **静默丢弃**，
-所以 Win+Space 里永远看不到 inklink —— 于是"PowerShell 里打不出中文"。
+`LanguageProfile` 里**没有具名 `Description` 值**。前者决定"终端这类宿主认不认我们"，
+后者决定"能不能进 Windows 的输入法列表"，两个缺一个都白搭：
 
-补齐这两处（`Category\Category\{13A016DF-…}\{CLSID}` + `LanguageProfile\…\Description`）之后，
-WT 窗口关掉重开，Win+Space 里出现「inklink 输入法」，选中即可正常打中文（2026-11-22 用户确认）。
+- 缺 `Description` → `Set-WinUserLanguageList` 把这条 TIP **静默丢弃**（不报错），
+  Win+Space 里永远看不到 inklink；
+- 缺沉浸式分类 → 即使手动把值塞进列表，Windows Terminal 这类宿主也不激活我们。
+
+补齐两处之后，WT 窗口关掉重开，Win+Space 里出现「inklink 输入法」，选中即可正常打中文
+（2026-11-22 用户确认；日志 `C:\Users\Public\inklink-tsf-26868.log` 里有完整的
+`compose buffer=nihao` → `pick 0` 上屏记录）。
+
+**两次对照很关键**：先只补 `Description`（22:05）→ 能进列表了，但 Win+Space 仍看不到、打不出；
+再加沉浸式分类 + 重启 `ctfmon`（22:15）→ 立刻可用。所以这一条不是"防御性"改动，是必需的。
+
+> 机制订正：WT 走 CoreText 渲染，但 **TIP 仍然是在终端自己的进程里激活的**
+> （`TextInputHost.exe` 从头到尾没加载过我们）。所以别被 `Windows.UI.Core.TextInput.dll`
+> 误导成"输入法跑在 TextInputHost 里"。
 
 **代码修复**：
 
@@ -22,6 +32,9 @@ WT 窗口关掉重开，Win+Space 里出现「inklink 输入法」，选中即�
 | `tsf/src/lib.rs` | 新增 `GUID_TFCAT_TIPCAP_IMMERSIVESUPPORT` 常量；`register_with_tsf()` 里多注册一个分类；`registry::register()` 增加第 4 步，补写具名 `Description` |
 | `installer/setup/src/main.rs` | 多写两棵沉浸式分类键（`Category\Category\…` 与 `Category\Item\…`）；`LanguageProfile` 补具名 `Description` |
 | `installer/install.ps1` | 第 6 步改成**回读校验**：`Set-WinUserLanguageList` 之后重新读一遍列表，没进去就告警，不再只打印"已加入" |
+
+**代码已验证**（2026-11-22，2.2.19）：把沉浸式分类键删掉、把 `Description` 值删掉，
+跑 `regsvr32 /s inklink_tsf_2.2.19.dll`，两者都被自动写回来，注册表树前后 diff 为空。
 
 ## 排查过程（还会用到的方法）
 
