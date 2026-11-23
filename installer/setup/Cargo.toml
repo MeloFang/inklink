@@ -1,6 +1,6 @@
 [package]
 name = "inklink-setup"
-version = "2.2.19"
+version = "2.2.20"
 edition = "2021"
 description = "inklink 单文件安装器"
 

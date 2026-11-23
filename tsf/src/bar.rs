@@ -55,14 +55,15 @@ use windows_sys::Win32::System::Threading::{
 use windows_sys::Win32::UI::HiDpi::GetDpiForSystem;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreateWindowExW, DI_NORMAL, DefWindowProcW, DrawIconEx,
-    EnumWindows, GetClassNameW, GetCursorPos, GetForegroundWindow, GetWindowRect,
-    GetWindowThreadProcessId, HICON, IDC_ARROW, IDI_APPLICATION, IMAGE_ICON, IsWindowVisible,
-    KillTimer, LR_LOADFROMFILE, LoadCursorW, LoadIconW, LoadImageW, MA_NOACTIVATE, MoveWindow,
-    PostMessageW, RegisterClassW, SPI_GETWORKAREA, SW_HIDE, SW_SHOWNOACTIVATE, SetTimer,
-    ShowWindow, SystemParametersInfoW, ULW_ALPHA, UpdateLayeredWindow, WM_APP, WM_ERASEBKGND,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_PAINT, WM_TIMER, WNDCLASSW,
-    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreateWindowExW, DI_NORMAL, DefWindowProcW,
+    DestroyWindow, DrawIconEx, EnumWindows, GetClassNameW, GetCursorPos, GetForegroundWindow,
+    GetWindowRect, GetWindowThreadProcessId, HICON, IDC_ARROW, IDI_APPLICATION, IMAGE_ICON,
+    IsWindowVisible, KillTimer, LR_LOADFROMFILE, LoadCursorW, LoadIconW, LoadImageW, MA_NOACTIVATE,
+    MoveWindow, PostMessageW, RegisterClassW, SPI_GETWORKAREA, SW_HIDE, SW_SHOWNOACTIVATE,
+    SetTimer, ShowWindow, SystemParametersInfoW, ULW_ALPHA, UnregisterClassW, UpdateLayeredWindow,
+    WM_APP, WM_ERASEBKGND, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_PAINT,
+    WM_TIMER, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WS_POPUP,
 };
 
 const CLASS_NAME: &str = "inklink-bar";
@@ -917,6 +918,44 @@ pub fn hide() {
         crate::log_line("bar hide");
     }
     unsafe { KillTimer(hwnd, TIMER_WATCH) };
+}
+
+/// 彻底销毁浮条窗口并注销窗口类（`Deactivate` 时调）。
+///
+/// 为什么不能只 `hide`（2026-11-23 查到的真实隐患）：
+/// TSF 在部分宿主里会把我们的 DLL `FreeLibrary` 掉——日志里同一个进程出现两次
+/// `DllGetClassObject`，就是"卸载之后又加载回来"。而窗口类的 `lpfnWndProc` 指向 DLL 里的代码，
+/// 类注册又是**进程级**的：DLL 一卸载，那个还活着的浮条窗口就成了悬空指针，下一条消息打过去
+/// 就是宿主进程里的访问违例；重新加载后 `RegisterClassW` 还会因"类已存在"失败，
+/// 新窗口继承的仍是上一份代码的 wndproc。托盘类程序常年不退出，最容易撞上这种时序。
+/// 所以：销毁窗口 + 注销类，让下一次 `Activate` 用当前这份代码注册一个干净的新类。
+pub fn destroy() {
+    let hwnd = our_hwnd();
+    if (hwnd as isize) == 0 {
+        return;
+    }
+    // SAFETY: 句柄来自本进程 CreateWindowExW
+    let destroyed = unsafe {
+        let _ = KillTimer(hwnd, TIMER_WATCH);
+        let _ = KillTimer(hwnd, TIMER_GLOW);
+        DestroyWindow(hwnd) != 0
+    };
+    if !destroyed {
+        // 不是创建线程（或窗口已没了）：别清句柄、别注销类，否则会留下"两个浮条"的后患。
+        crate::log_line("bar: destroy failed（可能不在创建线程）");
+        return;
+    }
+    set_our_hwnd(std::ptr::null_mut());
+    crate::log_line("bar: destroyed");
+    PAINTED_VALID.store(false, Ordering::SeqCst);
+    VISIBLE_OWNER.store(OWNER_NONE, Ordering::SeqCst);
+    MENU_OPEN.store(false, Ordering::SeqCst);
+    // 注销窗口类：必须在窗口销毁之后，否则会因为"还有窗口在用"失败。
+    unsafe {
+        let name = wide(CLASS_NAME);
+        let _ = UnregisterClassW(name.as_ptr(), std::ptr::null_mut());
+    }
+    REGISTERED.store(false, Ordering::SeqCst);
 }
 
 /// 重绘（Shift 在应用里切了中英之后，lib.rs 调这个让浮条跟一下）。

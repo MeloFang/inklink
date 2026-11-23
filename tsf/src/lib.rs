@@ -644,6 +644,9 @@ impl ITfTextInputProcessor_Impl for TextService_Impl {
     fn Deactivate(&self) -> windows::core::Result<()> {
         log_line("deactivate");
         bar::hide();
+        // 再把窗口和窗口类一起收掉：TSF 可能在 Deactivate 之后把我们 FreeLibrary 掉，
+        // 留着窗口就是留一个指向已卸载代码的 wndproc（见 bar::destroy 的注释）。
+        bar::destroy();
         // 切换输入法/焦点时清空状态，否则缓冲会跨会话累积
         self.inner
             .buffer
