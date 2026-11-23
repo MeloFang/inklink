@@ -3530,6 +3530,32 @@ fn ignore_s_false(r: windows::core::Result<()>) -> windows::core::Result<()> {
     }
 }
 
+/// 本地墙上时间 `HH:mm:ss.mmm`。
+///
+/// 为什么要时间戳：用户报过"某个程序未响应"，而我们的日志原先只有先后顺序、没有时刻，
+/// 没法判断"卡住那一刻我们到底在不在做事"。有戳之后，只要看最后一条日志的时间
+/// 离卡住时间有多近，就能立刻分清是"我们卡住了"还是"我们早就收工了"。
+fn log_stamp() -> String {
+    use windows_sys::Win32::Foundation::SYSTEMTIME;
+    use windows_sys::Win32::System::SystemInformation::GetLocalTime;
+    let mut st = SYSTEMTIME {
+        wYear: 0,
+        wMonth: 0,
+        wDayOfWeek: 0,
+        wDay: 0,
+        wHour: 0,
+        wMinute: 0,
+        wSecond: 0,
+        wMilliseconds: 0,
+    };
+    // SAFETY: 纯查询，函数会把整个 SYSTEMTIME 写满
+    unsafe { GetLocalTime(&mut st) };
+    format!(
+        "{:02}:{:02}:{:02}.{:03}",
+        st.wHour, st.wMinute, st.wSecond, st.wMilliseconds
+    )
+}
+
 fn log_line(msg: &str) {
     use std::io::Write;
     static LOG_LOCK: Mutex<()> = Mutex::new(());
@@ -3541,7 +3567,7 @@ fn log_line(msg: &str) {
         .append(true)
         .open(&path)
     {
-        let _ = writeln!(f, "{msg}");
+        let _ = writeln!(f, "[{}] {msg}", log_stamp());
     }
 }
 
