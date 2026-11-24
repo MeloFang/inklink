@@ -485,3 +485,40 @@ pub fn extract_entities(
         next_edges: next_lines.len(),
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn 键值对抽出实体() {
+        let mut map: HashMap<String, (u32, String)> = HashMap::new();
+        scan_entities("项目代号：赤兔\n负责人：张三（主持工作）\n正文里顺口提到的词不算\n", &mut map);
+        assert!(map.contains_key("赤兔"), "项目代号应抽到，实际 {:?}", map.keys());
+        assert!(map.contains_key("张三"), "括号注释要切掉");
+        assert_eq!(map.len(), 2, "正文不是键值对，不该收：{:?}", map.keys());
+    }
+
+    #[test]
+    fn 实体表写法与联想边() {
+        let mut map: HashMap<String, (u32, String)> = HashMap::new();
+        let mut edges: HashMap<String, Vec<(String, u32)>> = HashMap::new();
+        scan_entity_file(
+            "# 实体表\n赤兔 = 项目\n张三 = 人名\n赤兔 -> 张三\n> 说明文字不算\n",
+            &mut map,
+            &mut edges,
+        );
+        assert_eq!(map.get("赤兔").map(|v| v.0), Some(800), "实体表权重 800");
+        assert_eq!(map.get("张三").map(|v| v.1.clone()), Some("人名".to_string()));
+        let e = edges.get("赤兔").expect("赤兔 -> 张三 应产生联想边");
+        assert_eq!(e[0].0, "张三");
+        assert_eq!(e[0].1, 900, "显式关系权重最高");
+    }
+
+    #[test]
+    fn 太短或含非汉字的词不收() {
+        let mut map: HashMap<String, (u32, String)> = HashMap::new();
+        scan_entities("负责人：张\n负责人：张三abc\n", &mut map);
+        assert!(map.is_empty(), "单字和含字母的都不收，实际 {:?}", map.keys());
+    }
+}
