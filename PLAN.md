@@ -1290,7 +1290,8 @@ FunASR 是阿里开源的识别全家桶（Apache-2.0 / MIT，可商用），中
 
 | 层 | 模型（ModelScope id） | 作用 | 体积 |
 |:---|:---|:---|:---|
-| 语音输入 / 实时草稿 | `iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-online` | 流式 Paraformer（chunk 200–300ms） | 中 |
+| 语音输入（标准档） | `iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-online` | 流式 Paraformer（chunk 200–300ms） | 中（~200 MB） |
+| 语音输入（省电档） | `sherpa-onnx` 的 `streaming-zipformer-zh-14M`（int8） | 14M 参数流式，专为低端 CPU 设计 | **~25 MB** |
 | 录音转写（离线精转） | `iic/SenseVoiceSmall` | 高准离线识别（含情感/事件标签） | 小 |
 | 断句 | `iic/speech_fsmn_vad_zh-cn-16k-common-pytorch` | VAD 切句，长音频必备 | 极小 |
 | 标点 | `iic/punc_ct-transformer_zh-cn-common-vocab272727-pytorch` | 补标点，转写稿可读性 | 极小 |
@@ -1354,6 +1355,40 @@ FunASR 是阿里开源的识别全家桶（Apache-2.0 / MIT，可商用），中
   主线（SenseVoice + vad + punc + cam++）**不依赖**它们，装不上先跳过，别在这卡住；
 - 模型权重走 ModelScope 国内镜像，别直连 HuggingFace；
 - **官方"2 小时会议几十秒出稿"是宣传口径**，第一次实测必须自己计时，别拿它当验收。
+
+**按机器分档（"同事电脑很差"怎么办）**
+
+结论先给：**能做，而且不做"统一规格"**。社区里已有人把中文流式模型压到
+14M 参数、25 MB，官方口径是"专为 Cortex-A7 设计"，树莓派 4B 上 RTF 还能压到 0.8 以下
+（见下面的对照表）。所以我们按机器分三档 + 一个"不装"档：
+
+| 档位 | 判定（启动时探测） | 实时层 | 离线精转 | 预期体验 |
+|:---|:---|:---|:---|:---|
+| **省电档** | CPU ≤ 4 核 或 内存 ≤ 8 GB 或 无 AVX2 | zh-14M 流式（25 MB） | 不启用长录音；短句用同一模型 | 松手出字，标点靠规则补 |
+| **标准档** | 主流 4–8 核 / 8–16 GB | Paraformer streaming（~200 MB） | SenseVoiceSmall（CPU 8 线程约 20× 实时） | 边说边出草稿；会后精转 |
+| **性能档** | 检测到独显（≥ 4 GB 显存） | 标准档 + GPU 加速 | SenseVoice + 说话人分离（cam++） | 开会边听边出、散会几十秒出稿 |
+| **不装档** | 用户不点「启用语音」/ 内存 < 4 GB | — | — | 与现在完全一样，**零开销** |
+
+三条实现纪律：
+
+1. **模型按需下载、按档下载**：首装不带任何模型；点「启用语音」时先探测本机，
+   给一句"你的机器建议用省电档（25 MB）还是标准档（200 MB）"，用户可改。
+2. **随时可降档**：设置里能手动切档，切档=卸载当前模型再加载另一个；切到"不装"就删干净。
+3. **失败即降级**：实时层启动失败或跟不上（RTF > 1）自动退到"松手后整句识别"，
+   再失败就提示"这台机器跑不动实时字幕，只做会后转写"，**绝不允许把输入法拖卡**。
+
+**社区同类项目对照（2026-11-25 查，用来定选型和抄思路）**
+
+| 项目 | 它怎么做的 | 我们能借鉴 / 要避开 |
+|:---|:---|:---|
+| [水杉输入法 MSIME](https://github.com/metasequoiaime/MSIME-Windows)（开源，纯 TSF） | 输入法内置语音：默认豆包**云端**流式，也支持本地三种模型（中英流式 / 快速整句 / 高精度）；上屏可选 TSF / SendInput / `Ctrl+V`；支持 inline 预编辑 | **直接证明"TSF 输入法里做语音"可行**；inline 预编辑（识别中的字直接显示在输入框）值得抄。差异：它默认走云端，我们默认全本地 |
+| [CapsWriter-Offline](https://github.com/HaujetZhao/CapsWriter-Offline)（Windows，本地） | 客户端 + 服务端两进程，按住热键说话；模型可换（FunASR 旗舰约 2 GB 内存，另有更省内存的 Fun-ASR-Nano） | 两进程架构和我们 ADR-0006 同思路；"模型可换 + 低配备选"正是分档的依据 |
+| [sherpa-onnx zh-14M](https://github.com/k2-fsa/sherpa-onnx) 流式中文模型 | 14M 参数、约 25 MB，官方定位就是低端设备；有人实测树莓派 RTF < 0.8 | **省电档的底气**：连树莓派都能实时 |
+| [SenseVoiceSmall GGUF](https://huggingface.co/FunAudioLLM/SenseVoiceSmall-GGUF) | llama.cpp 运行时，CPU 8 线程约 20× 实时，中文 CER 8.01%（whisper.cpp 22–31%） | 离线精转的效率依据；同时也给了"不装 torch 也能跑"的路径 |
+| Windows 自带语音（Win+H） | 系统内置，中文中等，专名/长句错字多，多数情况依赖在线 | 兜底可以提一句，但不能当主力 |
+
+**我们的差异点**（写进选型，避免做成第二个水杉）：**默认全本地 + 按机器分档 + 转写产物直接进
+语料/实体管线**。前两条是"能装到差电脑上"，第三条是别人没有的闭环。
 
 **验收标准**
 
